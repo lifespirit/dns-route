@@ -1,13 +1,14 @@
 package main
 
 import (
-	"fmt"
+	"errors"
 	"github.com/miekg/dns"
 	"github.com/vishvananda/netlink"
 	"log"
 	"net"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -15,9 +16,70 @@ import (
 // the <icon src="AllIcons.Actions.Execute"/> icon in the gutter and select the <b>Run</b> menu item from here.
 
 var re *regexp.Regexp
+var whoisRe *regexp.Regexp
 
 var routeAddress = net.ParseIP(os.Getenv("ROUTE"))
 var dnsAddress = os.Getenv("DNSADDRESS")
+var whoisAddress = os.Getenv("WHOISADDRESS")
+
+func whois(ipaddr string) (net.IP, int, error) {
+
+	m := new(dns.Msg)
+	m.SetQuestion(dns.Fqdn(whoisAddress), 1)
+	m.RecursionDesired = true
+
+	c := new(dns.Client)
+	in, _, err := c.Exchange(m, dnsAddress)
+	if err != nil {
+		log.Println(err)
+		return nil, 0, err
+	}
+
+	address := net.ParseIP(strings.ReplaceAll(in.Answer[0].String(), in.Answer[0].Header().String(), ""))
+	if address != nil {
+		conn, err := net.Dial("tcp", address.String()+":43")
+		if err != nil {
+			log.Printf("Can't connect to whois server. Error: %s", err)
+			return nil, 0, err
+		}
+		defer conn.Close()
+
+		_, err = conn.Write([]byte("-K -l " + ipaddr + "\r\n"))
+		if err != nil {
+			log.Printf("Can't send ip addr to whois server. Error: %s", err)
+			return nil, 0, err
+		}
+
+		buf := make([]byte, 1024)
+
+		result := []byte{}
+
+		for {
+			numBytes, err := conn.Read(buf)
+			sbuf := buf[0:numBytes]
+			result = append(result, sbuf...)
+			if err != nil {
+				break
+			}
+		}
+
+		matches := whoisRe.FindStringSubmatch(string(result))
+		if len(matches) >= 3 {
+			ipNetwork := net.ParseIP(matches[1])
+			if ipNetwork == nil {
+				log.Printf("Can't convert ip addr to IP.")
+				return nil, 0, errors.New("can't convert ip addr to IP")
+			}
+			ipMask, err := strconv.Atoi(matches[2])
+			if err != nil {
+				log.Printf("Can't convert ip mask to int. Error: %s", err)
+				return ipNetwork, 0, errors.New("can't convert ip mask string to int")
+			}
+			return net.ParseIP(matches[1]), ipMask, nil
+		}
+	}
+	return nil, 0, errors.New("can't parse whois IP address")
+}
 
 func searchRoute(routesTable []netlink.Route) int {
 	var route = -1
@@ -37,13 +99,13 @@ func resolve(domain string, qtype uint16) []dns.RR {
 	c := new(dns.Client)
 	in, _, err := c.Exchange(m, dnsAddress)
 	if err != nil {
-		fmt.Println(err)
+		log.Println(err)
 		return nil
 	}
 
 	matches := re.FindStringSubmatch(domain)
 	if qtype == dns.TypeA && len(matches) > 0 {
-		fmt.Printf("Listed domain found: %s\n", domain)
+		log.Printf("Listed domain found: %s\n", domain)
 		for _, ans := range in.Answer {
 			address := net.ParseIP(strings.ReplaceAll(ans.String(), ans.Header().String(), ""))
 			if address != nil {
@@ -54,8 +116,19 @@ func resolve(domain string, qtype uint16) []dns.RR {
 				searchResult := searchRoute(routes)
 				if searchResult < 0 {
 					log.Printf("Can't find route to GW %s for %s", routeAddress, domain)
+					ipNetwork := address
+					ipMask := 32
+					if whoisAddress != "" {
+						log.Printf("Try send request to whois server.")
+						ipNetwork, ipMask, err = whois(address.String())
+						if err != nil {
+							log.Printf("Can't get ip network for %s from whois server: %v", address, err)
+						} else {
+							log.Printf("Done. Network: %s, Mask: %v", ipNetwork, ipMask)
+						}
+					}
 					destination := &net.IPNet{
-						IP: address, Mask: net.CIDRMask(32, 32),
+						IP: ipNetwork, Mask: net.CIDRMask(ipMask, 32),
 					}
 					customRoute := &netlink.Route{
 						Dst: destination,
@@ -65,7 +138,7 @@ func resolve(domain string, qtype uint16) []dns.RR {
 					if err != nil {
 						log.Printf("Can't add custom route for %s to netlink: %v", customRoute, err)
 					}
-					log.Printf("Added route: %s via %s", address, routeAddress)
+					log.Printf("Added route: %s/%v via %s", ipNetwork, ipMask, routeAddress)
 				}
 			}
 		}
@@ -83,14 +156,14 @@ func (h *dnsHandler) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 	msg.Authoritative = true
 
 	for _, question := range r.Question {
-		fmt.Printf("DNS request: %s\n", question.Name)
+		log.Printf("DNS request: %s\n", question.Name)
 		answers := resolve(question.Name, question.Qtype)
 		msg.Answer = append(msg.Answer, answers...)
 	}
 
 	err := w.WriteMsg(msg)
 	if err != nil {
-		fmt.Println(err)
+		log.Println(err)
 	}
 }
 
@@ -106,6 +179,7 @@ func main() {
 		filter += domain + ".$"
 	}
 	re = regexp.MustCompile(filter)
+	whoisRe = regexp.MustCompile(`route: (\S+)/(\d+)`)
 
 	go func() {
 		tcpHandler := new(dnsHandler)
@@ -116,10 +190,10 @@ func main() {
 			ReusePort: true,
 		}
 
-		fmt.Printf("Starting tcp DNS server on %s\n", address)
+		log.Printf("Starting tcp DNS server on %s\n", address)
 		err := tcpServer.ListenAndServe()
 		if err != nil {
-			fmt.Printf("Failed to start tcp server: %s\n", err.Error())
+			log.Printf("Failed to start tcp server: %s\n", err.Error())
 		}
 	}()
 
@@ -131,10 +205,10 @@ func main() {
 		UDPSize:   65535,
 		ReusePort: true,
 	}
-	fmt.Printf("Starting udp DNS server on %s\n", address)
+	log.Printf("Starting udp DNS server on %s\n", address)
 	err := udpServer.ListenAndServe()
 	if err != nil {
-		fmt.Printf("Failed to start udp server: %s\n", err.Error())
+		log.Printf("Failed to start udp server: %s\n", err.Error())
 	}
 
 }
