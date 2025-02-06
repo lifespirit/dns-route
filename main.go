@@ -24,18 +24,13 @@ var whoisAddress = os.Getenv("WHOISADDRESS")
 
 func whois(ipaddr string) (net.IP, int, error) {
 
-	m := new(dns.Msg)
-	m.SetQuestion(dns.Fqdn(whoisAddress), 1)
-	m.RecursionDesired = true
-
-	c := new(dns.Client)
-	in, _, err := c.Exchange(m, dnsAddress)
-	if err != nil {
-		log.Println(err)
-		return nil, 0, err
+	address := net.ParseIP(whoisAddress)
+	if address == nil {
+		log.Printf("whois address not an IP address: %s", whoisAddress)
+		answer := resolve(whoisAddress, dns.TypeA, true)
+		address = net.ParseIP(strings.ReplaceAll(answer[0].String(), answer[0].Header().String(), ""))
+		log.Printf("whois address resolved: %v", address)
 	}
-
-	address := net.ParseIP(strings.ReplaceAll(in.Answer[0].String(), in.Answer[0].Header().String(), ""))
 	if address != nil {
 		conn, err := net.Dial("tcp", address.String()+":43")
 		if err != nil {
@@ -81,7 +76,7 @@ func whois(ipaddr string) (net.IP, int, error) {
 	return nil, 0, errors.New("can't parse whois IP address")
 }
 
-func searchRoute(routesTable []netlink.Route) int {
+func searchGW(routesTable []netlink.Route) int {
 	var route = -1
 	for index, oneRoute := range routesTable {
 		if oneRoute.Gw.Equal(routeAddress) {
@@ -91,7 +86,42 @@ func searchRoute(routesTable []netlink.Route) int {
 	return route
 }
 
-func resolve(domain string, qtype uint16) []dns.RR {
+func setRoute(address net.IP, skipWhois bool) {
+	routes, err := netlink.RouteGet(address)
+	if err != nil {
+		log.Printf("Can't get route for %s from netlink: %v", address, err)
+	}
+	searchResult := searchGW(routes)
+	if searchResult < 0 {
+		log.Printf("Can't find route %s to GW %s", address, routeAddress)
+		mask := 32
+		if whoisAddress != "" && !skipWhois {
+			log.Printf("Try send request to whois server.")
+			ipNetwork, ipMask, err := whois(address.String())
+			if err != nil {
+				log.Printf("Can't get ip network for %s from whois server: %v", address, err)
+			} else {
+				log.Printf("Done. Network: %s, Mask: %v", ipNetwork, ipMask)
+				address = ipNetwork
+				mask = ipMask
+			}
+		}
+		destination := &net.IPNet{
+			IP: address, Mask: net.CIDRMask(mask, 32),
+		}
+		customRoute := &netlink.Route{
+			Dst: destination,
+			Gw:  routeAddress,
+		}
+		err = netlink.RouteAdd(customRoute)
+		if err != nil {
+			log.Printf("Can't add custom route for %s to netlink: %v", customRoute, err)
+		}
+		log.Printf("Added route: %s/%v via %s", address, mask, routeAddress)
+	}
+}
+
+func resolve(domain string, qtype uint16, skipWhois bool) []dns.RR {
 	m := new(dns.Msg)
 	m.SetQuestion(dns.Fqdn(domain), qtype)
 	m.RecursionDesired = true
@@ -109,43 +139,11 @@ func resolve(domain string, qtype uint16) []dns.RR {
 		for _, ans := range in.Answer {
 			address := net.ParseIP(strings.ReplaceAll(ans.String(), ans.Header().String(), ""))
 			if address != nil {
-				routes, err := netlink.RouteGet(address)
-				if err != nil {
-					log.Printf("Can't get route for %s from netlink: %v", address, err)
-				}
-				searchResult := searchRoute(routes)
-				if searchResult < 0 {
-					log.Printf("Can't find route to GW %s for %s", routeAddress, domain)
-					ipNetwork := address
-					ipMask := 32
-					if whoisAddress != "" {
-						log.Printf("Try send request to whois server.")
-						ipNetwork, ipMask, err = whois(address.String())
-						if err != nil {
-							log.Printf("Can't get ip network for %s from whois server: %v", address, err)
-						} else {
-							log.Printf("Done. Network: %s, Mask: %v", ipNetwork, ipMask)
-						}
-					}
-					destination := &net.IPNet{
-						IP: ipNetwork, Mask: net.CIDRMask(ipMask, 32),
-					}
-					customRoute := &netlink.Route{
-						Dst: destination,
-						Gw:  routeAddress,
-					}
-					err = netlink.RouteAdd(customRoute)
-					if err != nil {
-						log.Printf("Can't add custom route for %s to netlink: %v", customRoute, err)
-					}
-					log.Printf("Added route: %s/%v via %s", ipNetwork, ipMask, routeAddress)
-				}
+				setRoute(address, skipWhois)
 			}
 		}
 	}
-
 	return in.Answer
-
 }
 
 type dnsHandler struct{}
@@ -157,7 +155,7 @@ func (h *dnsHandler) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 
 	for _, question := range r.Question {
 		log.Printf("DNS request: %s\n", question.Name)
-		answers := resolve(question.Name, question.Qtype)
+		answers := resolve(question.Name, question.Qtype, false)
 		msg.Answer = append(msg.Answer, answers...)
 	}
 
