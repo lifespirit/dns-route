@@ -1,215 +1,293 @@
 package main
 
 import (
-	"errors"
-	"github.com/miekg/dns"
-	"github.com/vishvananda/netlink"
+	"bufio"
+	"bytes"
+	"crypto/tls"
+	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
 	"regexp"
-	"strconv"
 	"strings"
+	"sync"
+	"time"
+
+	"github.com/miekg/dns"
+	"github.com/vishvananda/netlink"
 )
 
-//TIP To run your code, right-click the code and select <b>Run</b>. Alternatively, click
-// the <icon src="AllIcons.Actions.Execute"/> icon in the gutter and select the <b>Run</b> menu item from here.
+const (
+	cacheCleanupInterval = time.Minute // период чистки устаревших записей
+	whoisPort            = "43"        // порт WHOIS
+	wgInterface          = "wg0"       // имя VPN-интерфейса
+)
 
-var re *regexp.Regexp
-var whoisRe *regexp.Regexp
+var (
+	listenAddr     string
+	upstream       string
+	wgGateway      string
+	specialDomains []string
 
-var routeAddress = net.ParseIP(os.Getenv("ROUTE"))
-var dnsAddress = os.Getenv("DNSADDRESS")
-var whoisAddress = os.Getenv("WHOISADDRESS")
+	cache   = make(map[string]cacheEntry)
+	cacheMu sync.RWMutex
 
-func whois(ipaddr string) (net.IP, int, error) {
+	cidrRe = regexp.MustCompile(`(?mi)^CIDR:\s*([0-9./]+)`)
+)
 
-	address := net.ParseIP(whoisAddress)
-	if address == nil {
-		log.Printf("whois address not an IP address: %s", whoisAddress)
-		answer := resolve(whoisAddress, dns.TypeA, true)
-		address = net.ParseIP(strings.ReplaceAll(answer[0].String(), answer[0].Header().String(), ""))
-		log.Printf("whois address resolved: %v", address)
-	}
-	if address != nil {
-		conn, err := net.Dial("tcp", address.String()+":43")
-		if err != nil {
-			log.Printf("Can't connect to whois server. Error: %s", err)
-			return nil, 0, err
-		}
-		defer conn.Close()
-
-		_, err = conn.Write([]byte("-K -l " + ipaddr + "\r\n"))
-		if err != nil {
-			log.Printf("Can't send ip addr to whois server. Error: %s", err)
-			return nil, 0, err
-		}
-
-		buf := make([]byte, 1024)
-
-		result := []byte{}
-
-		for {
-			numBytes, err := conn.Read(buf)
-			sbuf := buf[0:numBytes]
-			result = append(result, sbuf...)
-			if err != nil {
-				break
-			}
-		}
-
-		matches := whoisRe.FindStringSubmatch(string(result))
-		if len(matches) >= 3 {
-			ipNetwork := net.ParseIP(matches[1])
-			if ipNetwork == nil {
-				log.Printf("Can't convert ip addr to IP.")
-				return nil, 0, errors.New("can't convert ip addr to IP")
-			}
-			ipMask, err := strconv.Atoi(matches[2])
-			if err != nil {
-				log.Printf("Can't convert ip mask to int. Error: %s", err)
-				return ipNetwork, 0, errors.New("can't convert ip mask string to int")
-			}
-			return net.ParseIP(matches[1]), ipMask, nil
-		}
-	}
-	return nil, 0, errors.New("can't parse whois IP address")
+type cacheEntry struct {
+	msg        *dns.Msg
+	expiration time.Time
 }
 
-func searchGW(routesTable []netlink.Route) int {
-	var route = -1
-	for index, oneRoute := range routesTable {
-		if oneRoute.Gw.Equal(routeAddress) {
-			route = index
+func init() {
+	// Читаем обязательные переменные окружения
+	listenAddr = os.Getenv("LISTEN_ADDR")
+	upstream = os.Getenv("UPSTREAM")
+	wgGateway = os.Getenv("WG_GATEWAY")
+	if listenAddr == "" || upstream == "" || wgGateway == "" {
+		log.Fatal("Необходимы env: LISTEN_ADDR, UPSTREAM, WG_GATEWAY")
+	}
+	log.Printf("CONFIG: LISTEN_ADDR=%s UPSTREAM=%s WG_GATEWAY=%s", listenAddr, upstream, wgGateway)
+
+	// Читаем список доменов
+	env := os.Getenv("DOMAINS")
+	if env == "" {
+		log.Fatal("env DOMAINS не установлена (пример: DOMAINS=example.com,foo.bar)")
+	}
+	for _, d := range strings.Split(env, ",") {
+		d = strings.ToLower(strings.TrimSpace(d))
+		if d != "" {
+			specialDomains = append(specialDomains, d)
 		}
 	}
-	return route
-}
+	log.Printf("Loaded %d special domains", len(specialDomains))
 
-func setRoute(address net.IP, skipWhois bool) {
-	routes, err := netlink.RouteGet(address)
-	if err != nil {
-		log.Printf("Can't get route for %s from netlink: %v", address, err)
-	}
-	searchResult := searchGW(routes)
-	if searchResult < 0 {
-		log.Printf("Can't find route %s to GW %s", address, routeAddress)
-		mask := 32
-		if whoisAddress != "" && !skipWhois {
-			log.Printf("Try send request to whois server.")
-			ipNetwork, ipMask, err := whois(address.String())
-			if err != nil {
-				log.Printf("Can't get ip network for %s from whois server: %v", address, err)
-			} else {
-				log.Printf("Done. Network: %s, Mask: %v", ipNetwork, ipMask)
-				address = ipNetwork
-				mask = ipMask
+	// Фоновая чистка кэша
+	go func() {
+		ticker := time.NewTicker(cacheCleanupInterval)
+		defer ticker.Stop()
+		for range ticker.C {
+			now := time.Now()
+			cacheMu.Lock()
+			for k, e := range cache {
+				if now.After(e.expiration) {
+					delete(cache, k)
+				}
 			}
+			cacheMu.Unlock()
 		}
-		destination := &net.IPNet{
-			IP: address, Mask: net.CIDRMask(mask, 32),
-		}
-		customRoute := &netlink.Route{
-			Dst: destination,
-			Gw:  routeAddress,
-		}
-		err = netlink.RouteAdd(customRoute)
-		if err != nil {
-			log.Printf("Can't add custom route for %s to netlink: %v", customRoute, err)
-		}
-		log.Printf("Added route: %s/%v via %s", address, mask, routeAddress)
-	}
-}
-
-func resolve(domain string, qtype uint16, skipWhois bool) []dns.RR {
-	m := new(dns.Msg)
-	m.SetQuestion(dns.Fqdn(domain), qtype)
-	m.RecursionDesired = true
-
-	c := new(dns.Client)
-	in, _, err := c.Exchange(m, dnsAddress)
-	if err != nil {
-		log.Println(err)
-		return nil
-	}
-
-	matches := re.FindStringSubmatch(domain)
-	if qtype == dns.TypeA && len(matches) > 0 {
-		log.Printf("Listed domain found: %s\n", domain)
-		for _, ans := range in.Answer {
-			address := net.ParseIP(strings.ReplaceAll(ans.String(), ans.Header().String(), ""))
-			if address != nil {
-				setRoute(address, skipWhois)
-			}
-		}
-	}
-	return in.Answer
-}
-
-type dnsHandler struct{}
-
-func (h *dnsHandler) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
-	msg := new(dns.Msg)
-	msg.SetReply(r)
-	msg.Authoritative = true
-
-	for _, question := range r.Question {
-		log.Printf("DNS request: %s\n", question.Name)
-		answers := resolve(question.Name, question.Qtype, false)
-		msg.Answer = append(msg.Answer, answers...)
-	}
-
-	err := w.WriteMsg(msg)
-	if err != nil {
-		log.Println(err)
-	}
+	}()
 }
 
 func main() {
+	dns.HandleFunc(".", handleDNS)
 
-	domains := strings.Split(os.Getenv("DOMAINS"), ",")
-	address := os.Getenv("ADDRESS")
-	var filter string
-	for index, domain := range domains {
-		if index > 0 {
-			filter += "|"
-		}
-		filter += domain + ".$"
-	}
-	re = regexp.MustCompile(filter)
-	whoisRe = regexp.MustCompile(`route: (\S+)/(\d+)`)
-
+	// UDP-сервер
 	go func() {
-		tcpHandler := new(dnsHandler)
-		tcpServer := &dns.Server{
-			Addr:      address,
-			Net:       "tcp",
-			Handler:   tcpHandler,
-			ReusePort: true,
-		}
-
-		log.Printf("Starting tcp DNS server on %s\n", address)
-		err := tcpServer.ListenAndServe()
-		if err != nil {
-			log.Printf("Failed to start tcp server: %s\n", err.Error())
+		srv := &dns.Server{Addr: listenAddr, Net: "udp"}
+		log.Printf("Starting UDP on %s", listenAddr)
+		if err := srv.ListenAndServe(); err != nil {
+			log.Fatalf("UDP ListenAndServe error: %v", err)
 		}
 	}()
 
-	udpHandler := new(dnsHandler)
-	udpServer := &dns.Server{
-		Addr:      address,
-		Net:       "udp",
-		Handler:   udpHandler,
-		UDPSize:   65535,
-		ReusePort: true,
+	// TCP-сервер
+	srv := &dns.Server{Addr: listenAddr, Net: "tcp"}
+	log.Printf("Starting TCP on %s", listenAddr)
+	if err := srv.ListenAndServe(); err != nil {
+		log.Fatalf("TCP ListenAndServe error: %v", err)
 	}
-	log.Printf("Starting udp DNS server on %s\n", address)
-	err := udpServer.ListenAndServe()
-	if err != nil {
-		log.Printf("Failed to start udp server: %s\n", err.Error())
-	}
-
 }
 
-//TIP See GoLand help at <a href="https://www.jetbrains.com/help/go/">jetbrains.com/help/go/</a>.
-// Also, you can try interactive lessons for GoLand by selecting 'Help | Learn IDE Features' from the main menu.
+func handleDNS(w dns.ResponseWriter, req *dns.Msg) {
+	if len(req.Question) == 0 {
+		respondSERVFAIL(w, req)
+		return
+	}
+
+	q := req.Question[0]
+	name := strings.ToLower(strings.TrimSuffix(q.Name, "."))
+
+	key := name + ":" + dns.TypeToString[q.Qtype]
+
+	// Попытка из кеша
+	cacheMu.RLock()
+	if entry, ok := cache[key]; ok && time.Now().Before(entry.expiration) {
+		cacheMu.RUnlock()
+		w.WriteMsg(entry.msg.Copy())
+		return
+	}
+	cacheMu.RUnlock()
+
+	// Форвардим к upstream по TLS
+	client := &dns.Client{
+		Net:       "tcp-tls",
+		TLSConfig: &tls.Config{InsecureSkipVerify: true},
+	}
+	resp, _, err := client.Exchange(req, upstream)
+	if err != nil {
+		log.Printf("Forward %s %s error: %v", q.Name, dns.TypeToString[q.Qtype], err)
+		respondSERVFAIL(w, req)
+		return
+	}
+
+	// Если A-запрос и специальный домен — добавляем маршруты подсетей
+	if q.Qtype == dns.TypeA && isSpecial(name) {
+		seen := map[string]struct{}{}
+		for _, rr := range resp.Answer {
+			if a, ok := rr.(*dns.A); ok {
+				cidr := lookupCIDR(a.A.String())
+				if cidr == "" {
+					cidr = a.A.String() + "/32"
+				}
+				if _, exists := seen[cidr]; !exists {
+					if err := addRoute(cidr); err != nil {
+						log.Printf("Route add %s error: %v", cidr, err)
+					} else {
+						log.Printf("Route added: %s → dev %s via %s", cidr, wgInterface, wgGateway)
+					}
+					seen[cidr] = struct{}{}
+				}
+			}
+		}
+	}
+
+	// Сохраняем в кеш по минимальному TTL
+	if len(resp.Answer) > 0 {
+		minTTL := resp.Answer[0].Header().Ttl
+		for _, rr := range resp.Answer[1:] {
+			if rr.Header().Ttl < minTTL {
+				minTTL = rr.Header().Ttl
+			}
+		}
+		cacheMu.Lock()
+		cache[key] = cacheEntry{
+			msg:        resp.Copy(),
+			expiration: time.Now().Add(time.Duration(minTTL) * time.Second),
+		}
+		cacheMu.Unlock()
+	}
+
+	w.WriteMsg(resp)
+}
+
+func isSpecial(name string) bool {
+	for _, d := range specialDomains {
+		if name == d {
+			return true
+		}
+	}
+	return false
+}
+
+// lookupCIDR: выбирает самую маленькую (самую специфичную) подсеть из WHOIS
+func lookupCIDR(ip string) string {
+	// 1) Запрос IANA
+	data, err := whoisQuery("whois.iana.org:"+whoisPort, ip)
+	if err != nil {
+		return ""
+	}
+	refer := parseField(data, `(?mi)^refer:\s*(\S+)`)
+
+	combined := data
+	// 2) Региональный WHOIS, если refer задан
+	if refer != "" {
+		if data2, err2 := whoisQuery(refer+":"+whoisPort, ip); err2 == nil {
+			combined = append(combined, data2...)
+		}
+	}
+
+	// 3) Ищем все CIDR записи и выбираем с наибольшим префиксом (самая мелкая подсеть)
+	matches := cidrRe.FindAllSubmatch(combined, -1)
+	var bestNet *net.IPNet
+	bestOnes := -1
+	for _, m := range matches {
+		cidrStr := string(m[1])
+		_, netw, err := net.ParseCIDR(cidrStr)
+		if err != nil {
+			continue
+		}
+		ones, _ := netw.Mask.Size()
+		if ones > bestOnes {
+			bestOnes = ones
+			bestNet = netw
+		}
+	}
+	if bestNet != nil {
+		return bestNet.String()
+	}
+	return ""
+}
+
+func whoisQuery(server, query string) ([]byte, error) {
+	conn, err := net.Dial("tcp", server)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	if _, err := conn.Write([]byte(query + "\r\n")); err != nil {
+		return nil, err
+	}
+	var buf bytes.Buffer
+	reader := bufio.NewReader(conn)
+	_, err = io.Copy(&buf, reader)
+	return buf.Bytes(), err
+}
+
+func parseField(data []byte, pattern string) string {
+	re := regexp.MustCompile(pattern)
+	for _, line := range strings.Split(string(data), "\n") {
+		if m := re.FindStringSubmatch(line); m != nil {
+			return m[1]
+		}
+	}
+	return ""
+}
+
+func respondSERVFAIL(w dns.ResponseWriter, req *dns.Msg) {
+	m := new(dns.Msg)
+	m.SetRcode(req, dns.RcodeServerFailure)
+	w.WriteMsg(m)
+}
+
+func addRoute(cidr string) error {
+	// Парсим подсеть
+	_, dst, err := net.ParseCIDR(cidr)
+	if err != nil {
+		return err
+	}
+	gw := net.ParseIP(wgGateway)
+	if gw == nil {
+		return fmt.Errorf("invalid gateway IP: %s", wgGateway)
+	}
+
+	// Получаем link wg0
+	link, err := netlink.LinkByName(wgInterface)
+	if err != nil {
+		return err
+	}
+
+	// Проверяем существующие маршруты
+	routes, err := netlink.RouteList(link, netlink.FAMILY_V4)
+	if err != nil {
+		return err
+	}
+	for _, r := range routes {
+		if r.Dst != nil &&
+			r.Dst.IP.Equal(dst.IP) &&
+			bytes.Equal(r.Dst.Mask, dst.Mask) &&
+			r.Gw.Equal(gw) {
+			return nil // уже есть
+		}
+	}
+
+	// Добавляем новые
+	route := &netlink.Route{
+		LinkIndex: link.Attrs().Index,
+		Dst:       dst,
+		Gw:        gw,
+	}
+	return netlink.RouteAdd(route)
+}
