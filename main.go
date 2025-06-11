@@ -177,7 +177,8 @@ func handleDNS(w dns.ResponseWriter, req *dns.Msg) {
 
 func isSpecial(name string) bool {
 	for _, d := range specialDomains {
-		if name == d {
+		// match exact domain or any subdomain
+		if name == d || strings.HasSuffix(name, "."+d) {
 			return true
 		}
 	}
