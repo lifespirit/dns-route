@@ -131,7 +131,7 @@ func handleDNS(w dns.ResponseWriter, req *dns.Msg) {
 	}
 	cacheMu.RUnlock()
 
-	client := &dns.Client{Net: "tcp-tls", TLSConfig: &tls.Config{InsecureSkipVerify: true}}
+	client := &dns.Client{Net: "tcp-tls", TLSConfig: &tls.Config{InsecureSkipVerify: false}}
 	resp, _, err := client.Exchange(req, upstream)
 	if err != nil {
 		log.Printf("Forward %s %s error: %v", q.Name, dns.TypeToString[q.Qtype], err)
