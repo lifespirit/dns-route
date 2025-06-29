@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"regexp"
 	"strings"
@@ -92,9 +93,8 @@ func init() {
 func main() {
 	dns.HandleFunc(".", handleDNS)
 
-	// Запускаем UDP и TCP сервера на каждом указанном адресе
-	for _, host := range listenAddrs {
-		addr := net.JoinHostPort(host, "53")
+	// Start UDP and TCP servers on each address
+	for _, addr := range listenAddrs {
 		go startServer("udp", addr)
 		go startServer("tcp", addr)
 	}
@@ -131,12 +131,41 @@ func handleDNS(w dns.ResponseWriter, req *dns.Msg) {
 	}
 	cacheMu.RUnlock()
 
-	client := &dns.Client{Net: "tcp-tls", TLSConfig: &tls.Config{InsecureSkipVerify: false}}
-	resp, _, err := client.Exchange(req, upstream)
-	if err != nil {
-		log.Printf("Forward %s %s error: %v", q.Name, dns.TypeToString[q.Qtype], err)
-		respondSERVFAIL(w, req)
-		return
+	var resp *dns.Msg
+	var err error
+	if strings.HasPrefix(upstream, "https://") {
+		wire, _ := req.Pack()
+		httpReq, _ := http.NewRequest("POST", upstream, bytes.NewReader(wire))
+		httpReq.Header.Set("Content-Type", "application/dns-message")
+		httpReq.Header.Set("Accept", "application/dns-message")
+		client := &http.Client{
+			Timeout: 5 * time.Second,
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			},
+		}
+		httpResp, errDoH := client.Do(httpReq)
+		if errDoH != nil {
+			log.Printf("DoH forward error: %v", errDoH)
+			respondSERVFAIL(w, req)
+			return
+		}
+		defer httpResp.Body.Close()
+		body, _ := io.ReadAll(httpResp.Body)
+		resp = new(dns.Msg)
+		if err = resp.Unpack(body); err != nil {
+			log.Printf("DoH unpack error: %v", err)
+			respondSERVFAIL(w, req)
+			return
+		}
+	} else {
+		client := &dns.Client{Net: "tcp-tls", TLSConfig: &tls.Config{InsecureSkipVerify: true}}
+		resp, _, err = client.Exchange(req, upstream)
+		if err != nil {
+			log.Printf("Forward %s %s error: %v", q.Name, dns.TypeToString[q.Qtype], err)
+			respondSERVFAIL(w, req)
+			return
+		}
 	}
 	resp.Id = req.Id
 
