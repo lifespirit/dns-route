@@ -2,7 +2,10 @@ module dns-route
 
 go 1.23.2
 
-require github.com/miekg/dns v1.1.62
+require (
+	github.com/miekg/dns v1.1.62
+	github.com/vishvananda/netlink v1.2.1-beta.2.0.20240524165444-4d4ba1473f21
+)
 
 require (
 	github.com/Masterminds/semver/v3 v3.2.1 // indirect
@@ -98,7 +101,6 @@ require (
 	github.com/tidwall/match v1.1.1 // indirect
 	github.com/tidwall/pretty v1.2.0 // indirect
 	github.com/tidwall/sjson v1.2.5 // indirect
-	github.com/vishvananda/netlink v1.2.1-beta.2.0.20240524165444-4d4ba1473f21 // indirect
 	github.com/vishvananda/netns v0.0.4 // indirect
 	go.etcd.io/etcd/api/v3 v3.5.14 // indirect
 	go.etcd.io/etcd/client/pkg/v3 v3.5.14 // indirect

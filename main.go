@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net"
 	"net/http"
 	"os"
 	"regexp"
+        "strconv"
 	"strings"
 	"sync"
 	"time"
@@ -27,9 +29,10 @@ const (
 
 var (
 	listenAddrs    []string
-	upstream       string
+	upstreams      []string
 	wgGateway      string
 	specialDomains []string
+        routeTable     int // по умолчанию = 0 (main)
 
 	cache   = make(map[string]cacheEntry)
 	cacheMu sync.RWMutex
@@ -52,13 +55,23 @@ func init() {
 			}
 		}
 	}
-	upstream = os.Getenv("UPSTREAM")
+        if env := os.Getenv("UPSTREAM"); env != "" {
+                for _, u := range strings.Split(env, ",") {
+			if up := strings.TrimSpace(u); up != "" {
+				upstreams = append(upstreams, up)
+			}
+		}
+	}
+
 	wgGateway = os.Getenv("WG_GATEWAY")
 
-	if len(listenAddrs) == 0 || upstream == "" || wgGateway == "" {
+	if len(listenAddrs) == 0 || len(upstreams) == 0 || wgGateway == "" {
 		log.Fatal("Необходимы env: LISTEN_ADDRS, UPSTREAM, WG_GATEWAY")
 	}
-	log.Printf("CONFIG: LISTEN_ADDRS=%v, UPSTREAM=%s, WG_GATEWAY=%s", listenAddrs, upstream, wgGateway)
+
+	log.Printf("CONFIG: LISTEN_ADDRS=%v, UPSTREAMS=%v, WG_GATEWAY=%s", listenAddrs, upstreams, wgGateway)
+
+	rand.Seed(time.Now().UnixNano())
 
 	// Читаем список доменов
 	if env := os.Getenv("DOMAINS"); env != "" {
@@ -72,6 +85,19 @@ func init() {
 		log.Fatal("env DOMAINS не установлена или пуста (пример: DOMAINS=example.com,foo.bar)")
 	}
 	log.Printf("Loaded %d special domains", len(specialDomains))
+
+        routeTableStr := os.Getenv("ROUTE_TABLE")
+	if routeTableStr != "" {
+                v, err := strconv.Atoi(routeTableStr)
+		if err != nil {
+			log.Fatalf("Некорректный ROUTE_TABLE=%q: %v", routeTableStr, err)
+		}
+		routeTable = v
+		log.Printf("Using custom route table: %d", routeTable)
+	} else {
+		routeTable = 0 // main table
+		log.Printf("ROUTE_TABLE not set, using main table")
+	}
 
 	// Фоновая чистка кэша
 	go func() {
@@ -112,11 +138,104 @@ func startServer(network, addr string) {
 	}
 }
 
+func shuffledUpstreams() []string {
+	res := append([]string(nil), upstreams...)
+	rand.Shuffle(len(res), func(i, j int) {
+		res[i], res[j] = res[j], res[i]
+	})
+	return res
+}
+
+func forwardDNS(req *dns.Msg) (*dns.Msg, error) {
+	var lastErr error
+
+	for _, upstream := range shuffledUpstreams() {
+		var resp *dns.Msg
+		var err error
+
+		if strings.HasPrefix(upstream, "https://") {
+			wire, errPack := req.Pack()
+			if errPack != nil {
+				lastErr = errPack
+				log.Printf("DoH pack error for %s: %v", upstream, errPack)
+				continue
+			}
+
+			httpReq, errReq := http.NewRequest("POST", upstream, bytes.NewReader(wire))
+			if errReq != nil {
+				lastErr = errReq
+				log.Printf("DoH request build error for %s: %v", upstream, errReq)
+				continue
+			}
+
+			httpReq.Header.Set("Content-Type", "application/dns-message")
+			httpReq.Header.Set("Accept", "application/dns-message")
+
+			client := &http.Client{
+				Timeout: 5 * time.Second,
+				Transport: &http.Transport{
+					TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+				},
+			}
+
+			httpResp, errDoH := client.Do(httpReq)
+			if errDoH != nil {
+				lastErr = errDoH
+				log.Printf("DoH forward via %s error: %v", upstream, errDoH)
+				continue
+			}
+
+			body, errRead := io.ReadAll(httpResp.Body)
+			httpResp.Body.Close()
+			if errRead != nil {
+				lastErr = errRead
+				log.Printf("DoH read via %s error: %v", upstream, errRead)
+				continue
+			}
+
+			if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+				lastErr = fmt.Errorf("unexpected HTTP status %s", httpResp.Status)
+				log.Printf("DoH upstream %s returned %s", upstream, httpResp.Status)
+				continue
+			}
+
+			resp = new(dns.Msg)
+			if err = resp.Unpack(body); err != nil {
+				lastErr = err
+				log.Printf("DoH unpack via %s error: %v", upstream, err)
+				continue
+			}
+		} else {
+			client := &dns.Client{
+				Net:       "tcp-tls",
+				Timeout:   5 * time.Second,
+				TLSConfig: &tls.Config{InsecureSkipVerify: true},
+			}
+
+			resp, _, err = client.Exchange(req, upstream)
+			if err != nil {
+				lastErr = err
+				log.Printf("DNS forward via %s error: %v", upstream, err)
+				continue
+			}
+		}
+
+		log.Printf("DNS forward success via %s", upstream)
+		return resp, nil
+	}
+
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no upstreams configured")
+	}
+	return nil, lastErr
+}
+
 func handleDNS(w dns.ResponseWriter, req *dns.Msg) {
 	if len(req.Question) == 0 {
 		respondSERVFAIL(w, req)
 		return
 	}
+
 	q := req.Question[0]
 	name := strings.ToLower(strings.TrimSuffix(q.Name, "."))
 	key := name + ":" + dns.TypeToString[q.Qtype]
@@ -131,42 +250,13 @@ func handleDNS(w dns.ResponseWriter, req *dns.Msg) {
 	}
 	cacheMu.RUnlock()
 
-	var resp *dns.Msg
-	var err error
-	if strings.HasPrefix(upstream, "https://") {
-		wire, _ := req.Pack()
-		httpReq, _ := http.NewRequest("POST", upstream, bytes.NewReader(wire))
-		httpReq.Header.Set("Content-Type", "application/dns-message")
-		httpReq.Header.Set("Accept", "application/dns-message")
-		client := &http.Client{
-			Timeout: 5 * time.Second,
-			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-			},
-		}
-		httpResp, errDoH := client.Do(httpReq)
-		if errDoH != nil {
-			log.Printf("DoH forward error: %v", errDoH)
-			respondSERVFAIL(w, req)
-			return
-		}
-		defer httpResp.Body.Close()
-		body, _ := io.ReadAll(httpResp.Body)
-		resp = new(dns.Msg)
-		if err = resp.Unpack(body); err != nil {
-			log.Printf("DoH unpack error: %v", err)
-			respondSERVFAIL(w, req)
-			return
-		}
-	} else {
-		client := &dns.Client{Net: "tcp-tls", TLSConfig: &tls.Config{InsecureSkipVerify: true}}
-		resp, _, err = client.Exchange(req, upstream)
-		if err != nil {
-			log.Printf("Forward %s %s error: %v", q.Name, dns.TypeToString[q.Qtype], err)
-			respondSERVFAIL(w, req)
-			return
-		}
+	resp, err := forwardDNS(req)
+	if err != nil {
+		log.Printf("Forward %s %s failed on all upstreams: %v", q.Name, dns.TypeToString[q.Qtype], err)
+		respondSERVFAIL(w, req)
+		return
 	}
+
 	resp.Id = req.Id
 
 	if q.Qtype == dns.TypeA && isSpecial(name) {
@@ -196,8 +286,12 @@ func handleDNS(w dns.ResponseWriter, req *dns.Msg) {
 				minTTL = rr.Header().Ttl
 			}
 		}
+
 		cacheMu.Lock()
-		cache[key] = cacheEntry{msg: resp.Copy(), expiration: time.Now().Add(time.Duration(minTTL) * time.Second)}
+		cache[key] = cacheEntry{
+			msg:        resp.Copy(),
+			expiration: time.Now().Add(time.Duration(minTTL) * time.Second),
+		}
 		cacheMu.Unlock()
 	}
 
@@ -282,25 +376,37 @@ func respondSERVFAIL(w dns.ResponseWriter, req *dns.Msg) {
 func addRoute(cidr string) error {
 	_, dst, err := net.ParseCIDR(cidr)
 	if err != nil {
-		return err
+		return fmt.Errorf("parse cidr %q: %w", cidr, err)
 	}
-	gw := net.ParseIP(wgGateway)
-	if gw == nil {
-		return fmt.Errorf("invalid gateway IP: %s", wgGateway)
-	}
+
 	link, err := netlink.LinkByName(wgInterface)
 	if err != nil {
-		return err
+		return fmt.Errorf("get link %q: %w", wgInterface, err)
 	}
-	routes, err := netlink.RouteList(link, netlink.FAMILY_V4)
-	if err != nil {
-		return err
+
+	gw := net.ParseIP(wgGateway)
+	if gw == nil {
+		return fmt.Errorf("invalid WG_GATEWAY %q", wgGateway)
 	}
-	for _, r := range routes {
-		if r.Dst != nil && r.Dst.IP.Equal(dst.IP) && bytes.Equal(r.Dst.Mask, dst.Mask) && r.Gw.Equal(gw) {
-			return nil
-		}
+
+	route := netlink.Route{
+		LinkIndex: link.Attrs().Index,
+		Dst:       dst,
+		Gw:        gw,
+		Table:     routeTable, // 0 = main table
 	}
-	route := &netlink.Route{LinkIndex: link.Attrs().Index, Dst: dst, Gw: gw}
-	return netlink.RouteAdd(route)
+
+	if err := netlink.RouteReplace(&route); err != nil {
+		return fmt.Errorf("route replace %q in table %d: %w", cidr, routeTable, err)
+	}
+
+	tableForLog := routeTable
+	if tableForLog == 0 {
+		tableForLog = 254
+	}
+
+	log.Printf("Route added: %s -> dev %s via %s table %d",
+		cidr, wgInterface, wgGateway, tableForLog)
+
+	return nil
 }
