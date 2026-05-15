@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>dns-route admin</title>
+<style>
+body { font-family: sans-serif; margin: 24px; }
+h1,h2 { margin-top: 24px; }
+table { border-collapse: collapse; width: 100%; margin-top: 8px; }
+th, td { border: 1px solid #ccc; padding: 8px; text-align: left; vertical-align: top; }
+input[type=text], input[type=number], select { width: 100%; box-sizing: border-box; padding: 6px; }
+form.inline { display: inline; margin: 0; }
+.grid { display: grid; grid-template-columns: repeat(2, minmax(280px, 1fr)); gap: 16px; }
+.card { border: 1px solid #ccc; padding: 16px; border-radius: 8px; }
+.section-gap { margin-top: 24px; }
+small { color: #666; }
+button { padding: 6px 10px; }
+.actions { margin-top: 16px; }
+</style>
+</head>
+<body>
+<h1>dns-route admin</h1>
+<p><small>HTTP panel: {{.Message}}</small></p>
+
+<div class="grid">
+  <div class="card">
+    <h2>Global settings</h2>
+    <form method="post" action="/settings/save">
+      <table>
+        <tr><th>Key</th><th>Value</th></tr>
+        <tr><td>wg_interface</td><td><input type="text" name="wg_interface" value="{{index .Settings "wg_interface"}}"></td></tr>
+        <tr><td>wg_gateway</td><td><input type="text" name="wg_gateway" value="{{index .Settings "wg_gateway"}}"></td></tr>
+        <tr><td>route_table</td><td><input type="text" name="route_table" value="{{index .Settings "route_table"}}"></td></tr>
+        <tr><td>local_record_ttl</td><td><input type="text" name="local_record_ttl" value="{{index .Settings "local_record_ttl"}}"></td></tr>
+        <tr><td>lookup_cidr</td><td><input type="checkbox" name="lookup_cidr" value="1" {{if eq (index .Settings "lookup_cidr") "1"}}checked{{end}}></td></tr>
+        <tr><td>reply_before_route</td><td><input type="checkbox" name="reply_before_route" value="1" {{if eq (index .Settings "reply_before_route") "1"}}checked{{end}}></td></tr>
+      </table>
+      <p><button type="submit">Save settings</button></p>
+    </form>
+  </div>
+
+  <div class="card">
+    <h2>Runtime</h2>
+    <table>
+      <tr><td>Listen addrs</td><td>{{len .Config.ListenAddrs}}</td></tr>
+      <tr><td>Upstreams</td><td>{{len .Config.Upstreams}}</td></tr>
+      <tr><td>Special domains</td><td>{{len .SpecialDomains}}</td></tr>
+      <tr><td>Local A domains</td><td>{{len .Config.LocalA}}</td></tr>
+      <tr><td>Local AAAA domains</td><td>{{len .Config.LocalAAAA}}</td></tr>
+      <tr><td>Route table</td><td>{{.Config.RouteTable}}</td></tr>
+      <tr><td>Lookup CIDR</td><td>{{.Config.LookupCIDR}}</td></tr>
+      <tr><td>Reply before route</td><td>{{.Config.ReplyBeforeRoute}}</td></tr>
+      <tr><td>WG interface</td><td>{{.Config.WGInterface}}</td></tr>
+      <tr><td>WG gateway</td><td>{{.Config.WGGateway}}</td></tr>
+    </table>
+    <div class="actions">
+      <form class="inline" method="post" action="/reload"><button type="submit">Reload config</button></form>
+      <form class="inline" method="post" action="/routes/reload"><button type="submit">Reload routes</button></form>
+      <button type="button" onclick="location.href='/stats'">Open statistics</button>
+      <button type="button" onclick="window.open('/metrics', '_blank')">Prometheus metrics</button>
+    </div>
+  </div>
+</div>
+
+<div class="grid section-gap">
+  <div class="card">
+    <h2>Listen addresses</h2>
+    <form method="post" action="/listen/add">
+      <input type="text" name="addr" placeholder="0.0.0.0:53 or [::]:53">
+      <p><button type="submit">Add listen address</button></p>
+    </form>
+    <table>
+      <tr><th>Address</th><th>Action</th></tr>
+      {{range .ListenAddrs}}<tr><td>{{.}}</td><td><form class="inline" method="post" action="/listen/delete"><input type="hidden" name="addr" value="{{.}}"><button type="submit">Delete</button></form></td></tr>{{end}}
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>Upstreams</h2>
+    <form method="post" action="/upstream/add">
+      <input type="text" name="addr" placeholder="1.1.1.1:853 or https://dns.google/dns-query">
+      <p><button type="submit">Add upstream</button></p>
+    </form>
+    <table>
+      <tr><th>Upstream</th><th>Action</th></tr>
+      {{range .Upstreams}}<tr><td>{{.}}</td><td><form class="inline" method="post" action="/upstream/delete"><input type="hidden" name="addr" value="{{.}}"><button type="submit">Delete</button></form></td></tr>{{end}}
+    </table>
+  </div>
+</div>
+
+<div class="card section-gap">
+  <h2>Special domains</h2>
+  <form method="post" action="/special/add">
+    <input type="text" name="domain" placeholder="example.com">
+    <p><button type="submit">Add special domain</button></p>
+  </form>
+  <table>
+    <tr><th>Domain</th><th>Action</th></tr>
+    {{range .SpecialDomains}}<tr><td>{{.}}</td><td><form class="inline" method="post" action="/special/delete"><input type="hidden" name="domain" value="{{.}}"><button type="submit">Delete</button></form></td></tr>{{end}}
+  </table>
+</div>
+
+<div class="card section-gap">
+  <h2>DNS records</h2>
+  <form method="post" action="/record/add">
+    <table>
+      <tr>
+        <td><input type="text" name="name" placeholder="example.com or *.example.com"></td>
+        <td><select name="type"><option value="A">A</option><option value="AAAA">AAAA</option></select></td>
+        <td><input type="text" name="value" placeholder="10.0.0.1, 2001:db8::1, or empty=NODATA"></td>
+        <td><input type="number" name="ttl" placeholder="0"></td>
+        <td><button type="submit">Add record</button></td>
+      </tr>
+    </table>
+  </form>
+  <table>
+    <tr><th>ID</th><th>Name</th><th>Type</th><th>Value</th><th>TTL</th><th>Action</th></tr>
+    {{range .Records}}<tr><td>{{.ID}}</td><td>{{.Name}}</td><td>{{.Type}}</td><td>{{.Value}}</td><td>{{.TTL}}</td><td><form class="inline" method="post" action="/record/delete"><input type="hidden" name="id" value="{{.ID}}"><button type="submit">Delete</button></form></td></tr>{{end}}
+  </table>
+</div>
+</body>
+</html>

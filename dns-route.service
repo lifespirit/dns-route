@@ -1,12 +1,12 @@
 [Unit]
 Description=DNS route daemon
-After=network-online.target named.service openvpn-client@vps.service
-Wants=network-online.target named.service openvpn-client@vps.service
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 TimeoutStartSec=infinity
-EnvironmentFile=-/etc/conf.d/dns-route.env
-ExecStart=/usr/bin/dns-route
+StateDirectory=dns-route
+ExecStart=/usr/bin/dns-route -http 192.168.12.1:9010 -db /var/lib/dns-route/config.db
 
 [Install]
 WantedBy=multi-user.target

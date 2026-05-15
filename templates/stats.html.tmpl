@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>dns-route stats</title>
+<style>
+body { font-family: sans-serif; margin: 24px; }
+table { border-collapse: collapse; width: 100%; }
+th, td { border: 1px solid #ccc; padding: 8px; text-align: left; }
+.card { border: 1px solid #ccc; padding: 16px; border-radius: 8px; margin-bottom: 24px; }
+button { padding: 6px 10px; }
+.actions { margin-top: 16px; }
+</style>
+</head>
+<body>
+<h1>dns-route statistics</h1>
+<div class="card">
+  <h2>Runtime</h2>
+  <table>
+    <tr><td>Started at</td><td>{{.StartedAt}}</td></tr>
+    <tr><td>Uptime</td><td>{{.Uptime}}</td></tr>
+    <tr><td>Cache entries</td><td>{{.CacheEntries}}</td></tr>
+    <tr><td>Active listeners</td><td>{{.ActiveListeners}}</td></tr>
+    <tr><td>Route snapshot entries</td><td>{{.RouteSnapshot}}</td></tr>
+    <tr><td>IP cache entries</td><td>{{.IPCacheEntries}}</td></tr>
+    <tr><td>CIDR cache entries</td><td>{{.CIDRCacheEntries}}</td></tr>
+  </table>
+  <div class="actions">
+    <button type="button" onclick="location.href='/'">Back to admin</button>
+    <button type="button" onclick="window.open('/metrics', '_blank')">Prometheus metrics</button>
+  </div>
+</div>
+<div class="card">
+  <h2>Configuration</h2>
+  <table>
+    <tr><td>Listen addrs</td><td>{{.ListenAddrs}}</td></tr>
+    <tr><td>Upstreams</td><td>{{.Upstreams}}</td></tr>
+    <tr><td>Special domains</td><td>{{.SpecialDomains}}</td></tr>
+    <tr><td>Local A domains</td><td>{{.LocalADomains}}</td></tr>
+    <tr><td>Local AAAA domains</td><td>{{.LocalAAAADomains}}</td></tr>
+    <tr><td>Lookup CIDR</td><td>{{.LookupCIDR}}</td></tr>
+    <tr><td>Reply before route</td><td>{{.ReplyBeforeRoute}}</td></tr>
+    <tr><td>Route table</td><td>{{.RouteTable}}</td></tr>
+    <tr><td>WG interface</td><td>{{.WGInterface}}</td></tr>
+    <tr><td>WG gateway</td><td>{{.WGGateway}}</td></tr>
+  </table>
+</div>
+<div class="card">
+  <h2>Counters</h2>
+  <table>
+    <tr><td>Total queries</td><td>{{.TotalQueries}}</td></tr>
+    <tr><td>Cache hits</td><td>{{.CacheHits}}</td></tr>
+    <tr><td>Cache misses</td><td>{{.CacheMisses}}</td></tr>
+    <tr><td>Local answers</td><td>{{.LocalAnswers}}</td></tr>
+    <tr><td>Forwarded OK</td><td>{{.ForwardedOK}}</td></tr>
+    <tr><td>SERVFAIL</td><td>{{.ServfailCount}}</td></tr>
+    <tr><td>Route adds</td><td>{{.RouteAdds}}</td></tr>
+    <tr><td>Route add errors</td><td>{{.RouteAddErrors}}</td></tr>
+    <tr><td>Forward errors</td><td>{{.ForwardErrors}}</td></tr>
+    <tr><td>lookupCIDR attempts</td><td>{{.LookupCIDRAttempts}}</td></tr>
+    <tr><td>lookupCIDR failed</td><td>{{.LookupCIDRFailed}}</td></tr>
+  </table>
+</div>
+</body>
+</html>
