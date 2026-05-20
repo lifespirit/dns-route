@@ -63,8 +63,12 @@ type Config struct {
 	LocalA           map[string][]LocalRecord
 	LocalAAAA        map[string][]LocalRecord
 	WGGateway        string
+	WGGatewayV4      string
+	WGGatewayV6      string
 	WGInterface      string
 	RouteTable       int
+	RouteIPv4        bool
+	RouteIPv6        bool
 	DefaultTTL       uint32
 	LookupCIDR       bool
 	ReplyBeforeRoute bool
@@ -173,9 +177,13 @@ type statsData struct {
 	LocalAAAADomains int
 	LookupCIDR       bool
 	ReplyBeforeRoute bool
+	RouteIPv4        bool
+	RouteIPv6        bool
 	RouteTable       int
 	WGInterface      string
 	WGGateway        string
+	WGGatewayV4      string
+	WGGatewayV6      string
 	RouteSnapshot    int
 	IPCacheEntries   int
 	CIDRCacheEntries int
@@ -217,7 +225,7 @@ func main() {
 		db:        db,
 		cfg:       cfg,
 		cache:     make(map[string]cacheEntry),
-		cidrRe:    regexp.MustCompile(`(?mi)^CIDR:\s*([0-9./]+)`),
+		cidrRe:    regexp.MustCompile(`(?mi)^CIDR:\s*([0-9A-Fa-f:.]+/\d+)`),
 		servers:   make(map[string]*dns.Server),
 		adminAddr: *httpAddr,
 		startedAt: time.Now(),
@@ -264,18 +272,19 @@ func (rm *RouteManager) EnsureIPs(ips []net.IP) {
 	now := time.Now()
 	unique := map[string]struct{}{}
 	for _, ip := range ips {
-		v4 := ip.To4()
-		if v4 == nil {
+		routeIP := normalizeRouteIP(ip)
+		if routeIP == nil {
 			continue
 		}
-		s := v4.String()
+		s := routeIP.String()
 		if _, ok := unique[s]; ok {
 			continue
 		}
 		unique[s] = struct{}{}
 
-		if rm.ipCoveredBySnapshot(v4) {
-			rm.markIPApplied(s, s+"/32", now)
+		defaultCIDR := defaultCIDRForIP(routeIP)
+		if rm.ipCoveredBySnapshot(routeIP) {
+			rm.markIPApplied(s, defaultCIDR, now)
 			continue
 		}
 
@@ -285,7 +294,7 @@ func (rm *RouteManager) EnsureIPs(ips []net.IP) {
 			rm.ipMu.Unlock()
 			continue
 		}
-		rm.ipCache[s] = routeCacheEntry{State: StatePending, UpdatedAt: now}
+		rm.ipCache[s] = routeCacheEntry{State: StatePending, CIDR: defaultCIDR, UpdatedAt: now}
 		rm.ipMu.Unlock()
 
 		select {
@@ -298,27 +307,29 @@ func (rm *RouteManager) EnsureIPs(ips []net.IP) {
 
 func (rm *RouteManager) processIP(ip string) {
 	cfg := rm.app.getConfig()
-	parsed := net.ParseIP(ip).To4()
+	parsed := normalizeRouteIP(net.ParseIP(ip))
 	if parsed == nil {
 		return
 	}
+	ip = parsed.String()
 
+	defaultCIDR := defaultCIDRForIP(parsed)
 	if rm.ipCoveredBySnapshot(parsed) {
-		rm.markIPApplied(ip, ip+"/32", time.Now())
+		rm.markIPApplied(ip, defaultCIDR, time.Now())
 		return
 	}
 
-	cidr := ip + "/32"
+	cidr := defaultCIDR
 	if cfg.LookupCIDR {
 		atomic.AddUint64(&rm.app.lookupCIDRAttempts, 1)
 		val, _, _ := rm.lookupGroup.Do(ip, func() (any, error) {
 			if rm.ipCoveredBySnapshot(parsed) {
-				return ip + "/32", nil
+				return defaultCIDR, nil
 			}
 			c := rm.app.lookupCIDR(ip)
 			if c == "" {
 				atomic.AddUint64(&rm.app.lookupCIDRFailed, 1)
-				return ip + "/32", nil
+				return defaultCIDR, nil
 			}
 			return c, nil
 		})
@@ -466,11 +477,31 @@ func (rm *RouteManager) cidrCoveredBySnapshot(cidr string) bool {
 	return false
 }
 
+func normalizeRouteIP(ip net.IP) net.IP {
+	if ip == nil {
+		return nil
+	}
+	if v4 := ip.To4(); v4 != nil {
+		return v4
+	}
+	if v6 := ip.To16(); v6 != nil {
+		return v6
+	}
+	return nil
+}
+
+func defaultCIDRForIP(ip net.IP) string {
+	if v4 := ip.To4(); v4 != nil {
+		return v4.String() + "/32"
+	}
+	return ip.String() + "/128"
+}
+
 func logConfig(prefix string, cfg *Config) {
 	log.Printf(
-		"%s: LISTEN=%v UPSTREAMS=%v WG_INTERFACE=%s WG_GATEWAY=%s ROUTE_TABLE=%d LOOKUP_CIDR=%t REPLY_BEFORE_ROUTE=%t SPECIAL_DOMAINS=%d LOCAL_A=%d LOCAL_AAAA=%d",
-		prefix, cfg.ListenAddrs, cfg.Upstreams, cfg.WGInterface, cfg.WGGateway, cfg.RouteTable,
-		cfg.LookupCIDR, cfg.ReplyBeforeRoute, len(cfg.SpecialDomains), len(cfg.LocalA), len(cfg.LocalAAAA),
+		"%s: LISTEN=%v UPSTREAMS=%v WG_INTERFACE=%s WG_GATEWAY=%s WG_GATEWAY_V4=%s WG_GATEWAY_V6=%s ROUTE_TABLE=%d ROUTE_IPV4=%t ROUTE_IPV6=%t LOOKUP_CIDR=%t REPLY_BEFORE_ROUTE=%t SPECIAL_DOMAINS=%d LOCAL_A=%d LOCAL_AAAA=%d",
+		prefix, cfg.ListenAddrs, cfg.Upstreams, cfg.WGInterface, cfg.WGGateway, cfg.WGGatewayV4, cfg.WGGatewayV6, cfg.RouteTable,
+		cfg.RouteIPv4, cfg.RouteIPv6, cfg.LookupCIDR, cfg.ReplyBeforeRoute, len(cfg.SpecialDomains), len(cfg.LocalA), len(cfg.LocalAAAA),
 	)
 }
 
@@ -489,6 +520,8 @@ func loadConfigFromDB(db *sql.DB) (*Config, error) {
 		LocalAAAA:        make(map[string][]LocalRecord),
 		DefaultTTL:       60,
 		RouteTable:       0,
+		RouteIPv4:        true,
+		RouteIPv6:        true,
 		LookupCIDR:       true,
 		ReplyBeforeRoute: false,
 	}
@@ -497,6 +530,8 @@ func loadConfigFromDB(db *sql.DB) (*Config, error) {
 		return nil, err
 	}
 	cfg.WGGateway = settings["wg_gateway"]
+	cfg.WGGatewayV4 = settings["wg_gateway_v4"]
+	cfg.WGGatewayV6 = settings["wg_gateway_v6"]
 	cfg.WGInterface = settings["wg_interface"]
 	if v := strings.TrimSpace(settings["route_table"]); v != "" {
 		n, err := strconv.Atoi(v)
@@ -504,6 +539,12 @@ func loadConfigFromDB(db *sql.DB) (*Config, error) {
 			return nil, fmt.Errorf("invalid route_table=%q: %w", v, err)
 		}
 		cfg.RouteTable = n
+	}
+	if v := strings.TrimSpace(settings["route_ipv4"]); v != "" {
+		cfg.RouteIPv4 = isTrueString(v)
+	}
+	if v := strings.TrimSpace(settings["route_ipv6"]); v != "" {
+		cfg.RouteIPv6 = isTrueString(v)
 	}
 	if v := strings.TrimSpace(settings["local_record_ttl"]); v != "" {
 		n, err := strconv.Atoi(v)
@@ -933,10 +974,22 @@ func (a *App) handleSettingsSave(w http.ResponseWriter, r *http.Request) {
 	if r.FormValue("reply_before_route") != "" {
 		replyBeforeRoute = "1"
 	}
+	routeIPv4 := "0"
+	if r.FormValue("route_ipv4") != "" {
+		routeIPv4 = "1"
+	}
+	routeIPv6 := "0"
+	if r.FormValue("route_ipv6") != "" {
+		routeIPv6 = "1"
+	}
 	settings := map[string]string{
 		"wg_interface":       strings.TrimSpace(r.FormValue("wg_interface")),
 		"wg_gateway":         strings.TrimSpace(r.FormValue("wg_gateway")),
+		"wg_gateway_v4":      strings.TrimSpace(r.FormValue("wg_gateway_v4")),
+		"wg_gateway_v6":      strings.TrimSpace(r.FormValue("wg_gateway_v6")),
 		"route_table":        strings.TrimSpace(r.FormValue("route_table")),
+		"route_ipv4":         routeIPv4,
+		"route_ipv6":         routeIPv6,
 		"local_record_ttl":   strings.TrimSpace(r.FormValue("local_record_ttl")),
 		"lookup_cidr":        lookupCIDR,
 		"reply_before_route": replyBeforeRoute,
@@ -1174,6 +1227,18 @@ func (a *App) handleDNS(w dns.ResponseWriter, req *dns.Msg) {
 		atomic.AddUint64(&a.cacheHits, 1)
 		cached := entry.msg.Copy()
 		cached.Id = req.Id
+		cfg := a.getConfig()
+		ips := a.routeIPsFromAnswers(name, q.Qtype, cached.Answer, cfg)
+		if cfg.ReplyBeforeRoute {
+			_ = w.WriteMsg(cached)
+			if len(ips) > 0 {
+				a.routeMgr.EnsureIPs(ips)
+			}
+			return
+		}
+		if len(ips) > 0 {
+			a.routeMgr.EnsureIPs(ips)
+		}
 		_ = w.WriteMsg(cached)
 		return
 	}
@@ -1202,36 +1267,18 @@ func (a *App) handleDNS(w dns.ResponseWriter, req *dns.Msg) {
 	}
 
 	cfg := a.getConfig()
-	needRoutes := q.Qtype == dns.TypeA && a.isSpecial(name)
-	var ips []net.IP
-	if needRoutes {
-		seen := map[string]struct{}{}
-		for _, rr := range resp.Answer {
-			if aRec, ok := rr.(*dns.A); ok && aRec.A != nil {
-				ip := aRec.A.To4()
-				if ip == nil {
-					continue
-				}
-				s := ip.String()
-				if _, ok := seen[s]; ok {
-					continue
-				}
-				seen[s] = struct{}{}
-				ips = append(ips, ip)
-			}
-		}
-	}
+	ips := a.routeIPsFromAnswers(name, q.Qtype, resp.Answer, cfg)
 
 	if cfg.ReplyBeforeRoute {
 		_ = w.WriteMsg(resp)
 		atomic.AddUint64(&a.forwardedOK, 1)
-		if needRoutes && len(ips) > 0 {
+		if len(ips) > 0 {
 			a.routeMgr.EnsureIPs(ips)
 		}
 		return
 	}
 
-	if needRoutes && len(ips) > 0 {
+	if len(ips) > 0 {
 		a.routeMgr.EnsureIPs(ips)
 	}
 	_ = w.WriteMsg(resp)
@@ -1359,6 +1406,48 @@ func (a *App) shuffledUpstreams() []string {
 	rand.Shuffle(len(res), func(i, j int) { res[i], res[j] = res[j], res[i] })
 	return res
 }
+func (a *App) routeIPsFromAnswers(name string, qtype uint16, answers []dns.RR, cfg *Config) []net.IP {
+	if !a.routeEnabledForQuestion(qtype, cfg) || !a.isSpecial(name) {
+		return nil
+	}
+	seen := map[string]struct{}{}
+	var ips []net.IP
+	for _, rr := range answers {
+		var ip net.IP
+		switch qtype {
+		case dns.TypeA:
+			if aRec, ok := rr.(*dns.A); ok && aRec.A != nil {
+				ip = aRec.A.To4()
+			}
+		case dns.TypeAAAA:
+			if aaaaRec, ok := rr.(*dns.AAAA); ok && aaaaRec.AAAA != nil && aaaaRec.AAAA.To4() == nil {
+				ip = aaaaRec.AAAA.To16()
+			}
+		}
+		if ip == nil {
+			continue
+		}
+		s := ip.String()
+		if _, ok := seen[s]; ok {
+			continue
+		}
+		seen[s] = struct{}{}
+		ips = append(ips, ip)
+	}
+	return ips
+}
+
+func (a *App) routeEnabledForQuestion(qtype uint16, cfg *Config) bool {
+	switch qtype {
+	case dns.TypeA:
+		return cfg.RouteIPv4
+	case dns.TypeAAAA:
+		return cfg.RouteIPv6
+	default:
+		return false
+	}
+}
+
 func (a *App) isSpecial(name string) bool {
 	cfg := a.getConfig()
 	for d := range cfg.SpecialDomains {
@@ -1436,9 +1525,6 @@ func (a *App) addRoute(cidr string) error {
 	if cfg.WGInterface == "" {
 		return fmt.Errorf("wg_interface is empty")
 	}
-	if cfg.WGGateway == "" {
-		return fmt.Errorf("wg_gateway is empty")
-	}
 	_, dst, err := net.ParseCIDR(cidr)
 	if err != nil {
 		return err
@@ -1447,12 +1533,46 @@ func (a *App) addRoute(cidr string) error {
 	if err != nil {
 		return err
 	}
-	gw := net.ParseIP(cfg.WGGateway)
-	if gw == nil {
-		return fmt.Errorf("invalid wg_gateway %q", cfg.WGGateway)
+	route := netlink.Route{LinkIndex: link.Attrs().Index, Dst: dst, Table: cfg.RouteTable}
+	if gw, ok, err := routeGatewayForCIDR(cfg, dst); err != nil {
+		return err
+	} else if ok {
+		route.Gw = gw
 	}
-	route := netlink.Route{LinkIndex: link.Attrs().Index, Dst: dst, Gw: gw, Table: cfg.RouteTable}
 	return netlink.RouteReplace(&route)
+}
+
+func routeGatewayForCIDR(cfg *Config, dst *net.IPNet) (net.IP, bool, error) {
+	if dst.IP.To4() != nil {
+		gwValue := strings.TrimSpace(cfg.WGGatewayV4)
+		if gwValue == "" {
+			gwValue = strings.TrimSpace(cfg.WGGateway)
+		}
+		if gwValue == "" {
+			return nil, false, fmt.Errorf("wg_gateway_v4 or legacy wg_gateway is empty")
+		}
+		gw := net.ParseIP(gwValue)
+		if gw == nil || gw.To4() == nil {
+			return nil, false, fmt.Errorf("gateway %q is not an IPv4 address for IPv4 route %s", gwValue, dst.String())
+		}
+		return gw.To4(), true, nil
+	}
+
+	gwValue := strings.TrimSpace(cfg.WGGatewayV6)
+	if gwValue == "" {
+		gw := net.ParseIP(strings.TrimSpace(cfg.WGGateway))
+		if gw != nil && gw.To4() == nil {
+			gwValue = strings.TrimSpace(cfg.WGGateway)
+		}
+	}
+	if gwValue == "" {
+		return nil, false, nil
+	}
+	gw := net.ParseIP(gwValue)
+	if gw == nil || gw.To4() != nil {
+		return nil, false, fmt.Errorf("gateway %q is not an IPv6 address for IPv6 route %s", gwValue, dst.String())
+	}
+	return gw.To16(), true, nil
 }
 
 func (a *App) statsSnapshot() statsData {
@@ -1479,7 +1599,7 @@ func (a *App) statsSnapshot() statsData {
 		ActiveListeners: activeListeners,
 		ListenAddrs:     len(cfg.ListenAddrs), Upstreams: len(cfg.Upstreams), SpecialDomains: len(cfg.SpecialDomains),
 		LocalADomains: len(cfg.LocalA), LocalAAAADomains: len(cfg.LocalAAAA), LookupCIDR: cfg.LookupCIDR,
-		ReplyBeforeRoute: cfg.ReplyBeforeRoute, RouteTable: cfg.RouteTable, WGInterface: cfg.WGInterface, WGGateway: cfg.WGGateway,
+		ReplyBeforeRoute: cfg.ReplyBeforeRoute, RouteIPv4: cfg.RouteIPv4, RouteIPv6: cfg.RouteIPv6, RouteTable: cfg.RouteTable, WGInterface: cfg.WGInterface, WGGateway: cfg.WGGateway, WGGatewayV4: cfg.WGGatewayV4, WGGatewayV6: cfg.WGGatewayV6,
 		RouteSnapshot: routeSnapshot, IPCacheEntries: ipEntries, CIDRCacheEntries: cidrEntries,
 		TotalQueries: atomic.LoadUint64(&a.totalQueries), CacheHits: atomic.LoadUint64(&a.cacheHits), CacheMisses: atomic.LoadUint64(&a.cacheMisses),
 		LocalAnswers: atomic.LoadUint64(&a.localAnswers), ForwardedOK: atomic.LoadUint64(&a.forwardedOK), ServfailCount: atomic.LoadUint64(&a.servfailCount),
@@ -1507,6 +1627,8 @@ func (a *App) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	gauge("dns_route_local_aaaa_domains", s.LocalAAAADomains, "number of local AAAA domains")
 	gauge("dns_route_lookup_cidr_enabled", boolToInt(s.LookupCIDR), "lookupCIDR enabled")
 	gauge("dns_route_reply_before_route_enabled", boolToInt(s.ReplyBeforeRoute), "reply before route enabled")
+	gauge("dns_route_route_ipv4_enabled", boolToInt(s.RouteIPv4), "IPv4 route programming enabled")
+	gauge("dns_route_route_ipv6_enabled", boolToInt(s.RouteIPv6), "IPv6 route programming enabled")
 	gauge("dns_route_route_table", s.RouteTable, "configured route table")
 	gauge("dns_route_route_snapshot_entries", s.RouteSnapshot, "route snapshot entries")
 	gauge("dns_route_route_ip_cache_entries", s.IPCacheEntries, "route manager IP cache entries")

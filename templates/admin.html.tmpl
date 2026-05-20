@@ -29,11 +29,15 @@ button { padding: 6px 10px; }
       <table>
         <tr><th>Key</th><th>Value</th></tr>
         <tr><td>wg_interface</td><td><input type="text" name="wg_interface" value="{{index .Settings "wg_interface"}}"></td></tr>
-        <tr><td>wg_gateway</td><td><input type="text" name="wg_gateway" value="{{index .Settings "wg_gateway"}}"></td></tr>
+        <tr><td>wg_gateway</td><td><input type="text" name="wg_gateway" value="{{index .Settings "wg_gateway"}}"><br><small>legacy fallback, mostly for IPv4</small></td></tr>
+        <tr><td>wg_gateway_v4</td><td><input type="text" name="wg_gateway_v4" value="{{index .Settings "wg_gateway_v4"}}"><br><small>optional; overrides wg_gateway for A routes</small></td></tr>
+        <tr><td>wg_gateway_v6</td><td><input type="text" name="wg_gateway_v6" value="{{index .Settings "wg_gateway_v6"}}"><br><small>optional; AAAA routes use dev-only route when empty</small></td></tr>
         <tr><td>route_table</td><td><input type="text" name="route_table" value="{{index .Settings "route_table"}}"></td></tr>
+        <tr><td>route_ipv4</td><td><input type="checkbox" name="route_ipv4" value="1" {{if .Config.RouteIPv4}}checked{{end}}> program routes from A records</td></tr>
+        <tr><td>route_ipv6</td><td><input type="checkbox" name="route_ipv6" value="1" {{if .Config.RouteIPv6}}checked{{end}}> program routes from AAAA records</td></tr>
         <tr><td>local_record_ttl</td><td><input type="text" name="local_record_ttl" value="{{index .Settings "local_record_ttl"}}"></td></tr>
-        <tr><td>lookup_cidr</td><td><input type="checkbox" name="lookup_cidr" value="1" {{if eq (index .Settings "lookup_cidr") "1"}}checked{{end}}></td></tr>
-        <tr><td>reply_before_route</td><td><input type="checkbox" name="reply_before_route" value="1" {{if eq (index .Settings "reply_before_route") "1"}}checked{{end}}></td></tr>
+        <tr><td>lookup_cidr</td><td><input type="checkbox" name="lookup_cidr" value="1" {{if .Config.LookupCIDR}}checked{{end}}></td></tr>
+        <tr><td>reply_before_route</td><td><input type="checkbox" name="reply_before_route" value="1" {{if .Config.ReplyBeforeRoute}}checked{{end}}></td></tr>
       </table>
       <p><button type="submit">Save settings</button></p>
     </form>
@@ -48,10 +52,14 @@ button { padding: 6px 10px; }
       <tr><td>Local A domains</td><td>{{len .Config.LocalA}}</td></tr>
       <tr><td>Local AAAA domains</td><td>{{len .Config.LocalAAAA}}</td></tr>
       <tr><td>Route table</td><td>{{.Config.RouteTable}}</td></tr>
+      <tr><td>Route IPv4</td><td>{{.Config.RouteIPv4}}</td></tr>
+      <tr><td>Route IPv6</td><td>{{.Config.RouteIPv6}}</td></tr>
       <tr><td>Lookup CIDR</td><td>{{.Config.LookupCIDR}}</td></tr>
       <tr><td>Reply before route</td><td>{{.Config.ReplyBeforeRoute}}</td></tr>
       <tr><td>WG interface</td><td>{{.Config.WGInterface}}</td></tr>
       <tr><td>WG gateway</td><td>{{.Config.WGGateway}}</td></tr>
+      <tr><td>WG gateway v4</td><td>{{.Config.WGGatewayV4}}</td></tr>
+      <tr><td>WG gateway v6</td><td>{{.Config.WGGatewayV6}}</td></tr>
     </table>
     <div class="actions">
       <form class="inline" method="post" action="/reload"><button type="submit">Reload config</button></form>
