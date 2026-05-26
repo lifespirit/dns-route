@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"crypto/tls"
 	"database/sql"
@@ -15,7 +14,6 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -32,7 +30,6 @@ import (
 
 const (
 	cacheCleanupInterval = time.Minute
-	whoisPort            = "43"
 )
 
 //go:embed templates/*.tmpl
@@ -122,8 +119,6 @@ type App struct {
 
 	cache   map[string]cacheEntry
 	cacheMu sync.RWMutex
-
-	cidrRe *regexp.Regexp
 
 	servers map[string]*dns.Server
 	srvMu   sync.Mutex
@@ -225,7 +220,6 @@ func main() {
 		db:        db,
 		cfg:       cfg,
 		cache:     make(map[string]cacheEntry),
-		cidrRe:    regexp.MustCompile(`(?mi)^CIDR:\s*([0-9A-Fa-f:.]+/\d+)`),
 		servers:   make(map[string]*dns.Server),
 		adminAddr: *httpAddr,
 		startedAt: time.Now(),
@@ -499,7 +493,7 @@ func defaultCIDRForIP(ip net.IP) string {
 
 func logConfig(prefix string, cfg *Config) {
 	log.Printf(
-		"%s: LISTEN=%v UPSTREAMS=%v WG_INTERFACE=%s WG_GATEWAY=%s WG_GATEWAY_V4=%s WG_GATEWAY_V6=%s ROUTE_TABLE=%d ROUTE_IPV4=%t ROUTE_IPV6=%t LOOKUP_CIDR=%t REPLY_BEFORE_ROUTE=%t SPECIAL_DOMAINS=%d LOCAL_A=%d LOCAL_AAAA=%d",
+		"%s: LISTEN=%v UPSTREAMS=%v WG_INTERFACE=%s WG_GATEWAY=%s WG_GATEWAY_V4=%s WG_GATEWAY_V6=%s ROUTE_TABLE=%d ROUTE_IPV4=%t ROUTE_IPV6=%t LOOKUP_CYMRU_PREFIX=%t REPLY_BEFORE_ROUTE=%t SPECIAL_DOMAINS=%d LOCAL_A=%d LOCAL_AAAA=%d",
 		prefix, cfg.ListenAddrs, cfg.Upstreams, cfg.WGInterface, cfg.WGGateway, cfg.WGGatewayV4, cfg.WGGatewayV6, cfg.RouteTable,
 		cfg.RouteIPv4, cfg.RouteIPv6, cfg.LookupCIDR, cfg.ReplyBeforeRoute, len(cfg.SpecialDomains), len(cfg.LocalA), len(cfg.LocalAAAA),
 	)
@@ -1459,61 +1453,88 @@ func (a *App) isSpecial(name string) bool {
 }
 
 func (a *App) lookupCIDR(ip string) string {
-	data, err := whoisQuery("whois.iana.org:"+whoisPort, ip)
-	if err != nil {
+	parsed := normalizeRouteIP(net.ParseIP(ip))
+	if parsed == nil {
 		return ""
 	}
-	refer := parseField(data, `(?mi)^refer:\s*(\S+)`)
-	combined := data
-	if refer != "" {
-		if data2, err2 := whoisQuery(refer+":"+whoisPort, ip); err2 == nil {
-			combined = append(combined, data2...)
-		}
+
+	queryName := cymruQueryName(parsed)
+	if queryName == "" {
+		return ""
 	}
-	matches := a.cidrRe.FindAllSubmatch(combined, -1)
-	var bestNet *net.IPNet
-	bestOnes := -1
-	for _, m := range matches {
-		_, netw, err := net.ParseCIDR(string(m[1]))
-		if err != nil {
+
+	req := new(dns.Msg)
+	req.SetQuestion(queryName, dns.TypeTXT)
+	req.RecursionDesired = true
+
+	resp, err := a.forwardDNS(req)
+	if err != nil || resp == nil || resp.Rcode != dns.RcodeSuccess {
+		return ""
+	}
+
+	for _, rr := range resp.Answer {
+		txt, ok := rr.(*dns.TXT)
+		if !ok {
 			continue
 		}
-		ones, bits := netw.Mask.Size()
-		if bits == 0 {
-			continue
+		if prefix := parseCymruPrefix(strings.Join(txt.Txt, ""), parsed); prefix != "" {
+			return prefix
 		}
-		if ones > bestOnes {
-			bestOnes, bestNet = ones, netw
-		}
-	}
-	if bestNet != nil {
-		return bestNet.String()
 	}
 	return ""
 }
 
-func whoisQuery(server, query string) ([]byte, error) {
-	conn, err := net.Dial("tcp", server)
-	if err != nil {
-		return nil, err
+func cymruQueryName(ip net.IP) string {
+	if v4 := ip.To4(); v4 != nil {
+		return fmt.Sprintf("%d.%d.%d.%d.origin.asn.cymru.com.", v4[3], v4[2], v4[1], v4[0])
 	}
-	defer conn.Close()
-	if _, err := conn.Write([]byte(query + "\r\n")); err != nil {
-		return nil, err
+	v6 := ip.To16()
+	if v6 == nil {
+		return ""
 	}
-	var buf bytes.Buffer
-	_, err = io.Copy(&buf, bufio.NewReader(conn))
-	return buf.Bytes(), err
+	const hex = "0123456789abcdef"
+	labels := make([]byte, 0, 64+len("origin6.asn.cymru.com."))
+	for i := len(v6) - 1; i >= 0; i-- {
+		b := v6[i]
+		labels = append(labels, hex[b&0x0f], '.', hex[b>>4], '.')
+	}
+	labels = append(labels, "origin6.asn.cymru.com."...)
+	return string(labels)
 }
-func parseField(data []byte, pattern string) string {
-	re := regexp.MustCompile(pattern)
-	for _, line := range strings.Split(string(data), "\n") {
-		if m := re.FindStringSubmatch(line); m != nil {
-			return m[1]
+
+func parseCymruPrefix(txt string, ip net.IP) string {
+	fields := strings.Split(txt, "|")
+	if len(fields) < 2 {
+		return ""
+	}
+	prefix := strings.TrimSpace(fields[1])
+	_, netw, err := net.ParseCIDR(prefix)
+	if err != nil || netw == nil {
+		return ""
+	}
+
+	if ip4 := ip.To4(); ip4 != nil {
+		if netw.IP.To4() == nil || !netw.Contains(ip4) {
+			return ""
 		}
+		ones, bits := netw.Mask.Size()
+		if bits != 32 || ones >= 32 {
+			return ""
+		}
+		return netw.String()
 	}
-	return ""
+
+	ip16 := ip.To16()
+	if ip16 == nil || ip.To4() != nil || netw.IP.To4() != nil || !netw.Contains(ip16) {
+		return ""
+	}
+	ones, bits := netw.Mask.Size()
+	if bits != 128 || ones >= 128 {
+		return ""
+	}
+	return netw.String()
 }
+
 func respondSERVFAIL(w dns.ResponseWriter, req *dns.Msg) {
 	m := new(dns.Msg)
 	m.SetRcode(req, dns.RcodeServerFailure)
@@ -1625,14 +1646,14 @@ func (a *App) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	gauge("dns_route_special_domains", s.SpecialDomains, "number of special domains")
 	gauge("dns_route_local_a_domains", s.LocalADomains, "number of local A domains")
 	gauge("dns_route_local_aaaa_domains", s.LocalAAAADomains, "number of local AAAA domains")
-	gauge("dns_route_lookup_cidr_enabled", boolToInt(s.LookupCIDR), "lookupCIDR enabled")
+	gauge("dns_route_lookup_cidr_enabled", boolToInt(s.LookupCIDR), "Team Cymru BGP prefix lookup enabled; legacy metric name")
 	gauge("dns_route_reply_before_route_enabled", boolToInt(s.ReplyBeforeRoute), "reply before route enabled")
 	gauge("dns_route_route_ipv4_enabled", boolToInt(s.RouteIPv4), "IPv4 route programming enabled")
 	gauge("dns_route_route_ipv6_enabled", boolToInt(s.RouteIPv6), "IPv6 route programming enabled")
 	gauge("dns_route_route_table", s.RouteTable, "configured route table")
 	gauge("dns_route_route_snapshot_entries", s.RouteSnapshot, "route snapshot entries")
 	gauge("dns_route_route_ip_cache_entries", s.IPCacheEntries, "route manager IP cache entries")
-	gauge("dns_route_route_cidr_cache_entries", s.CIDRCacheEntries, "route manager CIDR cache entries")
+	gauge("dns_route_route_cidr_cache_entries", s.CIDRCacheEntries, "route manager prefix cache entries; legacy metric name")
 	counter("dns_route_queries_total", s.TotalQueries, "total DNS queries")
 	counter("dns_route_cache_hits_total", s.CacheHits, "cache hits")
 	counter("dns_route_cache_misses_total", s.CacheMisses, "cache misses")
@@ -1642,7 +1663,7 @@ func (a *App) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	counter("dns_route_route_add_total", s.RouteAdds, "successful route additions")
 	counter("dns_route_route_add_errors_total", s.RouteAddErrors, "route add errors")
 	counter("dns_route_forward_errors_total", s.ForwardErrors, "forward errors")
-	fmt.Fprintf(w, "# HELP dns_route_lookup_cidr_total lookupCIDR counters\n# TYPE dns_route_lookup_cidr_total counter\n")
+	fmt.Fprintf(w, "# HELP dns_route_lookup_cidr_total Team Cymru BGP prefix lookup counters; legacy metric name\n# TYPE dns_route_lookup_cidr_total counter\n")
 	fmt.Fprintf(w, "dns_route_lookup_cidr_total{result=\"attempts\"} %d\n", s.LookupCIDRAttempts)
 	fmt.Fprintf(w, "dns_route_lookup_cidr_total{result=\"failed\"} %d\n", s.LookupCIDRFailed)
 }

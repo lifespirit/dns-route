@@ -36,7 +36,7 @@ button { padding: 6px 10px; }
         <tr><td>route_ipv4</td><td><input type="checkbox" name="route_ipv4" value="1" {{if .Config.RouteIPv4}}checked{{end}}> program routes from A records</td></tr>
         <tr><td>route_ipv6</td><td><input type="checkbox" name="route_ipv6" value="1" {{if .Config.RouteIPv6}}checked{{end}}> program routes from AAAA records</td></tr>
         <tr><td>local_record_ttl</td><td><input type="text" name="local_record_ttl" value="{{index .Settings "local_record_ttl"}}"></td></tr>
-        <tr><td>lookup_cidr</td><td><input type="checkbox" name="lookup_cidr" value="1" {{if .Config.LookupCIDR}}checked{{end}}></td></tr>
+        <tr><td>lookup_cidr</td><td><input type="checkbox" name="lookup_cidr" value="1" {{if .Config.LookupCIDR}}checked{{end}}> Team Cymru BGP prefix lookup</td></tr>
         <tr><td>reply_before_route</td><td><input type="checkbox" name="reply_before_route" value="1" {{if .Config.ReplyBeforeRoute}}checked{{end}}></td></tr>
       </table>
       <p><button type="submit">Save settings</button></p>
@@ -54,7 +54,7 @@ button { padding: 6px 10px; }
       <tr><td>Route table</td><td>{{.Config.RouteTable}}</td></tr>
       <tr><td>Route IPv4</td><td>{{.Config.RouteIPv4}}</td></tr>
       <tr><td>Route IPv6</td><td>{{.Config.RouteIPv6}}</td></tr>
-      <tr><td>Lookup CIDR</td><td>{{.Config.LookupCIDR}}</td></tr>
+      <tr><td>Team Cymru prefix lookup</td><td>{{.Config.LookupCIDR}}</td></tr>
       <tr><td>Reply before route</td><td>{{.Config.ReplyBeforeRoute}}</td></tr>
       <tr><td>WG interface</td><td>{{.Config.WGInterface}}</td></tr>
       <tr><td>WG gateway</td><td>{{.Config.WGGateway}}</td></tr>
