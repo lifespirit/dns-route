@@ -1,3 +1,5 @@
+![Admin panel](docs/admin_panel.png "Admin panel")
+
 # dns-route
 
 DNS proxy with:
