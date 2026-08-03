@@ -2,14 +2,25 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>dns-route stats</title>
 <style>
-body { font-family: sans-serif; margin: 24px; }
+:root { color-scheme: light dark; }
+body { font-family: system-ui, sans-serif; margin: 24px; line-height: 1.4; }
 table { border-collapse: collapse; width: 100%; }
-th, td { border: 1px solid #ccc; padding: 8px; text-align: left; }
-.card { border: 1px solid #ccc; padding: 16px; border-radius: 8px; margin-bottom: 24px; }
-button { padding: 6px 10px; }
-.actions { margin-top: 16px; }
+th, td { border: 1px solid #8886; padding: 8px; text-align: left; vertical-align: top; }
+th { background: #8882; }
+.card { border: 1px solid #8886; padding: 16px; border-radius: 10px; margin-bottom: 24px; overflow-x: auto; }
+button { padding: 7px 11px; cursor: pointer; }
+.actions { margin-top: 16px; display: flex; flex-wrap: wrap; gap: 8px; }
+.badge { display: inline-block; padding: 2px 7px; border-radius: 999px; font-size: .82rem; font-weight: 600; }
+.badge.closed { background: #2e7d3230; }
+.badge.open { background: #c6282830; }
+.badge.half_open { background: #ef6c0030; }
+.muted { opacity: .72; }
+.error-text { max-width: 520px; overflow-wrap: anywhere; }
+.nowrap { white-space: nowrap; }
+@media (max-width: 900px) { body { margin: 12px; } }
 </style>
 </head>
 <body>
@@ -28,8 +39,10 @@ button { padding: 6px 10px; }
   <div class="actions">
     <button type="button" onclick="location.href='/'">Back to admin</button>
     <button type="button" onclick="window.open('/metrics', '_blank')">Prometheus metrics</button>
+    <button type="button" onclick="window.open('/routes/errors', '_blank')">Route error log</button>
   </div>
 </div>
+
 <div class="card">
   <h2>Configuration</h2>
   <table>
@@ -49,6 +62,7 @@ button { padding: 6px 10px; }
     <tr><td>WG gateway v6</td><td>{{.WGGatewayV6}}</td></tr>
   </table>
 </div>
+
 <div class="card">
   <h2>Counters</h2>
   <table>
@@ -58,11 +72,38 @@ button { padding: 6px 10px; }
     <tr><td>Local answers</td><td>{{.LocalAnswers}}</td></tr>
     <tr><td>Forwarded OK</td><td>{{.ForwardedOK}}</td></tr>
     <tr><td>SERVFAIL</td><td>{{.ServfailCount}}</td></tr>
+    <tr><td>Forward errors</td><td>{{.ForwardErrors}}</td></tr>
     <tr><td>Route adds</td><td>{{.RouteAdds}}</td></tr>
     <tr><td>Route add errors</td><td>{{.RouteAddErrors}}</td></tr>
-    <tr><td>Forward errors</td><td>{{.ForwardErrors}}</td></tr>
+    <tr><td>Route queue drops</td><td>{{.RouteQueueDrops}}</td></tr>
+    <tr><td>Conntrack reset attempts</td><td>{{.ConntrackResetAttempts}}</td></tr>
+    <tr><td>Conntrack flows deleted</td><td>{{.ConntrackResetDeleted}}</td></tr>
+    <tr><td>Conntrack reset errors</td><td>{{.ConntrackResetErrors}}</td></tr>
     <tr><td>Team Cymru lookup attempts</td><td>{{.LookupCIDRAttempts}}</td></tr>
     <tr><td>Team Cymru lookup failed</td><td>{{.LookupCIDRFailed}}</td></tr>
+  </table>
+</div>
+
+<div class="card">
+  <h2>Upstream circuit breakers</h2>
+  <table>
+    <tr>
+      <th>Upstream</th><th>Protocol</th><th>State</th><th>Consecutive failures</th>
+      <th>Requests</th><th>Skipped</th><th>Open / recover</th><th>Last activity</th><th>Last error</th>
+    </tr>
+    {{range .UpstreamCircuits}}
+    <tr>
+      <td><strong>{{.Addr}}</strong><br><small>{{.Endpoint}}</small></td>
+      <td>{{.ConfiguredProto}} → {{.Proto}}</td>
+      <td class="nowrap"><span class="badge {{.State}}">{{.State}}</span>{{if ne .OpenRemaining "—"}}<br><small>{{.OpenRemaining}} remaining</small>{{end}}</td>
+      <td>{{.ConsecutiveFailures}}</td>
+      <td>OK: {{.Successes}}<br>transport errors: {{.Failures}}<br>DNS errors: {{.DNSFailures}}</td>
+      <td>{{.Skipped}}<br><small>half-open probes: {{.HalfOpenProbes}}</small></td>
+      <td>opened: {{.OpenEvents}}<br>recovered: {{.Recoveries}}</td>
+      <td>success: {{.LastSuccess}}<br>failure: {{.LastFailure}}</td>
+      <td class="error-text">{{if .LastError}}{{.LastError}}{{else}}<span class="muted">—</span>{{end}}</td>
+    </tr>
+    {{else}}<tr><td colspan="9" class="muted">No upstreams configured.</td></tr>{{end}}
   </table>
 </div>
 </body>

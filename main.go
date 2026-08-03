@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"database/sql"
 	"embed"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -19,6 +20,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -29,7 +31,12 @@ import (
 )
 
 const (
-	cacheCleanupInterval = time.Minute
+	cacheCleanupInterval       = time.Minute
+	mainRouteTable             = 254
+	routeErrorHistoryLen       = 100
+	upstreamFailureThreshold   = 2
+	upstreamCircuitBaseBackoff = 30 * time.Second
+	upstreamCircuitMaxBackoff  = 5 * time.Minute
 )
 
 //go:embed templates/*.tmpl
@@ -47,6 +54,62 @@ type cacheEntry struct {
 	expiration time.Time
 }
 
+type upstreamCircuitState string
+
+const (
+	upstreamCircuitClosed   upstreamCircuitState = "closed"
+	upstreamCircuitOpen     upstreamCircuitState = "open"
+	upstreamCircuitHalfOpen upstreamCircuitState = "half_open"
+)
+
+type upstreamCircuit struct {
+	RawAddr string
+	Proto   string
+
+	State               upstreamCircuitState
+	ConsecutiveFailures uint64
+	BackoffLevel        uint
+	OpenUntil           time.Time
+	ProbeInFlight       bool
+	Generation          uint64
+
+	Successes      uint64
+	Failures       uint64
+	DNSFailures    uint64
+	Skipped        uint64
+	OpenEvents     uint64
+	Recoveries     uint64
+	HalfOpenProbes uint64
+
+	LastSuccess time.Time
+	LastFailure time.Time
+	LastError   string
+}
+
+type upstreamCircuitAttempt struct {
+	Key        string
+	Generation uint64
+	HalfOpen   bool
+}
+
+type upstreamCircuitSnapshot struct {
+	RawAddr             string
+	Proto               string
+	State               upstreamCircuitState
+	ConsecutiveFailures uint64
+	OpenUntil           time.Time
+	Successes           uint64
+	Failures            uint64
+	DNSFailures         uint64
+	Skipped             uint64
+	OpenEvents          uint64
+	Recoveries          uint64
+	HalfOpenProbes      uint64
+	LastSuccess         time.Time
+	LastFailure         time.Time
+	LastError           string
+}
+
 type LocalRecord struct {
 	IP     net.IP
 	TTL    uint32
@@ -56,6 +119,7 @@ type LocalRecord struct {
 type Config struct {
 	ListenAddrs      []string
 	Upstreams        []string
+	UpstreamProto    map[string]string
 	SpecialDomains   map[string]struct{}
 	LocalA           map[string][]LocalRecord
 	LocalAAAA        map[string][]LocalRecord
@@ -92,6 +156,49 @@ type routeCacheEntry struct {
 	UpdatedAt time.Time
 }
 
+// conntrackIPFilter matches every conntrack flow involving IP in either
+// direction. This also catches NATed flows where the remote address may be
+// present only in the reply tuple.
+type conntrackIPFilter struct {
+	ip net.IP
+}
+
+func (f conntrackIPFilter) MatchConntrackFlow(flow *netlink.ConntrackFlow) bool {
+	if flow == nil || f.ip == nil {
+		return false
+	}
+	return flow.Forward.SrcIP.Equal(f.ip) ||
+		flow.Forward.DstIP.Equal(f.ip) ||
+		flow.Reverse.SrcIP.Equal(f.ip) ||
+		flow.Reverse.DstIP.Equal(f.ip)
+}
+
+type routeErrorDiagnostic struct {
+	Time                    string   `json:"time"`
+	IP                      string   `json:"ip"`
+	CIDR                    string   `json:"cidr"`
+	Family                  string   `json:"family"`
+	Table                   int      `json:"table"`
+	Interface               string   `json:"interface"`
+	LinkIndex               int      `json:"link_index,omitempty"`
+	LinkType                string   `json:"link_type,omitempty"`
+	LinkFlags               string   `json:"link_flags,omitempty"`
+	LinkOperState           string   `json:"link_oper_state,omitempty"`
+	Gateway                 string   `json:"gateway,omitempty"`
+	Error                   string   `json:"error"`
+	ErrorType               string   `json:"error_type"`
+	Errno                   int      `json:"errno,omitempty"`
+	ErrnoText               string   `json:"errno_text,omitempty"`
+	InterfaceAddresses      []string `json:"interface_addresses,omitempty"`
+	DestinationRoutes       []string `json:"destination_routes,omitempty"`
+	GatewayRoutes           []string `json:"gateway_routes,omitempty"`
+	RouteListError          string   `json:"route_list_error,omitempty"`
+	LinkLookupError         string   `json:"link_lookup_error,omitempty"`
+	AddressListError        string   `json:"address_list_error,omitempty"`
+	SnapshotReloadError     string   `json:"snapshot_reload_error,omitempty"`
+	RoutePresentAfterReload bool     `json:"route_present_after_reload"`
+}
+
 type RouteManager struct {
 	app *App
 
@@ -104,8 +211,12 @@ type RouteManager struct {
 	snapMu   sync.RWMutex
 	snapshot []*net.IPNet
 
-	lookupGroup singleflight.Group
-	applyGroup  singleflight.Group
+	lookupGroup  singleflight.Group
+	applyGroup   singleflight.Group
+	processGroup singleflight.Group
+
+	resetMu         sync.Mutex
+	resetAfterApply map[string]struct{}
 
 	queue chan string
 	wg    sync.WaitGroup
@@ -120,6 +231,15 @@ type App struct {
 	cache   map[string]cacheEntry
 	cacheMu sync.RWMutex
 
+	dohClient *http.Client
+
+	upstreamMu       sync.Mutex
+	upstreamCircuits map[string]*upstreamCircuit
+
+	forwardLogMu           sync.Mutex
+	lastForwardErrorLog    time.Time
+	forwardErrorSuppressed uint64
+
 	servers map[string]*dns.Server
 	srvMu   sync.Mutex
 
@@ -128,24 +248,51 @@ type App struct {
 
 	routeMgr *RouteManager
 
-	totalQueries       uint64
-	cacheHits          uint64
-	cacheMisses        uint64
-	localAnswers       uint64
-	forwardedOK        uint64
-	servfailCount      uint64
-	routeAdds          uint64
-	routeAddErrors     uint64
-	forwardErrors      uint64
-	lookupCIDRAttempts uint64
-	lookupCIDRFailed   uint64
+	routeErrMu    sync.Mutex
+	routeErrorLog []routeErrorDiagnostic
+
+	totalQueries           uint64
+	cacheHits              uint64
+	cacheMisses            uint64
+	localAnswers           uint64
+	forwardedOK            uint64
+	servfailCount          uint64
+	routeAdds              uint64
+	routeAddErrors         uint64
+	forwardErrors          uint64
+	lookupCIDRAttempts     uint64
+	lookupCIDRFailed       uint64
+	routeQueueDrops        uint64
+	conntrackResetAttempts uint64
+	conntrackResetDeleted  uint64
+	conntrackResetErrors   uint64
+}
+
+type upstreamView struct {
+	Addr                string
+	ConfiguredProto     string
+	Proto               string
+	Endpoint            string
+	State               string
+	ConsecutiveFailures uint64
+	OpenRemaining       string
+	Successes           uint64
+	Failures            uint64
+	DNSFailures         uint64
+	Skipped             uint64
+	OpenEvents          uint64
+	Recoveries          uint64
+	HalfOpenProbes      uint64
+	LastSuccess         string
+	LastFailure         string
+	LastError           string
 }
 
 type pageData struct {
 	Config         *Config
 	Settings       map[string]string
 	ListenAddrs    []string
-	Upstreams      []string
+	Upstreams      []upstreamView
 	SpecialDomains []string
 	Records        []recordRow
 	Message        string
@@ -183,17 +330,23 @@ type statsData struct {
 	IPCacheEntries   int
 	CIDRCacheEntries int
 
-	TotalQueries       uint64
-	CacheHits          uint64
-	CacheMisses        uint64
-	LocalAnswers       uint64
-	ForwardedOK        uint64
-	ServfailCount      uint64
-	RouteAdds          uint64
-	RouteAddErrors     uint64
-	ForwardErrors      uint64
-	LookupCIDRAttempts uint64
-	LookupCIDRFailed   uint64
+	TotalQueries           uint64
+	CacheHits              uint64
+	CacheMisses            uint64
+	LocalAnswers           uint64
+	ForwardedOK            uint64
+	ServfailCount          uint64
+	RouteAdds              uint64
+	RouteAddErrors         uint64
+	ForwardErrors          uint64
+	LookupCIDRAttempts     uint64
+	LookupCIDRFailed       uint64
+	RouteQueueDrops        uint64
+	ConntrackResetAttempts uint64
+	ConntrackResetDeleted  uint64
+	ConntrackResetErrors   uint64
+
+	UpstreamCircuits []upstreamView
 }
 
 func main() {
@@ -217,13 +370,16 @@ func main() {
 	}
 
 	app := &App{
-		db:        db,
-		cfg:       cfg,
-		cache:     make(map[string]cacheEntry),
-		servers:   make(map[string]*dns.Server),
-		adminAddr: *httpAddr,
-		startedAt: time.Now(),
+		db:               db,
+		cfg:              cfg,
+		cache:            make(map[string]cacheEntry),
+		dohClient:        newDoHClient(),
+		upstreamCircuits: make(map[string]*upstreamCircuit),
+		servers:          make(map[string]*dns.Server),
+		adminAddr:        *httpAddr,
+		startedAt:        time.Now(),
 	}
+	app.syncUpstreamCircuits(cfg)
 	app.routeMgr = NewRouteManager(app, 8)
 	if err := app.routeMgr.ReloadSnapshot(); err != nil {
 		log.Printf("initial route snapshot reload failed: %v", err)
@@ -243,10 +399,11 @@ func main() {
 
 func NewRouteManager(app *App, workers int) *RouteManager {
 	rm := &RouteManager{
-		app:       app,
-		ipCache:   make(map[string]routeCacheEntry),
-		cidrCache: make(map[string]routeCacheEntry),
-		queue:     make(chan string, 1024),
+		app:             app,
+		ipCache:         make(map[string]routeCacheEntry),
+		cidrCache:       make(map[string]routeCacheEntry),
+		resetAfterApply: make(map[string]struct{}),
+		queue:           make(chan string, 1024),
 	}
 	for i := 0; i < workers; i++ {
 		rm.wg.Add(1)
@@ -258,7 +415,9 @@ func NewRouteManager(app *App, workers int) *RouteManager {
 func (rm *RouteManager) worker() {
 	defer rm.wg.Done()
 	for ip := range rm.queue {
-		rm.processIP(ip)
+		if err := rm.processIP(ip); err != nil {
+			log.Printf("ROUTE_PROCESS_ERROR ip=%s error=%v", ip, err)
+		}
 	}
 }
 
@@ -270,47 +429,121 @@ func (rm *RouteManager) EnsureIPs(ips []net.IP) {
 		if routeIP == nil {
 			continue
 		}
-		s := routeIP.String()
-		if _, ok := unique[s]; ok {
+		ipString := routeIP.String()
+		if _, ok := unique[ipString]; ok {
 			continue
 		}
-		unique[s] = struct{}{}
+		unique[ipString] = struct{}{}
 
 		defaultCIDR := defaultCIDRForIP(routeIP)
 		if rm.ipCoveredBySnapshot(routeIP) {
-			rm.markIPApplied(s, defaultCIDR, now)
+			rm.completeIPApplied(ipString, defaultCIDR, false)
 			continue
 		}
 
+		shouldQueue := false
 		rm.ipMu.Lock()
-		ent, ok := rm.ipCache[s]
-		if ok && (ent.State == StatePending || ent.State == StateApplied) {
+		ent, ok := rm.ipCache[ipString]
+		if ok && ent.State == StateApplied {
 			rm.ipMu.Unlock()
 			continue
 		}
-		rm.ipCache[s] = routeCacheEntry{State: StatePending, CIDR: defaultCIDR, UpdatedAt: now}
+
+		// The DNS answer has already been sent. Record that a successful route
+		// completion must invalidate any flow that raced with route installation.
+		rm.resetMu.Lock()
+		rm.resetAfterApply[ipString] = struct{}{}
+		rm.resetMu.Unlock()
+
+		if !ok || ent.State != StatePending {
+			rm.ipCache[ipString] = routeCacheEntry{State: StatePending, CIDR: defaultCIDR, UpdatedAt: now}
+			shouldQueue = true
+		}
 		rm.ipMu.Unlock()
 
+		if !shouldQueue {
+			continue
+		}
 		select {
-		case rm.queue <- s:
+		case rm.queue <- ipString:
 		default:
-			go rm.processIP(s)
+			atomic.AddUint64(&rm.app.routeQueueDrops, 1)
+			rm.markIPFailed(ipString, defaultCIDR, time.Now())
+			log.Printf("ROUTE_QUEUE_FULL ip=%s cidr=%s queue_len=%d queue_cap=%d; route will be retried on the next DNS answer", ipString, defaultCIDR, len(rm.queue), cap(rm.queue))
 		}
 	}
 }
 
-func (rm *RouteManager) processIP(ip string) {
+// EnsureIPsAndWait ensures routes for the supplied addresses and returns only
+// after every route is present or at least one route attempt has failed.
+func (rm *RouteManager) EnsureIPsAndWait(ips []net.IP) error {
+	unique := make(map[string]net.IP, len(ips))
+	for _, ip := range ips {
+		routeIP := normalizeRouteIP(ip)
+		if routeIP != nil {
+			unique[routeIP.String()] = routeIP
+		}
+	}
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, len(unique))
+	for ipString, routeIP := range unique {
+		defaultCIDR := defaultCIDRForIP(routeIP)
+		if rm.ipCoveredBySnapshot(routeIP) {
+			rm.completeIPApplied(ipString, defaultCIDR, false)
+			continue
+		}
+
+		rm.ipMu.Lock()
+		ent, ok := rm.ipCache[ipString]
+		if ok && ent.State == StateApplied {
+			rm.ipMu.Unlock()
+			continue
+		}
+		if !ok || ent.State != StatePending {
+			rm.ipCache[ipString] = routeCacheEntry{State: StatePending, CIDR: defaultCIDR, UpdatedAt: time.Now()}
+		}
+		rm.ipMu.Unlock()
+
+		wg.Add(1)
+		go func(ip string) {
+			defer wg.Done()
+			if err := rm.processIP(ip); err != nil {
+				errCh <- fmt.Errorf("route for %s: %w", ip, err)
+			}
+		}(ipString)
+	}
+	wg.Wait()
+	close(errCh)
+
+	var errs []error
+	for err := range errCh {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
+}
+
+// processIP serializes all work for one destination IP. A synchronous DNS
+// request can therefore join an already queued asynchronous route operation.
+func (rm *RouteManager) processIP(ip string) error {
+	_, err, _ := rm.processGroup.Do(ip, func() (any, error) {
+		return nil, rm.processIPOnce(ip)
+	})
+	return err
+}
+
+func (rm *RouteManager) processIPOnce(ip string) error {
 	cfg := rm.app.getConfig()
 	parsed := normalizeRouteIP(net.ParseIP(ip))
 	if parsed == nil {
-		return
+		return fmt.Errorf("invalid route IP %q", ip)
 	}
 	ip = parsed.String()
 
 	defaultCIDR := defaultCIDRForIP(parsed)
 	if rm.ipCoveredBySnapshot(parsed) {
-		rm.markIPApplied(ip, defaultCIDR, time.Now())
-		return
+		rm.completeIPApplied(ip, defaultCIDR, false)
+		return nil
 	}
 
 	cidr := defaultCIDR
@@ -335,49 +568,86 @@ func (rm *RouteManager) processIP(ip string) {
 	rm.ipMu.Unlock()
 
 	if rm.cidrCoveredBySnapshot(cidr) {
-		rm.markIPApplied(ip, cidr, time.Now())
 		rm.markCIDRApplied(cidr, time.Now())
-		return
+		rm.completeIPApplied(ip, cidr, false)
+		return nil
 	}
 
-	rm.cidrMu.Lock()
-	ent, ok := rm.cidrCache[cidr]
-	if ok && (ent.State == StatePending || ent.State == StateApplied) {
-		rm.cidrMu.Unlock()
-		if ent.State == StateApplied {
-			rm.markIPApplied(ip, cidr, time.Now())
-		}
-		return
-	}
-	rm.cidrCache[cidr] = routeCacheEntry{State: StatePending, CIDR: cidr, UpdatedAt: time.Now()}
-	rm.cidrMu.Unlock()
-
-	_, _, _ = rm.applyGroup.Do(cidr, func() (any, error) {
+	applyResult, applyErr, _ := rm.applyGroup.Do(cidr, func() (any, error) {
 		if rm.cidrCoveredBySnapshot(cidr) {
 			rm.markCIDRApplied(cidr, time.Now())
-			rm.markIPApplied(ip, cidr, time.Now())
-			return nil, nil
+			return false, nil
 		}
+
+		// Refresh from the kernel immediately before RouteReplace. The in-memory
+		// snapshot may not yet contain a route installed by another process. If
+		// the prefix is already covered, no routing change is required and any
+		// existing conntrack state must be left untouched.
+		routeAbsentConfirmed := false
+		if reloadErr := rm.ReloadSnapshot(); reloadErr != nil {
+			// Continue trying to install the route, but suppress conntrack reset:
+			// without a successful live precheck we cannot prove that the route did
+			// not already exist.
+			log.Printf("ROUTE_PRECHECK_RELOAD_ERROR ip=%s cidr=%s error=%v", ip, cidr, reloadErr)
+		} else if rm.cidrCoveredBySnapshot(cidr) {
+			rm.markCIDRApplied(cidr, time.Now())
+			return false, nil
+		} else {
+			routeAbsentConfirmed = true
+		}
+
+		rm.cidrMu.Lock()
+		rm.cidrCache[cidr] = routeCacheEntry{State: StatePending, CIDR: cidr, UpdatedAt: time.Now()}
+		rm.cidrMu.Unlock()
 
 		if err := rm.app.addRoute(cidr); err != nil {
 			atomic.AddUint64(&rm.app.routeAddErrors, 1)
-			// Принудительный refresh по ошибке.
-			if reloadErr := rm.ReloadSnapshot(); reloadErr == nil && rm.cidrCoveredBySnapshot(cidr) {
+			reloadErr := rm.ReloadSnapshot()
+			recovered := reloadErr == nil && rm.cidrCoveredBySnapshot(cidr)
+			rm.app.recordRouteAddError(ip, cidr, err, reloadErr, recovered)
+			if recovered {
 				rm.markCIDRApplied(cidr, time.Now())
-				rm.markIPApplied(ip, cidr, time.Now())
-				return nil, nil
+				// The route appeared without a successful RouteReplace from this
+				// operation. Do not disturb existing conntrack entries.
+				return false, nil
 			}
 			rm.markCIDRFailed(cidr, time.Now())
-			rm.markIPFailed(ip, cidr, time.Now())
-			return nil, err
+			return false, err
 		}
 
 		atomic.AddUint64(&rm.app.routeAdds, 1)
 		rm.addCIDRToSnapshot(cidr)
 		rm.markCIDRApplied(cidr, time.Now())
-		rm.markIPApplied(ip, cidr, time.Now())
-		return nil, nil
+		// Reset conntrack only when the live kernel precheck confirmed that the
+		// route was absent before our successful RouteReplace.
+		return routeAbsentConfirmed, nil
 	})
+
+	if applyErr != nil {
+		rm.markIPFailed(ip, cidr, time.Now())
+		return applyErr
+	}
+	routeReplaced, _ := applyResult.(bool)
+	rm.completeIPApplied(ip, cidr, routeReplaced)
+	return nil
+}
+
+func (rm *RouteManager) completeIPApplied(ip, cidr string, routeReplaced bool) {
+	// Mark the route applied before consuming the pending reset request.
+	// A reset is allowed only when this operation observed a successful
+	// RouteReplace. Merely finding the address/prefix in the route table must
+	// never disturb an already valid connection.
+	rm.ipMu.Lock()
+	rm.ipCache[ip] = routeCacheEntry{State: StateApplied, CIDR: cidr, UpdatedAt: time.Now()}
+	rm.resetMu.Lock()
+	_, resetRequested := rm.resetAfterApply[ip]
+	delete(rm.resetAfterApply, ip)
+	rm.resetMu.Unlock()
+	rm.ipMu.Unlock()
+
+	if routeReplaced && resetRequested {
+		rm.app.resetConntrackForIP(ip)
+	}
 }
 
 func (rm *RouteManager) markIPApplied(ip, cidr string, now time.Time) {
@@ -403,10 +673,17 @@ func (rm *RouteManager) markCIDRFailed(cidr string, now time.Time) {
 
 func (rm *RouteManager) routeTableForLookup() int {
 	cfg := rm.app.getConfig()
-	if cfg.RouteTable == 0 {
-		return 254
-	}
-	return cfg.RouteTable
+	return effectiveRouteTable(cfg.RouteTable)
+}
+
+func (rm *RouteManager) ResetCaches() {
+	rm.ipMu.Lock()
+	rm.ipCache = make(map[string]routeCacheEntry)
+	rm.ipMu.Unlock()
+
+	rm.cidrMu.Lock()
+	rm.cidrCache = make(map[string]routeCacheEntry)
+	rm.cidrMu.Unlock()
 }
 
 func (rm *RouteManager) ReloadSnapshot() error {
@@ -491,6 +768,13 @@ func defaultCIDRForIP(ip net.IP) string {
 	return ip.String() + "/128"
 }
 
+func effectiveRouteTable(table int) int {
+	if table == 0 {
+		return mainRouteTable
+	}
+	return table
+}
+
 func logConfig(prefix string, cfg *Config) {
 	log.Printf(
 		"%s: LISTEN=%v UPSTREAMS=%v WG_INTERFACE=%s WG_GATEWAY=%s WG_GATEWAY_V4=%s WG_GATEWAY_V6=%s ROUTE_TABLE=%d ROUTE_IPV4=%t ROUTE_IPV6=%t LOOKUP_CYMRU_PREFIX=%t REPLY_BEFORE_ROUTE=%t SPECIAL_DOMAINS=%d LOCAL_A=%d LOCAL_AAAA=%d",
@@ -509,6 +793,7 @@ func renderError(w http.ResponseWriter, status int, err error) {
 
 func loadConfigFromDB(db *sql.DB) (*Config, error) {
 	cfg := &Config{
+		UpstreamProto:    make(map[string]string),
 		SpecialDomains:   make(map[string]struct{}),
 		LocalA:           make(map[string][]LocalRecord),
 		LocalAAAA:        make(map[string][]LocalRecord),
@@ -579,6 +864,25 @@ func isTrueString(v string) bool {
 	}
 }
 
+func formBoolean(r *http.Request, name string) bool {
+	if err := r.ParseForm(); err != nil {
+		return false
+	}
+	for _, value := range r.PostForm[name] {
+		if isTrueString(value) {
+			return true
+		}
+	}
+	return false
+}
+
+func boolSetting(v bool) string {
+	if v {
+		return "1"
+	}
+	return "0"
+}
+
 func initDB(db *sql.DB) error {
 	stmts := []string{
 		`CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);`,
@@ -631,19 +935,26 @@ func readListenAddrs(db *sql.DB, cfg *Config) error {
 	return rows.Err()
 }
 func readUpstreams(db *sql.DB, cfg *Config) error {
-	rows, err := db.Query(`SELECT addr FROM upstreams WHERE enabled = 1 ORDER BY priority, id`)
+	rows, err := db.Query(`SELECT addr, proto FROM upstreams WHERE enabled = 1 ORDER BY priority, id`)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
 	for rows.Next() {
-		var v string
-		if err := rows.Scan(&v); err != nil {
+		var addr, proto string
+		if err := rows.Scan(&addr, &proto); err != nil {
 			return err
 		}
-		if v = strings.TrimSpace(v); v != "" {
-			cfg.Upstreams = append(cfg.Upstreams, v)
+		addr = strings.TrimSpace(addr)
+		if addr == "" {
+			continue
 		}
+		proto = strings.ToLower(strings.TrimSpace(proto))
+		if proto == "" {
+			proto = "auto"
+		}
+		cfg.Upstreams = append(cfg.Upstreams, addr)
+		cfg.UpstreamProto[addr] = proto
 	}
 	return rows.Err()
 }
@@ -777,7 +1088,12 @@ func (a *App) reloadConfig() error {
 	if err := a.reconcileListeners(cfg.ListenAddrs); err != nil {
 		return err
 	}
+	a.syncUpstreamCircuits(cfg)
 	a.setConfig(cfg)
+	a.routeMgr.ResetCaches()
+	if err := a.routeMgr.ReloadSnapshot(); err != nil {
+		return fmt.Errorf("reload route snapshot after config change: %w", err)
+	}
 	logConfig("CONFIG reloaded", cfg)
 	return nil
 }
@@ -869,6 +1185,7 @@ func (a *App) startHTTP() {
 	mux.HandleFunc("/", a.handleAdmin)
 	mux.HandleFunc("/reload", a.handleReload)
 	mux.HandleFunc("/routes/reload", a.handleRoutesReload)
+	mux.HandleFunc("/routes/errors", a.handleRouteErrors)
 	mux.HandleFunc("/stats", a.handleStats)
 	mux.HandleFunc("/metrics", a.handleMetrics)
 	mux.HandleFunc("/settings/save", a.handleSettingsSave)
@@ -903,11 +1220,8 @@ func (a *App) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		renderError(w, 500, err)
 		return
 	}
-	upstreams, err := a.listSimple(`SELECT addr FROM upstreams WHERE enabled = 1 ORDER BY priority, id`)
-	if err != nil {
-		renderError(w, 500, err)
-		return
-	}
+	cfg := a.getConfig()
+	upstreams := a.upstreamViews(cfg)
 	specials, err := a.listSimple(`SELECT domain FROM special_domains WHERE enabled = 1 ORDER BY domain`)
 	if err != nil {
 		renderError(w, 500, err)
@@ -918,7 +1232,7 @@ func (a *App) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		renderError(w, 500, err)
 		return
 	}
-	data := pageData{Config: a.getConfig(), Settings: settings, ListenAddrs: listenAddrs, Upstreams: upstreams, SpecialDomains: specials, Records: records, Message: a.adminAddr}
+	data := pageData{Config: cfg, Settings: settings, ListenAddrs: listenAddrs, Upstreams: upstreams, SpecialDomains: specials, Records: records, Message: a.adminAddr}
 	if err := templates.ExecuteTemplate(w, "admin.html.tmpl", data); err != nil {
 		renderError(w, 500, err)
 	}
@@ -955,27 +1269,42 @@ func (a *App) handleRoutesReload(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
+func (a *App) handleRouteErrors(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		renderError(w, http.StatusMethodNotAllowed, fmt.Errorf("method not allowed"))
+		return
+	}
+
+	a.routeErrMu.Lock()
+	out := append([]routeErrorDiagnostic(nil), a.routeErrorLog...)
+	a.routeErrMu.Unlock()
+
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
+	}
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(out); err != nil {
+		log.Printf("write route error history: %v", err)
+	}
+}
+
 func (a *App) handleSettingsSave(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		renderError(w, 405, fmt.Errorf("method not allowed"))
 		return
 	}
-	lookupCIDR := "0"
-	if r.FormValue("lookup_cidr") != "" {
-		lookupCIDR = "1"
+	if err := r.ParseForm(); err != nil {
+		renderError(w, http.StatusBadRequest, fmt.Errorf("parse settings form: %w", err))
+		return
 	}
-	replyBeforeRoute := "0"
-	if r.FormValue("reply_before_route") != "" {
-		replyBeforeRoute = "1"
-	}
-	routeIPv4 := "0"
-	if r.FormValue("route_ipv4") != "" {
-		routeIPv4 = "1"
-	}
-	routeIPv6 := "0"
-	if r.FormValue("route_ipv6") != "" {
-		routeIPv6 = "1"
-	}
+	lookupCIDR := boolSetting(formBoolean(r, "lookup_cidr"))
+	replyBeforeRoute := boolSetting(formBoolean(r, "reply_before_route"))
+	routeIPv4 := boolSetting(formBoolean(r, "route_ipv4"))
+	routeIPv6 := boolSetting(formBoolean(r, "route_ipv6"))
 	settings := map[string]string{
 		"wg_interface":       strings.TrimSpace(r.FormValue("wg_interface")),
 		"wg_gateway":         strings.TrimSpace(r.FormValue("wg_gateway")),
@@ -1035,7 +1364,19 @@ func (a *App) handleUpstreamAdd(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
 	}
-	if _, err := a.db.Exec(`INSERT OR IGNORE INTO upstreams(addr, enabled, priority) VALUES(?, 1, 100)`, addr); err != nil {
+	proto := strings.ToLower(strings.TrimSpace(r.FormValue("proto")))
+	if proto == "" {
+		proto = "auto"
+	}
+	if !validUpstreamProto(proto) {
+		renderError(w, 400, fmt.Errorf("unsupported upstream protocol %q", proto))
+		return
+	}
+	if _, _, err := resolveUpstream(addr, proto); err != nil {
+		renderError(w, 400, err)
+		return
+	}
+	if _, err := a.db.Exec(`INSERT INTO upstreams(addr, proto, enabled, priority) VALUES(?, ?, 1, 100) ON CONFLICT(addr) DO UPDATE SET proto = excluded.proto, enabled = 1`, addr, proto); err != nil {
 		renderError(w, 500, err)
 		return
 	}
@@ -1210,8 +1551,26 @@ func (a *App) handleDNS(w dns.ResponseWriter, req *dns.Msg) {
 	key := name + ":" + dns.TypeToString[q.Qtype]
 
 	if resp := a.localResponse(req, q); resp != nil {
+		cfg := a.getConfig()
+		ips := a.routeIPsFromAnswers(name, q.Qtype, resp.Answer, cfg)
+		if cfg.ReplyBeforeRoute {
+			atomic.AddUint64(&a.localAnswers, 1)
+			_ = writeDNSResponse(w, req, resp)
+			if len(ips) > 0 {
+				a.routeMgr.EnsureIPs(ips)
+			}
+			return
+		}
+		if len(ips) > 0 {
+			if err := a.routeMgr.EnsureIPsAndWait(ips); err != nil {
+				atomic.AddUint64(&a.servfailCount, 1)
+				log.Printf("ROUTE_BEFORE_REPLY_ERROR name=%s qtype=%s local=true error=%v", name, dns.TypeToString[q.Qtype], err)
+				respondSERVFAIL(w, req)
+				return
+			}
+		}
 		atomic.AddUint64(&a.localAnswers, 1)
-		_ = w.WriteMsg(resp)
+		_ = writeDNSResponse(w, req, resp)
 		return
 	}
 
@@ -1224,16 +1583,21 @@ func (a *App) handleDNS(w dns.ResponseWriter, req *dns.Msg) {
 		cfg := a.getConfig()
 		ips := a.routeIPsFromAnswers(name, q.Qtype, cached.Answer, cfg)
 		if cfg.ReplyBeforeRoute {
-			_ = w.WriteMsg(cached)
+			_ = writeDNSResponse(w, req, cached)
 			if len(ips) > 0 {
 				a.routeMgr.EnsureIPs(ips)
 			}
 			return
 		}
 		if len(ips) > 0 {
-			a.routeMgr.EnsureIPs(ips)
+			if err := a.routeMgr.EnsureIPsAndWait(ips); err != nil {
+				atomic.AddUint64(&a.servfailCount, 1)
+				log.Printf("ROUTE_BEFORE_REPLY_ERROR name=%s qtype=%s cached=true error=%v", name, dns.TypeToString[q.Qtype], err)
+				respondSERVFAIL(w, req)
+				return
+			}
 		}
-		_ = w.WriteMsg(cached)
+		_ = writeDNSResponse(w, req, cached)
 		return
 	}
 	a.cacheMu.RUnlock()
@@ -1243,6 +1607,7 @@ func (a *App) handleDNS(w dns.ResponseWriter, req *dns.Msg) {
 	if err != nil {
 		atomic.AddUint64(&a.forwardErrors, 1)
 		atomic.AddUint64(&a.servfailCount, 1)
+		a.logForwardError(name, q.Qtype, err)
 		respondSERVFAIL(w, req)
 		return
 	}
@@ -1264,7 +1629,7 @@ func (a *App) handleDNS(w dns.ResponseWriter, req *dns.Msg) {
 	ips := a.routeIPsFromAnswers(name, q.Qtype, resp.Answer, cfg)
 
 	if cfg.ReplyBeforeRoute {
-		_ = w.WriteMsg(resp)
+		_ = writeDNSResponse(w, req, resp)
 		atomic.AddUint64(&a.forwardedOK, 1)
 		if len(ips) > 0 {
 			a.routeMgr.EnsureIPs(ips)
@@ -1273,9 +1638,14 @@ func (a *App) handleDNS(w dns.ResponseWriter, req *dns.Msg) {
 	}
 
 	if len(ips) > 0 {
-		a.routeMgr.EnsureIPs(ips)
+		if err := a.routeMgr.EnsureIPsAndWait(ips); err != nil {
+			atomic.AddUint64(&a.servfailCount, 1)
+			log.Printf("ROUTE_BEFORE_REPLY_ERROR name=%s qtype=%s cached=false error=%v", name, dns.TypeToString[q.Qtype], err)
+			respondSERVFAIL(w, req)
+			return
+		}
 	}
-	_ = w.WriteMsg(resp)
+	_ = writeDNSResponse(w, req, resp)
 	atomic.AddUint64(&a.forwardedOK, 1)
 }
 
@@ -1336,70 +1706,532 @@ func (a *App) findLocalRecords(name string, qtype uint16) []LocalRecord {
 	return nil
 }
 
+func newDoHClient() *http.Client {
+	transport := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          128,
+		MaxIdleConnsPerHost:   32,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   5 * time.Second,
+		ResponseHeaderTimeout: 5 * time.Second,
+		TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
+	}
+	return &http.Client{Timeout: 5 * time.Second, Transport: transport}
+}
+
+func validUpstreamProto(proto string) bool {
+	switch strings.ToLower(strings.TrimSpace(proto)) {
+	case "auto", "udp", "dns", "tcp", "tls", "dot", "https", "doh":
+		return true
+	default:
+		return false
+	}
+}
+
+func canonicalUpstreamProto(proto string) string {
+	switch strings.ToLower(strings.TrimSpace(proto)) {
+	case "dns":
+		return "udp"
+	case "dot":
+		return "tls"
+	case "doh":
+		return "https"
+	default:
+		return strings.ToLower(strings.TrimSpace(proto))
+	}
+}
+
+// resolveUpstream converts the database protocol and optional address scheme
+// into a canonical protocol and endpoint. Existing address-only entries remain
+// compatible: port 853 means DoT, every other port means ordinary UDP DNS.
+func resolveUpstream(rawAddr, configuredProto string) (proto, endpoint string, err error) {
+	endpoint = strings.TrimSpace(rawAddr)
+	if endpoint == "" {
+		return "", "", fmt.Errorf("empty upstream address")
+	}
+
+	proto = canonicalUpstreamProto(configuredProto)
+	if proto == "" {
+		proto = "auto"
+	}
+	if !validUpstreamProto(proto) {
+		return "", "", fmt.Errorf("unsupported upstream protocol %q for %q", configuredProto, rawAddr)
+	}
+
+	lower := strings.ToLower(endpoint)
+	schemeProto := ""
+	switch {
+	case strings.HasPrefix(lower, "https://"):
+		schemeProto = "https"
+	case strings.HasPrefix(lower, "doh://"):
+		schemeProto = "https"
+		endpoint = "https://" + endpoint[len("doh://"):]
+	case strings.HasPrefix(lower, "tls://"):
+		schemeProto = "tls"
+		endpoint = endpoint[len("tls://"):]
+	case strings.HasPrefix(lower, "dot://"):
+		schemeProto = "tls"
+		endpoint = endpoint[len("dot://"):]
+	case strings.HasPrefix(lower, "tcp://"):
+		schemeProto = "tcp"
+		endpoint = endpoint[len("tcp://"):]
+	case strings.HasPrefix(lower, "udp://"):
+		schemeProto = "udp"
+		endpoint = endpoint[len("udp://"):]
+	case strings.HasPrefix(lower, "dns://"):
+		schemeProto = "udp"
+		endpoint = endpoint[len("dns://"):]
+	}
+
+	if proto == "auto" && schemeProto != "" {
+		proto = schemeProto
+	} else if proto != "auto" && schemeProto != "" && proto != schemeProto {
+		return "", "", fmt.Errorf("upstream protocol %q conflicts with address %q", configuredProto, rawAddr)
+	}
+
+	if proto == "auto" {
+		if strings.HasPrefix(strings.ToLower(endpoint), "https://") {
+			proto = "https"
+		} else if _, port, splitErr := net.SplitHostPort(endpoint); splitErr == nil && port == "853" {
+			proto = "tls"
+		} else {
+			proto = "udp"
+		}
+	}
+
+	if proto == "https" {
+		if !strings.HasPrefix(strings.ToLower(endpoint), "https://") {
+			return "", "", fmt.Errorf("DoH upstream must be an https URL: %q", rawAddr)
+		}
+		return proto, endpoint, nil
+	}
+
+	defaultPort := "53"
+	if proto == "tls" {
+		defaultPort = "853"
+	}
+	endpoint, err = upstreamAddrWithDefaultPort(endpoint, defaultPort)
+	if err != nil {
+		return "", "", fmt.Errorf("invalid %s upstream %q: %w", proto, rawAddr, err)
+	}
+	return proto, endpoint, nil
+}
+
+func upstreamAddrWithDefaultPort(addr, defaultPort string) (string, error) {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return "", fmt.Errorf("empty address")
+	}
+	if _, _, err := net.SplitHostPort(addr); err == nil {
+		return addr, nil
+	}
+	if ip := net.ParseIP(addr); ip != nil {
+		return net.JoinHostPort(addr, defaultPort), nil
+	}
+	if !strings.Contains(addr, ":") {
+		return net.JoinHostPort(addr, defaultPort), nil
+	}
+	return "", fmt.Errorf("address must be host:port; IPv6 literals must use brackets")
+}
+
+func (a *App) exchangeDoH(req *dns.Msg, endpoint string) (*dns.Msg, error) {
+	wire, err := req.Pack()
+	if err != nil {
+		return nil, fmt.Errorf("pack request: %w", err)
+	}
+	httpReq, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(wire))
+	if err != nil {
+		return nil, fmt.Errorf("create DoH request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/dns-message")
+	httpReq.Header.Set("Accept", "application/dns-message")
+
+	client := a.dohClient
+	if client == nil {
+		client = newDoHClient()
+	}
+	httpResp, err := client.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("DoH request: %w", err)
+	}
+	defer httpResp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(httpResp.Body, 65536))
+	if err != nil {
+		return nil, fmt.Errorf("read DoH response: %w", err)
+	}
+	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+		return nil, fmt.Errorf("unexpected HTTP status %s", httpResp.Status)
+	}
+	resp := new(dns.Msg)
+	if err := resp.Unpack(body); err != nil {
+		return nil, fmt.Errorf("unpack DoH response: %w", err)
+	}
+	return resp, nil
+}
+
+func exchangeClassicDNS(req *dns.Msg, proto, endpoint string) (*dns.Msg, error) {
+	network := proto
+	client := &dns.Client{Timeout: 5 * time.Second}
+	switch proto {
+	case "udp":
+		client.Net = "udp"
+	case "tcp":
+		client.Net = "tcp"
+	case "tls":
+		client.Net = "tcp-tls"
+		client.TLSConfig = &tls.Config{InsecureSkipVerify: true}
+	default:
+		return nil, fmt.Errorf("unsupported DNS transport %q", proto)
+	}
+
+	resp, _, err := client.Exchange(req, endpoint)
+	if err != nil {
+		return nil, err
+	}
+	if resp == nil {
+		return nil, fmt.Errorf("empty %s response", network)
+	}
+	if proto == "udp" && resp.Truncated {
+		tcpClient := &dns.Client{Net: "tcp", Timeout: 5 * time.Second}
+		resp, _, err = tcpClient.Exchange(req, endpoint)
+		if err != nil {
+			return nil, fmt.Errorf("UDP response truncated; TCP retry failed: %w", err)
+		}
+		if resp == nil {
+			return nil, fmt.Errorf("UDP response truncated; empty TCP response")
+		}
+	}
+	return resp, nil
+}
+
+func upstreamCircuitKey(rawAddr, configuredProto string) string {
+	proto := canonicalUpstreamProto(configuredProto)
+	if proto == "" {
+		proto = "auto"
+	}
+	return strings.TrimSpace(rawAddr) + "\x00" + proto
+}
+
+func upstreamCircuitProtoLabel(rawAddr, configuredProto string) string {
+	proto, _, err := resolveUpstream(rawAddr, configuredProto)
+	if err == nil {
+		return proto
+	}
+	proto = canonicalUpstreamProto(configuredProto)
+	if proto == "" {
+		return "auto"
+	}
+	return proto
+}
+
+func (a *App) syncUpstreamCircuits(cfg *Config) {
+	wanted := make(map[string]struct{}, len(cfg.Upstreams))
+
+	a.upstreamMu.Lock()
+	defer a.upstreamMu.Unlock()
+	if a.upstreamCircuits == nil {
+		a.upstreamCircuits = make(map[string]*upstreamCircuit)
+	}
+	for _, rawAddr := range cfg.Upstreams {
+		configuredProto := cfg.UpstreamProto[rawAddr]
+		key := upstreamCircuitKey(rawAddr, configuredProto)
+		wanted[key] = struct{}{}
+		if _, ok := a.upstreamCircuits[key]; !ok {
+			a.upstreamCircuits[key] = &upstreamCircuit{
+				RawAddr: strings.TrimSpace(rawAddr),
+				Proto:   upstreamCircuitProtoLabel(rawAddr, configuredProto),
+				State:   upstreamCircuitClosed,
+			}
+		}
+	}
+	for key := range a.upstreamCircuits {
+		if _, ok := wanted[key]; !ok {
+			delete(a.upstreamCircuits, key)
+		}
+	}
+}
+
+func upstreamCircuitBackoff(level uint) time.Duration {
+	backoff := upstreamCircuitBaseBackoff
+	for i := uint(0); i < level && backoff < upstreamCircuitMaxBackoff; i++ {
+		if backoff > upstreamCircuitMaxBackoff/2 {
+			return upstreamCircuitMaxBackoff
+		}
+		backoff *= 2
+	}
+	if backoff > upstreamCircuitMaxBackoff {
+		return upstreamCircuitMaxBackoff
+	}
+	return backoff
+}
+
+// beginUpstreamAttempt returns false while an upstream is in its cooldown.
+// After the cooldown expires, exactly one caller is admitted as a half-open
+// probe; concurrent callers skip that upstream until the probe completes.
+func (a *App) beginUpstreamAttempt(rawAddr, configuredProto, resolvedProto string) (upstreamCircuitAttempt, bool, time.Duration) {
+	key := upstreamCircuitKey(rawAddr, configuredProto)
+	now := time.Now()
+
+	a.upstreamMu.Lock()
+	defer a.upstreamMu.Unlock()
+	if a.upstreamCircuits == nil {
+		a.upstreamCircuits = make(map[string]*upstreamCircuit)
+	}
+	c, ok := a.upstreamCircuits[key]
+	if !ok {
+		return upstreamCircuitAttempt{}, false, 0
+	}
+	if resolvedProto != "" {
+		c.Proto = resolvedProto
+	}
+
+	switch c.State {
+	case upstreamCircuitOpen:
+		if now.Before(c.OpenUntil) {
+			c.Skipped++
+			return upstreamCircuitAttempt{}, false, time.Until(c.OpenUntil)
+		}
+		c.State = upstreamCircuitHalfOpen
+		c.ProbeInFlight = true
+		c.HalfOpenProbes++
+		log.Printf("UPSTREAM_CIRCUIT_HALF_OPEN upstream=%q proto=%s", c.RawAddr, c.Proto)
+		return upstreamCircuitAttempt{Key: key, Generation: c.Generation, HalfOpen: true}, true, 0
+	case upstreamCircuitHalfOpen:
+		if c.ProbeInFlight {
+			c.Skipped++
+			return upstreamCircuitAttempt{}, false, 0
+		}
+		c.ProbeInFlight = true
+		c.HalfOpenProbes++
+		return upstreamCircuitAttempt{Key: key, Generation: c.Generation, HalfOpen: true}, true, 0
+	default:
+		return upstreamCircuitAttempt{Key: key, Generation: c.Generation}, true, 0
+	}
+}
+
+func (a *App) completeUpstreamTransportSuccess(attempt upstreamCircuitAttempt, usefulAnswer bool) {
+	now := time.Now()
+	var recovered bool
+	var rawAddr, proto string
+
+	a.upstreamMu.Lock()
+	c, ok := a.upstreamCircuits[attempt.Key]
+	if !ok {
+		a.upstreamMu.Unlock()
+		return
+	}
+	if usefulAnswer {
+		c.Successes++
+	} else {
+		c.DNSFailures++
+	}
+	c.LastSuccess = now
+	if attempt.Generation == c.Generation {
+		recovered = c.State == upstreamCircuitHalfOpen || c.State == upstreamCircuitOpen
+		c.State = upstreamCircuitClosed
+		c.ConsecutiveFailures = 0
+		c.BackoffLevel = 0
+		c.OpenUntil = time.Time{}
+		c.ProbeInFlight = false
+		c.LastError = ""
+		if recovered {
+			c.Recoveries++
+			c.Generation++
+		}
+	}
+	rawAddr, proto = c.RawAddr, c.Proto
+	a.upstreamMu.Unlock()
+
+	if recovered {
+		log.Printf("UPSTREAM_CIRCUIT_RECOVERED upstream=%q proto=%s", rawAddr, proto)
+	}
+}
+
+func (a *App) completeUpstreamSuccess(attempt upstreamCircuitAttempt) {
+	a.completeUpstreamTransportSuccess(attempt, true)
+}
+
+func (a *App) completeUpstreamDNSFailure(attempt upstreamCircuitAttempt) {
+	// A DNS SERVFAIL/REFUSED proves that the transport and server are reachable,
+	// so it closes the circuit but is not counted as a useful answer. The caller
+	// may continue to another upstream without penalizing this circuit.
+	a.completeUpstreamTransportSuccess(attempt, false)
+}
+
+func (a *App) completeUpstreamFailure(attempt upstreamCircuitAttempt, err error) {
+	now := time.Now()
+	var opened bool
+	var rawAddr, proto string
+	var failures uint64
+	var cooldown time.Duration
+	var openUntil time.Time
+
+	a.upstreamMu.Lock()
+	c, ok := a.upstreamCircuits[attempt.Key]
+	if !ok {
+		a.upstreamMu.Unlock()
+		return
+	}
+	c.Failures++
+	c.LastFailure = now
+	c.LastError = err.Error()
+	if attempt.Generation == c.Generation {
+		c.ConsecutiveFailures++
+		if c.State == upstreamCircuitHalfOpen || c.ConsecutiveFailures >= upstreamFailureThreshold {
+			cooldown = upstreamCircuitBackoff(c.BackoffLevel)
+			if cooldown < upstreamCircuitMaxBackoff {
+				c.BackoffLevel++
+			}
+			c.State = upstreamCircuitOpen
+			c.OpenUntil = now.Add(cooldown)
+			c.ProbeInFlight = false
+			c.OpenEvents++
+			c.Generation++
+			opened = true
+		}
+	}
+	rawAddr, proto = c.RawAddr, c.Proto
+	failures = c.ConsecutiveFailures
+	openUntil = c.OpenUntil
+	a.upstreamMu.Unlock()
+
+	if opened {
+		log.Printf(
+			"UPSTREAM_CIRCUIT_OPEN upstream=%q proto=%s consecutive_failures=%d cooldown=%s open_until=%s error=%v",
+			rawAddr,
+			proto,
+			failures,
+			cooldown,
+			openUntil.Format(time.RFC3339),
+			err,
+		)
+	}
+}
+
+func (a *App) upstreamCircuitSnapshots() []upstreamCircuitSnapshot {
+	a.upstreamMu.Lock()
+	out := make([]upstreamCircuitSnapshot, 0, len(a.upstreamCircuits))
+	for _, c := range a.upstreamCircuits {
+		out = append(out, upstreamCircuitSnapshot{
+			RawAddr:             c.RawAddr,
+			Proto:               c.Proto,
+			State:               c.State,
+			ConsecutiveFailures: c.ConsecutiveFailures,
+			OpenUntil:           c.OpenUntil,
+			Successes:           c.Successes,
+			Failures:            c.Failures,
+			DNSFailures:         c.DNSFailures,
+			Skipped:             c.Skipped,
+			OpenEvents:          c.OpenEvents,
+			Recoveries:          c.Recoveries,
+			HalfOpenProbes:      c.HalfOpenProbes,
+			LastSuccess:         c.LastSuccess,
+			LastFailure:         c.LastFailure,
+			LastError:           c.LastError,
+		})
+	}
+	a.upstreamMu.Unlock()
+
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].RawAddr != out[j].RawAddr {
+			return out[i].RawAddr < out[j].RawAddr
+		}
+		return out[i].Proto < out[j].Proto
+	})
+	return out
+}
+
 func (a *App) forwardDNS(req *dns.Msg) (*dns.Msg, error) {
 	cfg := a.getConfig()
 	if len(cfg.Upstreams) == 0 {
 		return nil, fmt.Errorf("no upstreams configured")
 	}
-	var lastErr error
-	for _, upstream := range a.shuffledUpstreams() {
-		var resp *dns.Msg
-		var err error
-		if strings.HasPrefix(upstream, "https://") {
-			wire, errPack := req.Pack()
-			if errPack != nil {
-				lastErr = errPack
-				continue
-			}
-			httpReq, errReq := http.NewRequest("POST", upstream, bytes.NewReader(wire))
-			if errReq != nil {
-				lastErr = errReq
-				continue
-			}
-			httpReq.Header.Set("Content-Type", "application/dns-message")
-			httpReq.Header.Set("Accept", "application/dns-message")
-			client := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
-			httpResp, errDoH := client.Do(httpReq)
-			if errDoH != nil {
-				lastErr = errDoH
-				continue
-			}
-			body, errRead := io.ReadAll(httpResp.Body)
-			_ = httpResp.Body.Close()
-			if errRead != nil {
-				lastErr = errRead
-				continue
-			}
-			if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-				lastErr = fmt.Errorf("unexpected HTTP status %s", httpResp.Status)
-				continue
-			}
-			resp = new(dns.Msg)
-			if err = resp.Unpack(body); err != nil {
-				lastErr = err
-				continue
-			}
-		} else {
-			client := &dns.Client{Net: "tcp-tls", Timeout: 5 * time.Second, TLSConfig: &tls.Config{InsecureSkipVerify: true}}
-			resp, _, err = client.Exchange(req, upstream)
-			if err != nil {
-				lastErr = err
-				continue
-			}
+
+	var attemptErrors []string
+	var lastRetryableResponse *dns.Msg
+	attempted := 0
+	for _, upstream := range shuffledUpstreams(cfg.Upstreams) {
+		configuredProto := cfg.UpstreamProto[upstream]
+		proto, endpoint, err := resolveUpstream(upstream, configuredProto)
+		if err != nil {
+			attemptErrors = append(attemptErrors, fmt.Sprintf("%s: %v", upstream, err))
+			continue
 		}
+
+		attempt, allowed, remaining := a.beginUpstreamAttempt(upstream, configuredProto, proto)
+		if !allowed {
+			if remaining > 0 {
+				attemptErrors = append(attemptErrors, fmt.Sprintf("%s[%s]: circuit open for %s", endpoint, proto, remaining.Truncate(time.Millisecond)))
+			} else {
+				attemptErrors = append(attemptErrors, fmt.Sprintf("%s[%s]: half-open probe already in flight", endpoint, proto))
+			}
+			continue
+		}
+		attempted++
+
+		var resp *dns.Msg
+		if proto == "https" {
+			resp, err = a.exchangeDoH(req, endpoint)
+		} else {
+			resp, err = exchangeClassicDNS(req, proto, endpoint)
+		}
+		if err != nil {
+			a.completeUpstreamFailure(attempt, err)
+			attemptErrors = append(attemptErrors, fmt.Sprintf("%s[%s]: %v", endpoint, proto, err))
+			continue
+		}
+		if resp.Rcode == dns.RcodeServerFailure || resp.Rcode == dns.RcodeRefused {
+			a.completeUpstreamDNSFailure(attempt)
+			lastRetryableResponse = resp
+			attemptErrors = append(attemptErrors, fmt.Sprintf("%s[%s]: DNS %s", endpoint, proto, dns.RcodeToString[resp.Rcode]))
+			continue
+		}
+		a.completeUpstreamSuccess(attempt)
 		return resp, nil
 	}
-	if lastErr == nil {
-		lastErr = fmt.Errorf("no upstreams configured")
+
+	if lastRetryableResponse != nil {
+		return lastRetryableResponse, nil
 	}
-	return nil, lastErr
+	if len(attemptErrors) == 0 {
+		return nil, fmt.Errorf("no usable upstreams configured")
+	}
+	if attempted == 0 {
+		return nil, fmt.Errorf("all upstream circuits unavailable: %s", strings.Join(attemptErrors, "; "))
+	}
+	return nil, fmt.Errorf("all attempted upstreams failed: %s", strings.Join(attemptErrors, "; "))
 }
-func (a *App) shuffledUpstreams() []string {
-	cfg := a.getConfig()
-	res := append([]string(nil), cfg.Upstreams...)
+
+func (a *App) logForwardError(name string, qtype uint16, err error) {
+	const interval = 10 * time.Second
+	now := time.Now()
+	a.forwardLogMu.Lock()
+	if !a.lastForwardErrorLog.IsZero() && now.Sub(a.lastForwardErrorLog) < interval {
+		a.forwardErrorSuppressed++
+		a.forwardLogMu.Unlock()
+		return
+	}
+	suppressed := a.forwardErrorSuppressed
+	a.forwardErrorSuppressed = 0
+	a.lastForwardErrorLog = now
+	a.forwardLogMu.Unlock()
+
+	log.Printf(
+		"FORWARD_ERROR name=%s qtype=%s suppressed=%d error=%v",
+		name,
+		dns.TypeToString[qtype],
+		suppressed,
+		err,
+	)
+}
+
+func shuffledUpstreams(upstreams []string) []string {
+	res := append([]string(nil), upstreams...)
 	rand.Shuffle(len(res), func(i, j int) { res[i], res[j] = res[j], res[i] })
 	return res
 }
+
 func (a *App) routeIPsFromAnswers(name string, qtype uint16, answers []dns.RR, cfg *Config) []net.IP {
 	if !a.routeEnabledForQuestion(qtype, cfg) || !a.isSpecial(name) {
 		return nil
@@ -1535,32 +2367,141 @@ func parseCymruPrefix(txt string, ip net.IP) string {
 	return netw.String()
 }
 
+const maxUDPResponseSize = 1232
+
+// writeDNSResponse returns a full response to TCP clients. For UDP clients it
+// respects the EDNS0 advertised buffer size, defaults to 512 bytes without
+// EDNS0, and caps the response at maxUDPResponseSize to avoid IP fragmentation.
+// Msg.Truncate sets TC=1 when records have to be omitted, prompting the client
+// to retry the same query over TCP.
+func writeDNSResponse(w dns.ResponseWriter, req, resp *dns.Msg) error {
+	if resp == nil {
+		return fmt.Errorf("nil DNS response")
+	}
+
+	out := resp.Copy()
+	if req != nil {
+		out.Id = req.Id
+	}
+
+	if !isUDPResponseWriter(w) {
+		out.Compress = true
+		return w.WriteMsg(out)
+	}
+
+	udpSize := dns.MinMsgSize
+	if req != nil {
+		if opt := req.IsEdns0(); opt != nil {
+			udpSize = int(opt.UDPSize())
+			if udpSize < dns.MinMsgSize {
+				udpSize = dns.MinMsgSize
+			}
+		}
+	}
+	if udpSize > maxUDPResponseSize {
+		udpSize = maxUDPResponseSize
+	}
+
+	// If the response already contains OPT, advertise the limit actually used
+	// by this server rather than forwarding the upstream server's buffer size.
+	if opt := out.IsEdns0(); opt != nil {
+		opt.SetUDPSize(uint16(udpSize))
+	}
+
+	out.Truncate(udpSize)
+	// Truncate may turn compression off when the uncompressed response fits.
+	// Re-enabling it can only make the final UDP payload smaller.
+	out.Compress = true
+	return w.WriteMsg(out)
+}
+
+func isUDPResponseWriter(w dns.ResponseWriter) bool {
+	if w == nil {
+		return false
+	}
+	if _, ok := w.RemoteAddr().(*net.UDPAddr); ok {
+		return true
+	}
+	if addr := w.LocalAddr(); addr != nil {
+		return strings.HasPrefix(strings.ToLower(addr.Network()), "udp")
+	}
+	return false
+}
+
 func respondSERVFAIL(w dns.ResponseWriter, req *dns.Msg) {
 	m := new(dns.Msg)
 	m.SetRcode(req, dns.RcodeServerFailure)
-	_ = w.WriteMsg(m)
+	_ = writeDNSResponse(w, req, m)
+}
+
+func (a *App) resetConntrackForIP(ipString string) {
+	ip := normalizeRouteIP(net.ParseIP(ipString))
+	if ip == nil {
+		atomic.AddUint64(&a.conntrackResetErrors, 1)
+		log.Printf("CONNTRACK_RESET_ERROR ip=%q error=invalid_ip", ipString)
+		return
+	}
+
+	familyName := "ipv6"
+	family := netlink.InetFamily(syscall.AF_INET6)
+	if ip4 := ip.To4(); ip4 != nil {
+		ip = ip4
+		familyName = "ipv4"
+		family = netlink.InetFamily(syscall.AF_INET)
+	}
+
+	atomic.AddUint64(&a.conntrackResetAttempts, 1)
+	deleted, err := netlink.ConntrackDeleteFilter(
+		netlink.ConntrackTable,
+		family,
+		conntrackIPFilter{ip: ip},
+	)
+	if err != nil {
+		atomic.AddUint64(&a.conntrackResetErrors, 1)
+		log.Printf("CONNTRACK_RESET_ERROR ip=%s family=%s error=%v", ip.String(), familyName, err)
+		return
+	}
+
+	atomic.AddUint64(&a.conntrackResetDeleted, uint64(deleted))
+	if deleted > 0 {
+		log.Printf("CONNTRACK_RESET ip=%s family=%s deleted=%d", ip.String(), familyName, deleted)
+	}
 }
 
 func (a *App) addRoute(cidr string) error {
 	cfg := a.getConfig()
 	if cfg.WGInterface == "" {
-		return fmt.Errorf("wg_interface is empty")
+		return fmt.Errorf("prepare route %s: wg_interface is empty", cidr)
 	}
 	_, dst, err := net.ParseCIDR(cidr)
 	if err != nil {
-		return err
+		return fmt.Errorf("parse route CIDR %q: %w", cidr, err)
 	}
 	link, err := netlink.LinkByName(cfg.WGInterface)
 	if err != nil {
-		return err
+		return fmt.Errorf("lookup interface %q for route %s: %w", cfg.WGInterface, cidr, err)
 	}
-	route := netlink.Route{LinkIndex: link.Attrs().Index, Dst: dst, Table: cfg.RouteTable}
+	table := effectiveRouteTable(cfg.RouteTable)
+	route := netlink.Route{LinkIndex: link.Attrs().Index, Dst: dst, Table: table}
 	if gw, ok, err := routeGatewayForCIDR(cfg, dst); err != nil {
-		return err
+		return fmt.Errorf("select gateway for route %s table %d dev %s: %w", cidr, table, cfg.WGInterface, err)
 	} else if ok {
 		route.Gw = gw
 	}
-	return netlink.RouteReplace(&route)
+	if err := netlink.RouteReplace(&route); err != nil {
+		return fmt.Errorf(
+			"netlink RouteReplace dst=%s table=%d dev=%s(index=%d) gw=%s: %w",
+			cidr, table, cfg.WGInterface, link.Attrs().Index, routeGatewayString(route.Gw), err,
+		)
+	}
+	return nil
+}
+
+func routeGatewayString(gw net.IP) string {
+	if gw == nil {
+		return "<direct>"
+	}
+	return gw.String()
 }
 
 func routeGatewayForCIDR(cfg *Config, dst *net.IPNet) (net.IP, bool, error) {
@@ -1596,6 +2537,202 @@ func routeGatewayForCIDR(cfg *Config, dst *net.IPNet) (net.IP, bool, error) {
 	return gw.To16(), true, nil
 }
 
+func (a *App) recordRouteAddError(ip, cidr string, routeErr, reloadErr error, recovered bool) {
+	cfg := a.getConfig()
+	diag := routeErrorDiagnostic{
+		Time:                    time.Now().Format(time.RFC3339Nano),
+		IP:                      ip,
+		CIDR:                    cidr,
+		Table:                   effectiveRouteTable(cfg.RouteTable),
+		Interface:               cfg.WGInterface,
+		Error:                   routeErr.Error(),
+		ErrorType:               fmt.Sprintf("%T", routeErr),
+		RoutePresentAfterReload: recovered,
+	}
+	if reloadErr != nil {
+		diag.SnapshotReloadError = reloadErr.Error()
+	}
+
+	var errno syscall.Errno
+	if errors.As(routeErr, &errno) {
+		diag.Errno = int(errno)
+		diag.ErrnoText = errno.Error()
+	}
+
+	parsed := normalizeRouteIP(net.ParseIP(ip))
+	if parsed == nil {
+		if _, dst, err := net.ParseCIDR(cidr); err == nil {
+			parsed = normalizeRouteIP(dst.IP)
+		}
+	}
+	if parsed != nil && parsed.To4() != nil {
+		diag.Family = "ipv4"
+	} else if parsed != nil {
+		diag.Family = "ipv6"
+	} else {
+		diag.Family = "unknown"
+	}
+
+	_, dst, dstErr := net.ParseCIDR(cidr)
+	if dstErr == nil {
+		if gw, ok, gwErr := routeGatewayForCIDR(cfg, dst); gwErr != nil {
+			diag.Gateway = "config error: " + gwErr.Error()
+		} else if ok {
+			diag.Gateway = gw.String()
+		} else {
+			diag.Gateway = "<direct>"
+		}
+	}
+
+	var link netlink.Link
+	if cfg.WGInterface != "" {
+		var err error
+		link, err = netlink.LinkByName(cfg.WGInterface)
+		if err != nil {
+			diag.LinkLookupError = err.Error()
+		} else if attrs := link.Attrs(); attrs != nil {
+			diag.LinkIndex = attrs.Index
+			diag.LinkType = link.Type()
+			diag.LinkFlags = attrs.Flags.String()
+			diag.LinkOperState = fmt.Sprint(attrs.OperState)
+
+			family := netlink.FAMILY_ALL
+			if parsed != nil && parsed.To4() != nil {
+				family = netlink.FAMILY_V4
+			} else if parsed != nil {
+				family = netlink.FAMILY_V6
+			}
+			addrs, addrErr := netlink.AddrList(link, family)
+			if addrErr != nil {
+				diag.AddressListError = addrErr.Error()
+			} else {
+				for _, addr := range addrs {
+					diag.InterfaceAddresses = append(diag.InterfaceAddresses, addr.String())
+				}
+			}
+		}
+	}
+
+	if parsed != nil {
+		family := netlink.FAMILY_V6
+		if parsed.To4() != nil {
+			family = netlink.FAMILY_V4
+		}
+		filter := &netlink.Route{Table: diag.Table}
+		routes, err := netlink.RouteListFiltered(family, filter, netlink.RT_FILTER_TABLE)
+		if err != nil {
+			diag.RouteListError = err.Error()
+		} else {
+			diag.DestinationRoutes = relevantRouteDescriptions(routes, parsed, 16)
+			if gw := net.ParseIP(diag.Gateway); gw != nil {
+				diag.GatewayRoutes = relevantRouteDescriptions(routes, gw, 16)
+			}
+		}
+	}
+
+	a.routeErrMu.Lock()
+	if len(a.routeErrorLog) >= routeErrorHistoryLen {
+		copy(a.routeErrorLog, a.routeErrorLog[len(a.routeErrorLog)-routeErrorHistoryLen+1:])
+		a.routeErrorLog = a.routeErrorLog[:routeErrorHistoryLen-1]
+	}
+	a.routeErrorLog = append(a.routeErrorLog, diag)
+	a.routeErrMu.Unlock()
+
+	if encoded, err := json.Marshal(diag); err == nil {
+		log.Printf("ROUTE_ADD_ERROR %s", encoded)
+	} else {
+		log.Printf("ROUTE_ADD_ERROR ip=%s cidr=%s err=%v diagnostic_marshal_error=%v", ip, cidr, routeErr, err)
+	}
+}
+
+func relevantRouteDescriptions(routes []netlink.Route, ip net.IP, limit int) []string {
+	if ip == nil || limit <= 0 {
+		return nil
+	}
+	out := make([]string, 0, limit)
+	for _, route := range routes {
+		if route.Dst != nil && !route.Dst.Contains(ip) {
+			continue
+		}
+		out = append(out, formatRouteDiagnostic(route))
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out
+}
+
+func formatRouteDiagnostic(route netlink.Route) string {
+	dst := "default"
+	if route.Dst != nil {
+		dst = route.Dst.String()
+	}
+	return fmt.Sprintf(
+		"dst=%s gw=%s link_index=%d table=%d scope=%v protocol=%v priority=%d flags=%d",
+		dst, routeGatewayString(route.Gw), route.LinkIndex, route.Table, route.Scope, route.Protocol, route.Priority, route.Flags,
+	)
+}
+
+func formatWebTime(value time.Time) string {
+	if value.IsZero() {
+		return "—"
+	}
+	return value.Format(time.RFC3339)
+}
+
+func (a *App) upstreamViews(cfg *Config) []upstreamView {
+	snapshots := a.upstreamCircuitSnapshots()
+	byAddr := make(map[string]upstreamCircuitSnapshot, len(snapshots))
+	for _, snapshot := range snapshots {
+		byAddr[snapshot.RawAddr] = snapshot
+	}
+
+	now := time.Now()
+	out := make([]upstreamView, 0, len(cfg.Upstreams))
+	for _, addr := range cfg.Upstreams {
+		configuredProto := canonicalUpstreamProto(cfg.UpstreamProto[addr])
+		if configuredProto == "" {
+			configuredProto = "auto"
+		}
+
+		proto, endpoint, resolveErr := resolveUpstream(addr, configuredProto)
+		if resolveErr != nil {
+			proto = configuredProto
+			endpoint = "invalid: " + resolveErr.Error()
+		}
+
+		view := upstreamView{
+			Addr:            addr,
+			ConfiguredProto: configuredProto,
+			Proto:           proto,
+			Endpoint:        endpoint,
+			State:           string(upstreamCircuitClosed),
+			OpenRemaining:   "—",
+			LastSuccess:     "—",
+			LastFailure:     "—",
+		}
+		if snapshot, ok := byAddr[addr]; ok {
+			view.State = string(snapshot.State)
+			view.ConsecutiveFailures = snapshot.ConsecutiveFailures
+			view.Successes = snapshot.Successes
+			view.Failures = snapshot.Failures
+			view.DNSFailures = snapshot.DNSFailures
+			view.Skipped = snapshot.Skipped
+			view.OpenEvents = snapshot.OpenEvents
+			view.Recoveries = snapshot.Recoveries
+			view.HalfOpenProbes = snapshot.HalfOpenProbes
+			view.LastSuccess = formatWebTime(snapshot.LastSuccess)
+			view.LastFailure = formatWebTime(snapshot.LastFailure)
+			view.LastError = snapshot.LastError
+			if snapshot.State == upstreamCircuitOpen && snapshot.OpenUntil.After(now) {
+				view.OpenRemaining = time.Until(snapshot.OpenUntil).Truncate(time.Second).String()
+			}
+		}
+		out = append(out, view)
+	}
+	return out
+}
+
 func (a *App) statsSnapshot() statsData {
 	cfg := a.getConfig()
 	a.cacheMu.RLock()
@@ -1625,8 +2762,17 @@ func (a *App) statsSnapshot() statsData {
 		TotalQueries: atomic.LoadUint64(&a.totalQueries), CacheHits: atomic.LoadUint64(&a.cacheHits), CacheMisses: atomic.LoadUint64(&a.cacheMisses),
 		LocalAnswers: atomic.LoadUint64(&a.localAnswers), ForwardedOK: atomic.LoadUint64(&a.forwardedOK), ServfailCount: atomic.LoadUint64(&a.servfailCount),
 		RouteAdds: atomic.LoadUint64(&a.routeAdds), RouteAddErrors: atomic.LoadUint64(&a.routeAddErrors), ForwardErrors: atomic.LoadUint64(&a.forwardErrors),
-		LookupCIDRAttempts: atomic.LoadUint64(&a.lookupCIDRAttempts), LookupCIDRFailed: atomic.LoadUint64(&a.lookupCIDRFailed),
+		LookupCIDRAttempts: atomic.LoadUint64(&a.lookupCIDRAttempts), LookupCIDRFailed: atomic.LoadUint64(&a.lookupCIDRFailed), RouteQueueDrops: atomic.LoadUint64(&a.routeQueueDrops),
+		ConntrackResetAttempts: atomic.LoadUint64(&a.conntrackResetAttempts), ConntrackResetDeleted: atomic.LoadUint64(&a.conntrackResetDeleted), ConntrackResetErrors: atomic.LoadUint64(&a.conntrackResetErrors),
+		UpstreamCircuits: a.upstreamViews(cfg),
 	}
+}
+
+func prometheusLabelValue(v string) string {
+	v = strings.ReplaceAll(v, `\`, `\\`)
+	v = strings.ReplaceAll(v, "\n", `\n`)
+	v = strings.ReplaceAll(v, `"`, `\"`)
+	return v
 }
 
 func (a *App) handleMetrics(w http.ResponseWriter, _ *http.Request) {
@@ -1662,10 +2808,81 @@ func (a *App) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	counter("dns_route_servfail_total", s.ServfailCount, "servfail responses")
 	counter("dns_route_route_add_total", s.RouteAdds, "successful route additions")
 	counter("dns_route_route_add_errors_total", s.RouteAddErrors, "route add errors")
+	counter("dns_route_route_queue_drops_total", s.RouteQueueDrops, "route requests dropped because the route worker queue was full")
+	counter("dns_route_conntrack_reset_attempts_total", s.ConntrackResetAttempts, "conntrack reset attempts after an early DNS reply and route installation")
+	counter("dns_route_conntrack_reset_deleted_total", s.ConntrackResetDeleted, "conntrack flows deleted after destination route installation")
+	counter("dns_route_conntrack_reset_errors_total", s.ConntrackResetErrors, "conntrack reset errors")
 	counter("dns_route_forward_errors_total", s.ForwardErrors, "forward errors")
 	fmt.Fprintf(w, "# HELP dns_route_lookup_cidr_total Team Cymru BGP prefix lookup counters; legacy metric name\n# TYPE dns_route_lookup_cidr_total counter\n")
 	fmt.Fprintf(w, "dns_route_lookup_cidr_total{result=\"attempts\"} %d\n", s.LookupCIDRAttempts)
 	fmt.Fprintf(w, "dns_route_lookup_cidr_total{result=\"failed\"} %d\n", s.LookupCIDRFailed)
+
+	gauge("dns_route_upstream_circuit_failure_threshold", upstreamFailureThreshold, "consecutive upstream failures required to open a circuit")
+	gauge("dns_route_upstream_circuit_base_backoff_seconds", int64(upstreamCircuitBaseBackoff.Seconds()), "initial upstream circuit cooldown in seconds")
+	gauge("dns_route_upstream_circuit_max_backoff_seconds", int64(upstreamCircuitMaxBackoff.Seconds()), "maximum upstream circuit cooldown in seconds")
+
+	fmt.Fprintln(w, "# HELP dns_route_upstream_circuit_state Current upstream circuit state as a one-hot gauge")
+	fmt.Fprintln(w, "# TYPE dns_route_upstream_circuit_state gauge")
+	fmt.Fprintln(w, "# HELP dns_route_upstream_circuit_consecutive_failures Consecutive failures in the current circuit generation")
+	fmt.Fprintln(w, "# TYPE dns_route_upstream_circuit_consecutive_failures gauge")
+	fmt.Fprintln(w, "# HELP dns_route_upstream_circuit_open_until_seconds Unix timestamp until which the upstream circuit remains open")
+	fmt.Fprintln(w, "# TYPE dns_route_upstream_circuit_open_until_seconds gauge")
+	fmt.Fprintln(w, "# HELP dns_route_upstream_circuit_open_remaining_seconds Remaining upstream circuit cooldown in seconds")
+	fmt.Fprintln(w, "# TYPE dns_route_upstream_circuit_open_remaining_seconds gauge")
+	fmt.Fprintln(w, "# HELP dns_route_upstream_requests_total Actual network requests sent to each upstream by result")
+	fmt.Fprintln(w, "# TYPE dns_route_upstream_requests_total counter")
+	fmt.Fprintln(w, "# HELP dns_route_upstream_circuit_skipped_total Requests that skipped an upstream because its circuit was open or probing")
+	fmt.Fprintln(w, "# TYPE dns_route_upstream_circuit_skipped_total counter")
+	fmt.Fprintln(w, "# HELP dns_route_upstream_circuit_open_total Number of times an upstream circuit opened")
+	fmt.Fprintln(w, "# TYPE dns_route_upstream_circuit_open_total counter")
+	fmt.Fprintln(w, "# HELP dns_route_upstream_circuit_recoveries_total Successful half-open probes that closed an upstream circuit")
+	fmt.Fprintln(w, "# TYPE dns_route_upstream_circuit_recoveries_total counter")
+	fmt.Fprintln(w, "# HELP dns_route_upstream_circuit_half_open_probes_total Half-open probe requests admitted for an upstream")
+	fmt.Fprintln(w, "# TYPE dns_route_upstream_circuit_half_open_probes_total counter")
+	fmt.Fprintln(w, "# HELP dns_route_upstream_last_success_timestamp_seconds Unix timestamp of the last successful upstream request")
+	fmt.Fprintln(w, "# TYPE dns_route_upstream_last_success_timestamp_seconds gauge")
+	fmt.Fprintln(w, "# HELP dns_route_upstream_last_failure_timestamp_seconds Unix timestamp of the last failed upstream request")
+	fmt.Fprintln(w, "# TYPE dns_route_upstream_last_failure_timestamp_seconds gauge")
+
+	now := time.Now()
+	for _, upstream := range a.upstreamCircuitSnapshots() {
+		labels := fmt.Sprintf("upstream=\"%s\",proto=\"%s\"", prometheusLabelValue(upstream.RawAddr), prometheusLabelValue(upstream.Proto))
+		for _, state := range []upstreamCircuitState{upstreamCircuitClosed, upstreamCircuitOpen, upstreamCircuitHalfOpen} {
+			value := 0
+			if upstream.State == state {
+				value = 1
+			}
+			fmt.Fprintf(w, "dns_route_upstream_circuit_state{%s,state=\"%s\"} %d\n", labels, state, value)
+		}
+		openUntil := int64(0)
+		remaining := float64(0)
+		if !upstream.OpenUntil.IsZero() {
+			openUntil = upstream.OpenUntil.Unix()
+			if upstream.OpenUntil.After(now) {
+				remaining = upstream.OpenUntil.Sub(now).Seconds()
+			}
+		}
+		lastSuccess := int64(0)
+		if !upstream.LastSuccess.IsZero() {
+			lastSuccess = upstream.LastSuccess.Unix()
+		}
+		lastFailure := int64(0)
+		if !upstream.LastFailure.IsZero() {
+			lastFailure = upstream.LastFailure.Unix()
+		}
+		fmt.Fprintf(w, "dns_route_upstream_circuit_consecutive_failures{%s} %d\n", labels, upstream.ConsecutiveFailures)
+		fmt.Fprintf(w, "dns_route_upstream_circuit_open_until_seconds{%s} %d\n", labels, openUntil)
+		fmt.Fprintf(w, "dns_route_upstream_circuit_open_remaining_seconds{%s} %.3f\n", labels, remaining)
+		fmt.Fprintf(w, "dns_route_upstream_requests_total{%s,result=\"success\"} %d\n", labels, upstream.Successes)
+		fmt.Fprintf(w, "dns_route_upstream_requests_total{%s,result=\"error\"} %d\n", labels, upstream.Failures)
+		fmt.Fprintf(w, "dns_route_upstream_requests_total{%s,result=\"dns_error\"} %d\n", labels, upstream.DNSFailures)
+		fmt.Fprintf(w, "dns_route_upstream_circuit_skipped_total{%s} %d\n", labels, upstream.Skipped)
+		fmt.Fprintf(w, "dns_route_upstream_circuit_open_total{%s} %d\n", labels, upstream.OpenEvents)
+		fmt.Fprintf(w, "dns_route_upstream_circuit_recoveries_total{%s} %d\n", labels, upstream.Recoveries)
+		fmt.Fprintf(w, "dns_route_upstream_circuit_half_open_probes_total{%s} %d\n", labels, upstream.HalfOpenProbes)
+		fmt.Fprintf(w, "dns_route_upstream_last_success_timestamp_seconds{%s} %d\n", labels, lastSuccess)
+		fmt.Fprintf(w, "dns_route_upstream_last_failure_timestamp_seconds{%s} %d\n", labels, lastFailure)
+	}
 }
 
 func boolToInt(v bool) int {

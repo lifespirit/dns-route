@@ -1,10 +1,27 @@
 <!doctype html>
-<html lang="en"><head><meta charset="utf-8"><title>dns-route error</title>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>dns-route error</title>
 <style>
-body { font-family: sans-serif; margin: 24px; }
-.card { border: 1px solid #ccc; padding: 16px; border-radius: 8px; max-width: 900px; }
-pre { background: #f6f6f6; padding: 12px; border-radius: 6px; overflow: auto; white-space: pre-wrap; }
-.actions { margin-top: 16px; display: flex; gap: 12px; }
-button { padding: 6px 10px; }
-</style></head>
-<body><div class="card"><h1>Operation failed</h1><pre>{{.Error}}</pre><div class="actions"><button onclick="history.back()">Back</button><button onclick="location.href='/'">Home</button></div></div></body></html>
+:root { color-scheme: light dark; }
+body { font-family: system-ui, sans-serif; margin: 24px; }
+.card { border: 1px solid #8886; padding: 16px; border-radius: 10px; max-width: 900px; }
+pre { background: #8882; padding: 12px; border-radius: 6px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+.actions { margin-top: 16px; display: flex; flex-wrap: wrap; gap: 8px; }
+button { padding: 7px 11px; cursor: pointer; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>Operation failed</h1>
+  <pre>{{.Error}}</pre>
+  <div class="actions">
+    <button type="button" onclick="history.back()">Back</button>
+    <button type="button" onclick="location.href='/'">Home</button>
+    <button type="button" onclick="location.href='/stats'">Statistics</button>
+  </div>
+</div>
+</body>
+</html>

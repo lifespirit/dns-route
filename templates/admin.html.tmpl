@@ -2,20 +2,37 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>dns-route admin</title>
 <style>
-body { font-family: sans-serif; margin: 24px; }
-h1,h2 { margin-top: 24px; }
+:root { color-scheme: light dark; }
+body { font-family: system-ui, sans-serif; margin: 24px; line-height: 1.4; }
+h1, h2 { margin-top: 0; }
+h2 { font-size: 1.2rem; }
 table { border-collapse: collapse; width: 100%; margin-top: 8px; }
-th, td { border: 1px solid #ccc; padding: 8px; text-align: left; vertical-align: top; }
-input[type=text], input[type=number], select { width: 100%; box-sizing: border-box; padding: 6px; }
+th, td { border: 1px solid #8886; padding: 8px; text-align: left; vertical-align: top; }
+th { background: #8882; }
+input[type=text], input[type=number], select { width: 100%; box-sizing: border-box; padding: 7px; }
+input[type=checkbox] { transform: translateY(1px); }
 form.inline { display: inline; margin: 0; }
-.grid { display: grid; grid-template-columns: repeat(2, minmax(280px, 1fr)); gap: 16px; }
-.card { border: 1px solid #ccc; padding: 16px; border-radius: 8px; }
+.grid { display: grid; grid-template-columns: repeat(2, minmax(300px, 1fr)); gap: 16px; }
+.card { border: 1px solid #8886; padding: 16px; border-radius: 10px; overflow-x: auto; }
 .section-gap { margin-top: 24px; }
-small { color: #666; }
-button { padding: 6px 10px; }
-.actions { margin-top: 16px; }
+small, .muted { opacity: .72; }
+button { padding: 7px 11px; cursor: pointer; }
+.actions { margin-top: 16px; display: flex; flex-wrap: wrap; gap: 8px; }
+.form-grid { display: grid; grid-template-columns: minmax(220px, 1fr) 140px auto; gap: 8px; align-items: end; }
+.badge { display: inline-block; padding: 2px 7px; border-radius: 999px; font-size: .82rem; font-weight: 600; }
+.badge.closed { background: #2e7d3230; }
+.badge.open { background: #c6282830; }
+.badge.half_open { background: #ef6c0030; }
+.nowrap { white-space: nowrap; }
+.error-text { max-width: 520px; overflow-wrap: anywhere; }
+@media (max-width: 900px) {
+  body { margin: 12px; }
+  .grid { grid-template-columns: 1fr; }
+  .form-grid { grid-template-columns: 1fr; }
+}
 </style>
 </head>
 <body>
@@ -29,15 +46,31 @@ button { padding: 6px 10px; }
       <table>
         <tr><th>Key</th><th>Value</th></tr>
         <tr><td>wg_interface</td><td><input type="text" name="wg_interface" value="{{index .Settings "wg_interface"}}"></td></tr>
-        <tr><td>wg_gateway</td><td><input type="text" name="wg_gateway" value="{{index .Settings "wg_gateway"}}"><br><small>legacy fallback, mostly for IPv4</small></td></tr>
-        <tr><td>wg_gateway_v4</td><td><input type="text" name="wg_gateway_v4" value="{{index .Settings "wg_gateway_v4"}}"><br><small>optional; overrides wg_gateway for A routes</small></td></tr>
-        <tr><td>wg_gateway_v6</td><td><input type="text" name="wg_gateway_v6" value="{{index .Settings "wg_gateway_v6"}}"><br><small>optional; AAAA routes use dev-only route when empty</small></td></tr>
-        <tr><td>route_table</td><td><input type="text" name="route_table" value="{{index .Settings "route_table"}}"></td></tr>
-        <tr><td>route_ipv4</td><td><input type="checkbox" name="route_ipv4" value="1" {{if .Config.RouteIPv4}}checked{{end}}> program routes from A records</td></tr>
-        <tr><td>route_ipv6</td><td><input type="checkbox" name="route_ipv6" value="1" {{if .Config.RouteIPv6}}checked{{end}}> program routes from AAAA records</td></tr>
-        <tr><td>local_record_ttl</td><td><input type="text" name="local_record_ttl" value="{{index .Settings "local_record_ttl"}}"></td></tr>
-        <tr><td>lookup_cidr</td><td><input type="checkbox" name="lookup_cidr" value="1" {{if .Config.LookupCIDR}}checked{{end}}> Team Cymru BGP prefix lookup</td></tr>
-        <tr><td>reply_before_route</td><td><input type="checkbox" name="reply_before_route" value="1" {{if .Config.ReplyBeforeRoute}}checked{{end}}></td></tr>
+        <tr><td>wg_gateway</td><td><input type="text" name="wg_gateway" value="{{index .Settings "wg_gateway"}}"><br><small>Legacy fallback, mainly for IPv4.</small></td></tr>
+        <tr><td>wg_gateway_v4</td><td><input type="text" name="wg_gateway_v4" value="{{index .Settings "wg_gateway_v4"}}"><br><small>Overrides wg_gateway for A routes.</small></td></tr>
+        <tr><td>wg_gateway_v6</td><td><input type="text" name="wg_gateway_v6" value="{{index .Settings "wg_gateway_v6"}}"><br><small>AAAA routes are device-only when empty.</small></td></tr>
+        <tr><td>route_table</td><td><input type="number" min="0" name="route_table" value="{{index .Settings "route_table"}}"><br><small>0 means the main table (254).</small></td></tr>
+        <tr>
+          <td>route_ipv4</td>
+          <td><input type="hidden" name="route_ipv4" value="0"><label><input type="checkbox" name="route_ipv4" value="1" {{if .Config.RouteIPv4}}checked{{end}}> Program routes from A records</label></td>
+        </tr>
+        <tr>
+          <td>route_ipv6</td>
+          <td><input type="hidden" name="route_ipv6" value="0"><label><input type="checkbox" name="route_ipv6" value="1" {{if .Config.RouteIPv6}}checked{{end}}> Program routes from AAAA records</label></td>
+        </tr>
+        <tr><td>local_record_ttl</td><td><input type="number" min="0" name="local_record_ttl" value="{{index .Settings "local_record_ttl"}}"></td></tr>
+        <tr>
+          <td>lookup_cidr</td>
+          <td><input type="hidden" name="lookup_cidr" value="0"><label><input type="checkbox" name="lookup_cidr" value="1" {{if .Config.LookupCIDR}}checked{{end}}> Team Cymru BGP prefix lookup</label></td>
+        </tr>
+        <tr>
+          <td>reply_before_route</td>
+          <td>
+            <input type="hidden" name="reply_before_route" value="0">
+            <label><input type="checkbox" name="reply_before_route" value="1" {{if .Config.ReplyBeforeRoute}}checked{{end}}> Reply before route installation</label><br>
+            <small>Enabled: answer immediately, install route asynchronously, then reset conntrack only if a route was actually installed. Disabled: wait for route installation; return SERVFAIL on route failure.</small>
+          </td>
+        </tr>
       </table>
       <p><button type="submit">Save settings</button></p>
     </form>
@@ -66,6 +99,7 @@ button { padding: 6px 10px; }
       <form class="inline" method="post" action="/routes/reload"><button type="submit">Reload routes</button></form>
       <button type="button" onclick="location.href='/stats'">Open statistics</button>
       <button type="button" onclick="window.open('/metrics', '_blank')">Prometheus metrics</button>
+      <button type="button" onclick="window.open('/routes/errors', '_blank')">Route error log</button>
     </div>
   </div>
 </div>
@@ -74,24 +108,45 @@ button { padding: 6px 10px; }
   <div class="card">
     <h2>Listen addresses</h2>
     <form method="post" action="/listen/add">
-      <input type="text" name="addr" placeholder="0.0.0.0:53 or [::]:53">
+      <input type="text" name="addr" placeholder="0.0.0.0:53 or [::]:53" required>
       <p><button type="submit">Add listen address</button></p>
     </form>
     <table>
       <tr><th>Address</th><th>Action</th></tr>
-      {{range .ListenAddrs}}<tr><td>{{.}}</td><td><form class="inline" method="post" action="/listen/delete"><input type="hidden" name="addr" value="{{.}}"><button type="submit">Delete</button></form></td></tr>{{end}}
+      {{range .ListenAddrs}}<tr><td>{{.}}</td><td><form class="inline" method="post" action="/listen/delete"><input type="hidden" name="addr" value="{{.}}"><button type="submit">Delete</button></form></td></tr>{{else}}<tr><td colspan="2" class="muted">No listen addresses configured.</td></tr>{{end}}
     </table>
   </div>
 
   <div class="card">
     <h2>Upstreams</h2>
-    <form method="post" action="/upstream/add">
-      <input type="text" name="addr" placeholder="1.1.1.1:853 or https://dns.google/dns-query">
-      <p><button type="submit">Add upstream</button></p>
+    <form method="post" action="/upstream/add" class="form-grid">
+      <label>Address
+        <input type="text" name="addr" placeholder="10.0.0.2:53 or https://dns.google/dns-query" required>
+      </label>
+      <label>Protocol
+        <select name="proto">
+          <option value="auto">auto</option>
+          <option value="udp">udp</option>
+          <option value="tcp">tcp</option>
+          <option value="tls">tls / DoT</option>
+          <option value="https">https / DoH</option>
+        </select>
+      </label>
+      <button type="submit">Add / update</button>
     </form>
+    <p><small>With auto: https URL → DoH; port 853 → DoT; other addresses → UDP DNS. UDP automatically retries truncated replies over TCP.</small></p>
     <table>
-      <tr><th>Upstream</th><th>Action</th></tr>
-      {{range .Upstreams}}<tr><td>{{.}}</td><td><form class="inline" method="post" action="/upstream/delete"><input type="hidden" name="addr" value="{{.}}"><button type="submit">Delete</button></form></td></tr>{{end}}
+      <tr><th>Upstream</th><th>Configured</th><th>Effective</th><th>Circuit</th><th>Failures</th><th>Action</th></tr>
+      {{range .Upstreams}}
+      <tr>
+        <td><strong>{{.Addr}}</strong><br><small>{{.Endpoint}}</small></td>
+        <td>{{.ConfiguredProto}}</td>
+        <td>{{.Proto}}</td>
+        <td class="nowrap"><span class="badge {{.State}}">{{.State}}</span>{{if ne .OpenRemaining "—"}}<br><small>{{.OpenRemaining}} remaining</small>{{end}}</td>
+        <td>{{.ConsecutiveFailures}}{{if .LastError}}<br><small class="error-text" title="{{.LastError}}">{{.LastError}}</small>{{end}}</td>
+        <td><form class="inline" method="post" action="/upstream/delete"><input type="hidden" name="addr" value="{{.Addr}}"><button type="submit">Delete</button></form></td>
+      </tr>
+      {{else}}<tr><td colspan="6" class="muted">No upstreams configured.</td></tr>{{end}}
     </table>
   </div>
 </div>
@@ -99,12 +154,12 @@ button { padding: 6px 10px; }
 <div class="card section-gap">
   <h2>Special domains</h2>
   <form method="post" action="/special/add">
-    <input type="text" name="domain" placeholder="example.com">
+    <input type="text" name="domain" placeholder="example.com" required>
     <p><button type="submit">Add special domain</button></p>
   </form>
   <table>
     <tr><th>Domain</th><th>Action</th></tr>
-    {{range .SpecialDomains}}<tr><td>{{.}}</td><td><form class="inline" method="post" action="/special/delete"><input type="hidden" name="domain" value="{{.}}"><button type="submit">Delete</button></form></td></tr>{{end}}
+    {{range .SpecialDomains}}<tr><td>{{.}}</td><td><form class="inline" method="post" action="/special/delete"><input type="hidden" name="domain" value="{{.}}"><button type="submit">Delete</button></form></td></tr>{{else}}<tr><td colspan="2" class="muted">No special domains configured.</td></tr>{{end}}
   </table>
 </div>
 
@@ -113,17 +168,17 @@ button { padding: 6px 10px; }
   <form method="post" action="/record/add">
     <table>
       <tr>
-        <td><input type="text" name="name" placeholder="example.com or *.example.com"></td>
+        <td><input type="text" name="name" placeholder="example.com or *.example.com" required></td>
         <td><select name="type"><option value="A">A</option><option value="AAAA">AAAA</option></select></td>
         <td><input type="text" name="value" placeholder="10.0.0.1, 2001:db8::1, or empty=NODATA"></td>
-        <td><input type="number" name="ttl" placeholder="0"></td>
+        <td><input type="number" min="0" name="ttl" placeholder="0"></td>
         <td><button type="submit">Add record</button></td>
       </tr>
     </table>
   </form>
   <table>
     <tr><th>ID</th><th>Name</th><th>Type</th><th>Value</th><th>TTL</th><th>Action</th></tr>
-    {{range .Records}}<tr><td>{{.ID}}</td><td>{{.Name}}</td><td>{{.Type}}</td><td>{{.Value}}</td><td>{{.TTL}}</td><td><form class="inline" method="post" action="/record/delete"><input type="hidden" name="id" value="{{.ID}}"><button type="submit">Delete</button></form></td></tr>{{end}}
+    {{range .Records}}<tr><td>{{.ID}}</td><td>{{.Name}}</td><td>{{.Type}}</td><td>{{.Value}}</td><td>{{.TTL}}</td><td><form class="inline" method="post" action="/record/delete"><input type="hidden" name="id" value="{{.ID}}"><button type="submit">Delete</button></form></td></tr>{{else}}<tr><td colspan="6" class="muted">No local DNS records configured.</td></tr>{{end}}
   </table>
 </div>
 </body>
