@@ -21,8 +21,15 @@ Routing notes:
 - `wg_gateway_v6` is optional for IPv6 routes. If it is empty, AAAA routes are added as dev-only routes via `wg_interface`; if legacy `wg_gateway` contains an IPv6 address, it is used as IPv6 fallback.
 - `lookup_cidr` is kept as a compatibility setting name, but it now uses Team Cymru DNS TXT lookups to resolve IP addresses to BGP prefixes (`origin.asn.cymru.com` for IPv4 and `origin6.asn.cymru.com` for IPv6). WHOIS/RIR `CIDR:` lookup is no longer used.
 
+Build:
+
+```bash
+go get
+go build .
+```
+
 Run:
 
 ```bash
-go run . -db /var/lib/dns-route/config.db -http 127.0.0.1:8080
+./dns-route -http 127.0.0.1:9010 -db ./config.db
 ```
