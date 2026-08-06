@@ -152,6 +152,7 @@ type Config struct {
 	UpstreamProto    map[string]string
 	ForwardZones     []ForwardZone
 	SpecialDomains   map[string]struct{}
+	DNSRecordSources []DNSRecordSourceState
 	LocalA           map[string][]LocalRecord
 	LocalAAAA        map[string][]LocalRecord
 	WGGatewayV4      string
@@ -405,18 +406,19 @@ type bgpStatusView struct {
 }
 
 type pageData struct {
-	Title          string
-	Path           string
-	Config         *Config
-	Settings       map[string]string
-	ListenAddrs    []string
-	ListenerStates []listenerView
-	Upstreams      []upstreamView
-	ForwardZones   []forwardZoneView
-	SpecialDomains []string
-	Records        []recordRow
-	BGP            bgpStatusView
-	Message        string
+	Title            string
+	Path             string
+	Config           *Config
+	Settings         map[string]string
+	ListenAddrs      []string
+	ListenerStates   []listenerView
+	Upstreams        []upstreamView
+	ForwardZones     []forwardZoneView
+	SpecialDomains   []string
+	DNSRecordSources []DNSRecordSourceState
+	Records          []recordRow
+	BGP              bgpStatusView
+	Message          string
 }
 
 type recordRow struct {
@@ -1084,9 +1086,9 @@ func effectiveRouteTable(table int) int {
 
 func logConfig(prefix string, cfg *Config) {
 	log.Printf(
-		"%s: LISTEN=%v LISTENER_FREEBIND=%t UPSTREAMS=%v FORWARD_ZONES=%d FORWARD_ZONE_UPSTREAMS=%d WG_INTERFACE=%s WG_GATEWAY_V4=%s WG_GATEWAY_V6=%s ROUTE_MODE=%s ROUTE_TABLE=%d ROUTE_IPV4=%t ROUTE_IPV6=%t BGP_LOCAL_ASN=%d BGP_ROUTER_ID=%s BGP_PEER=%s BGP_PEER_ASN=%d BGP_REQUIRE_ESTABLISHED=%t LOOKUP_CYMRU_PREFIX=%t REPLY_BEFORE_ROUTE=%t SPECIAL_DOMAINS=%d LOCAL_A=%d LOCAL_AAAA=%d",
+		"%s: LISTEN=%v LISTENER_FREEBIND=%t UPSTREAMS=%v FORWARD_ZONES=%d FORWARD_ZONE_UPSTREAMS=%d WG_INTERFACE=%s WG_GATEWAY_V4=%s WG_GATEWAY_V6=%s ROUTE_MODE=%s ROUTE_TABLE=%d ROUTE_IPV4=%t ROUTE_IPV6=%t BGP_LOCAL_ASN=%d BGP_ROUTER_ID=%s BGP_PEER=%s BGP_PEER_ASN=%d BGP_REQUIRE_ESTABLISHED=%t LOOKUP_CYMRU_PREFIX=%t REPLY_BEFORE_ROUTE=%t SPECIAL_DOMAINS=%d DNS_RECORD_SOURCES=%d LOCAL_A=%d LOCAL_AAAA=%d",
 		prefix, cfg.ListenAddrs, cfg.ListenerFreeBind, cfg.Upstreams, len(cfg.ForwardZones), forwardZoneUpstreamCount(cfg), cfg.WGInterface, cfg.WGGatewayV4, cfg.WGGatewayV6, cfg.RouteMode, cfg.RouteTable,
-		cfg.RouteIPv4, cfg.RouteIPv6, cfg.BGP.LocalASN, cfg.BGP.RouterID, cfg.BGP.PeerAddress, cfg.BGP.PeerASN, cfg.BGP.RequireEstablished, cfg.LookupCIDR, cfg.ReplyBeforeRoute, len(cfg.SpecialDomains), len(cfg.LocalA), len(cfg.LocalAAAA),
+		cfg.RouteIPv4, cfg.RouteIPv6, cfg.BGP.LocalASN, cfg.BGP.RouterID, cfg.BGP.PeerAddress, cfg.BGP.PeerASN, cfg.BGP.RequireEstablished, cfg.LookupCIDR, cfg.ReplyBeforeRoute, len(cfg.SpecialDomains), len(cfg.DNSRecordSources), len(cfg.LocalA), len(cfg.LocalAAAA),
 	)
 }
 
@@ -1101,18 +1103,19 @@ func renderError(w http.ResponseWriter, status int, err error) {
 func (a *App) validateTemplates() error {
 	cfg := a.getConfig()
 	adminData := pageData{
-		Title:          "Runtime",
-		Path:           "/",
-		Config:         cfg,
-		Settings:       map[string]string{},
-		ListenAddrs:    append([]string(nil), cfg.ListenAddrs...),
-		ListenerStates: a.listenerViews(),
-		Upstreams:      a.defaultUpstreamViews(cfg),
-		ForwardZones:   a.forwardZoneViews(cfg),
-		SpecialDomains: []string{},
-		Records:        []recordRow{},
-		BGP:            a.bgpStatus(cfg),
-		Message:        a.adminAddr,
+		Title:            "Runtime",
+		Path:             "/",
+		Config:           cfg,
+		Settings:         map[string]string{},
+		ListenAddrs:      append([]string(nil), cfg.ListenAddrs...),
+		ListenerStates:   a.listenerViews(),
+		Upstreams:        a.defaultUpstreamViews(cfg),
+		ForwardZones:     a.forwardZoneViews(cfg),
+		SpecialDomains:   []string{},
+		DNSRecordSources: []DNSRecordSourceState{},
+		Records:          []recordRow{},
+		BGP:              a.bgpStatus(cfg),
+		Message:          a.adminAddr,
 	}
 	adminTemplates := []struct {
 		name  string
@@ -1210,6 +1213,9 @@ func loadConfigFromDB(db *sql.DB) (*Config, error) {
 	if err := readDNSRecords(db, cfg); err != nil {
 		return nil, err
 	}
+	if err := loadDNSRecordSources(context.Background(), db, cfg, newDNSRecordSourceClient()); err != nil {
+		return nil, err
+	}
 	cfg.ListenAddrs = uniqueStrings(cfg.ListenAddrs)
 	cfg.Upstreams = uniqueStrings(cfg.Upstreams)
 	return cfg, nil
@@ -1255,11 +1261,15 @@ func initDB(db *sql.DB) error {
 		`CREATE TABLE IF NOT EXISTS special_domains (id INTEGER PRIMARY KEY AUTOINCREMENT, domain TEXT NOT NULL UNIQUE, enabled INTEGER NOT NULL DEFAULT 1);`,
 		`CREATE TABLE IF NOT EXISTS dns_records (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, type TEXT NOT NULL, value TEXT NOT NULL, ttl INTEGER NOT NULL DEFAULT 0, enabled INTEGER NOT NULL DEFAULT 1);`,
 		`CREATE INDEX IF NOT EXISTS idx_dns_records_name_type ON dns_records(name, type, enabled);`,
+		`CREATE TABLE IF NOT EXISTS dns_record_sources (id INTEGER PRIMARY KEY AUTOINCREMENT, location TEXT NOT NULL UNIQUE, no_data_only INTEGER NOT NULL DEFAULT 0, enabled INTEGER NOT NULL DEFAULT 1);`,
 	}
 	for _, stmt := range stmts {
 		if _, err := db.Exec(stmt); err != nil {
 			return err
 		}
+	}
+	if err := ensureDNSRecordSourceModeColumn(db); err != nil {
+		return err
 	}
 	return nil
 }
@@ -1936,6 +1946,11 @@ func (a *App) startHTTP() {
 	mux.HandleFunc("/special/delete", a.handleSpecialDelete)
 	mux.HandleFunc("/record/add", a.handleRecordAdd)
 	mux.HandleFunc("/record/delete", a.handleRecordDelete)
+	mux.HandleFunc("/record/import", a.handleRecordImport)
+	mux.HandleFunc("/record/export", a.handleRecordExport)
+	mux.HandleFunc("/record/source/add", a.handleRecordSourceAdd)
+	mux.HandleFunc("/record/source/update", a.handleRecordSourceUpdate)
+	mux.HandleFunc("/record/source/delete", a.handleRecordSourceDelete)
 	go func() {
 		log.Printf("admin http listening on %s", a.adminAddr)
 		if err := http.ListenAndServe(a.adminAddr, mux); err != nil {
@@ -1963,18 +1978,19 @@ func (a *App) adminPageData(title, path string) (pageData, error) {
 	}
 	cfg := a.getConfig()
 	return pageData{
-		Title:          title,
-		Path:           path,
-		Config:         cfg,
-		Settings:       settings,
-		ListenAddrs:    listenAddrs,
-		ListenerStates: a.listenerViews(),
-		Upstreams:      a.defaultUpstreamViews(cfg),
-		ForwardZones:   a.forwardZoneViews(cfg),
-		SpecialDomains: specials,
-		Records:        records,
-		BGP:            a.bgpStatus(cfg),
-		Message:        a.adminAddr,
+		Title:            title,
+		Path:             path,
+		Config:           cfg,
+		Settings:         settings,
+		ListenAddrs:      listenAddrs,
+		ListenerStates:   a.listenerViews(),
+		Upstreams:        a.defaultUpstreamViews(cfg),
+		ForwardZones:     a.forwardZoneViews(cfg),
+		SpecialDomains:   specials,
+		DNSRecordSources: append([]DNSRecordSourceState(nil), cfg.DNSRecordSources...),
+		Records:          records,
+		BGP:              a.bgpStatus(cfg),
+		Message:          a.adminAddr,
 	}, nil
 }
 

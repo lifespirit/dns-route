@@ -64,3 +64,31 @@ For IPv6 routing, set `bgp_next_hop_v6` to the address that the peer must use as
 After an offline database change, start or restart the service. If the database was edited while dns-route was running, send `POST /reload`. `POST /routes/reload` rereads the configured kernel table and mirrors it into BGP in `kernel+bgp` mode without reloading unrelated configuration.
 
 The admin and statistics pages show the peer state, backend readiness, ephemeral desired-prefix count and embedded GoBGP Loc-RIB count. Prometheus exports the same state through `dns_route_bgp_*` metrics and exposes the selected mode through `dns_route_route_mode_info`.
+
+## DNS-record CSV configuration
+
+The DNS records page supports persistent CSV import/export and external CSV sources.
+
+CSV rows use these forms:
+
+```text
+test.lan
+test.lan,A
+test.lan,AAAA
+test.lan,A,
+test.lan,AAAA,
+test.lan,A,192.0.2.10
+test.lan,AAAA,2001:db8::10
+```
+
+- one column creates NOERROR/NODATA records for both A and AAAA;
+- `name,A` and `name,A,` create NODATA only for A;
+- `name,AAAA` and `name,AAAA,` create NODATA only for AAAA;
+- a non-empty third column creates a static record of the selected type;
+- repeated address rows for the same name and type create a multi-value answer.
+
+A normal web import replaces every persistent A/AAAA row for each name present in the uploaded file and stores the imported result in SQLite. Names absent from the file remain unchanged. The CSV format has no TTL column, so imported rows use `ttl=0`, which means the configured default local-record TTL. Export includes only persistent enabled records from SQLite; external source contents are not exported.
+
+A source can be an `http://` or `https://` URL, a `file:///absolute/path.csv` URL, or a normal filesystem path. Every `Reload config` downloads HTTP sources again and rereads filesystem sources. Source contents are kept only in the active in-memory configuration and are never inserted into `dns_records`. Sources are applied in database-id order after persistent records. A source row replaces the persistent/in-memory value only for the A or AAAA family explicitly present in that row; a one-column row replaces both families. Later sources win for the same name and family.
+
+Each source has its own **NO_DATA only** option. When enabled, dns-route reads only the first two CSV columns and ignores all later columns. Therefore an address supplied by a public list can never become a DNS answer: `name,A,203.0.113.10` is treated as `name,A`, and `name,AAAA,2001:db8::10` is treated as `name,AAAA`.

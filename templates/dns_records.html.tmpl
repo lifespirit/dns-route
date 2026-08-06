@@ -10,7 +10,63 @@
   </form>
   <table>
     <tr><th>ID</th><th>Name</th><th>Type</th><th>Value</th><th>TTL</th><th>Action</th></tr>
-    {{range .Records}}<tr><td>{{.ID}}</td><td>{{.Name}}</td><td>{{.Type}}</td><td>{{.Value}}</td><td>{{.TTL}}</td><td><form class="inline" method="post" action="/record/delete"><input type="hidden" name="return" value="/dns-records"><input type="hidden" name="id" value="{{.ID}}"><button type="submit">Delete</button></form></td></tr>{{else}}<tr><td colspan="6" class="muted">No local DNS records configured.</td></tr>{{end}}
+    {{range .Records}}<tr><td>{{.ID}}</td><td>{{.Name}}</td><td>{{.Type}}</td><td>{{if .Value}}{{.Value}}{{else}}<span class="badge disabled">NODATA</span>{{end}}</td><td>{{.TTL}}</td><td><form class="inline" method="post" action="/record/delete"><input type="hidden" name="return" value="/dns-records"><input type="hidden" name="id" value="{{.ID}}"><button type="submit">Delete</button></form></td></tr>{{else}}<tr><td colspan="6" class="muted">No local DNS records configured.</td></tr>{{end}}
+  </table>
+</div>
+
+<div class="grid section-gap">
+  <div class="card">
+    <h2>Import / export</h2>
+    <div class="actions">
+      <form method="get" action="/record/export"><button type="submit">Export CSV</button></form>
+    </div>
+    <form method="post" action="/record/import" enctype="multipart/form-data" class="section-gap">
+      <input type="hidden" name="return" value="/dns-records">
+      <label>CSV file<input type="file" name="file" accept=".csv,text/csv,text/plain" required></label>
+      <p><button type="submit">Import CSV</button></p>
+    </form>
+    <p><small>Import replaces every persistent A/AAAA record for each name present in the file. Other names remain unchanged. Imported records are stored in SQLite with the default TTL.</small></p>
+    <p><small><code>name</code> means NODATA for A and AAAA; <code>name,A</code> or <code>name,AAAA</code> means NODATA only for that type; a third column supplies the address.</small></p>
+  </div>
+
+  <div class="card">
+    <h2>External CSV sources</h2>
+    <form method="post" action="/record/source/add">
+      <input type="hidden" name="return" value="/dns-records">
+      <label>HTTP(S) URL or filesystem path<input type="text" name="location" placeholder="https://example/list.csv or /etc/dns-route/records.csv" required></label>
+      <p><label><input type="checkbox" name="no_data_only" value="1"> NO_DATA only</label></p>
+      <p><button type="submit">Add / update source</button></p>
+    </form>
+    <p><small>Sources are downloaded or reread on every Reload config. Their records exist only in memory and override persistent records per name and type. NO_DATA only ignores the address column and prevents a source from injecting DNS addresses.</small></p>
+  </div>
+</div>
+
+<div class="card section-gap">
+  <h2>Configured sources</h2>
+  <table>
+    <tr><th>ID</th><th>Location</th><th>Kind</th><th>Loaded</th><th>Mode</th><th>Actions</th></tr>
+    {{range .DNSRecordSources}}
+    <tr>
+      <td>{{.ID}}</td>
+      <td class="error-text">{{.Location}}</td>
+      <td>{{.Kind}}</td>
+      <td>{{.Domains}} names / {{.Records}} records</td>
+      <td>{{if .NoDataOnly}}<span class="badge active">NO_DATA only</span>{{else}}normal{{end}}</td>
+      <td class="nowrap">
+        <form class="inline" method="post" action="/record/source/update">
+          <input type="hidden" name="return" value="/dns-records">
+          <input type="hidden" name="id" value="{{.ID}}">
+          <label><input type="checkbox" name="no_data_only" value="1" {{if .NoDataOnly}}checked{{end}}> NO_DATA only</label>
+          <button type="submit">Update</button>
+        </form>
+        <form class="inline" method="post" action="/record/source/delete">
+          <input type="hidden" name="return" value="/dns-records">
+          <input type="hidden" name="id" value="{{.ID}}">
+          <button type="submit">Delete</button>
+        </form>
+      </td>
+    </tr>
+    {{else}}<tr><td colspan="6" class="muted">No external DNS-record sources configured.</td></tr>{{end}}
   </table>
 </div>
 {{template "admin_footer" .}}
