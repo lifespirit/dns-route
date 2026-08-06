@@ -91,6 +91,7 @@ func TestRuntimeTemplateContainsOnlyRuntimeContent(t *testing.T) {
 		`href="/" class="active"`,
 		`action="/reload"`,
 		`action="/routes/reload"`,
+		`href="/statistics">Statistics</a>`,
 	} {
 		if !strings.Contains(html, want) {
 			t.Fatalf("runtime HTML missing %q", want)
@@ -143,6 +144,9 @@ func TestAdminSectionTemplatesRender(t *testing.T) {
 func TestStatsTemplateRendersBGPStatus(t *testing.T) {
 	var out bytes.Buffer
 	data := statsData{
+		Title:     "Statistics",
+		Path:      "/statistics",
+		Message:   "127.0.0.1:8080",
 		RouteMode: string(RouteModeBGP),
 		BGP: bgpStatusView{
 			Enabled:           true,
@@ -157,9 +161,38 @@ func TestStatsTemplateRendersBGPStatus(t *testing.T) {
 		t.Fatalf("render stats: %v", err)
 	}
 	html := out.String()
-	for _, want := range []string{"Route mode", "bgp", "192.0.2.2 AS65002", "Desired prefixes", ">3<"} {
+	for _, want := range []string{
+		"Route mode",
+		"bgp",
+		"192.0.2.2 AS65002",
+		"Desired prefixes",
+		">3<",
+		"HTTP panel: 127.0.0.1:8080",
+		`action="/reload"`,
+		`action="/routes/reload"`,
+		`name="return" value="/statistics"`,
+		`href="/statistics">Statistics</a>`,
+	} {
 		if !strings.Contains(html, want) {
 			t.Fatalf("stats HTML missing %q", want)
+		}
+	}
+	footerIndex := strings.Index(html, `<footer class="site-footer">`)
+	if footerIndex < 0 {
+		t.Fatal("statistics HTML is missing the shared footer")
+	}
+	for _, action := range []string{`action="/reload"`, `action="/routes/reload"`, `href="/statistics">Statistics</a>`} {
+		if index := strings.Index(html, action); index < footerIndex {
+			t.Fatalf("%q is not located in the footer", action)
+		}
+	}
+	for _, unwanted := range []string{
+		"dns-route statistics</h1>",
+		"Back to admin",
+		`href="/stats"`,
+	} {
+		if strings.Contains(html, unwanted) {
+			t.Fatalf("stats HTML unexpectedly contains %q", unwanted)
 		}
 	}
 }

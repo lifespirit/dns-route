@@ -1,34 +1,5 @@
-<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>dns-route stats</title>
-<style>
-:root { color-scheme: light dark; }
-body { font-family: system-ui, sans-serif; margin: 24px; line-height: 1.4; }
-table { border-collapse: collapse; width: 100%; }
-th, td { border: 1px solid #8886; padding: 8px; text-align: left; vertical-align: top; }
-th { background: #8882; }
-.card { border: 1px solid #8886; padding: 16px; border-radius: 10px; margin-bottom: 24px; overflow-x: auto; }
-button { padding: 7px 11px; cursor: pointer; }
-.actions { margin-top: 16px; display: flex; flex-wrap: wrap; gap: 8px; }
-.badge { display: inline-block; padding: 2px 7px; border-radius: 999px; font-size: .82rem; font-weight: 600; }
-.badge.closed { background: #2e7d3230; }
-.badge.open { background: #c6282830; }
-.badge.half_open { background: #ef6c0030; }
-.badge.active { background: #2e7d3230; }
-.badge.pending, .badge.down, .badge.unavailable { background: #ef6c0030; }
-.badge.established { background: #2e7d3230; }
-.badge.disabled { background: #8883; }
-.muted { opacity: .72; }
-.error-text { max-width: 520px; overflow-wrap: anywhere; }
-.nowrap { white-space: nowrap; }
-@media (max-width: 900px) { body { margin: 12px; } }
-</style>
-</head>
-<body>
-<h1>dns-route statistics</h1>
+{{define "stats.html.tmpl"}}
+{{template "admin_header" .}}
 <div class="card">
   <h2>Runtime</h2>
   <table>
@@ -41,14 +12,9 @@ button { padding: 7px 11px; cursor: pointer; }
     <tr><td>IP cache entries</td><td>{{.IPCacheEntries}}</td></tr>
     <tr><td>Route prefix cache entries</td><td>{{.CIDRCacheEntries}}</td></tr>
   </table>
-  <div class="actions">
-    <button type="button" onclick="location.href='/'">Back to admin</button>
-    <button type="button" onclick="window.open('/metrics', '_blank')">Prometheus metrics</button>
-    <button type="button" onclick="window.open('/routes/errors', '_blank')">Route error log</button>
-  </div>
 </div>
 
-<div class="card">
+<div class="card section-gap">
   <h2>Configuration</h2>
   <table>
     <tr><td>Listen addrs</td><td>{{.ListenAddrs}}</td></tr>
@@ -71,7 +37,7 @@ button { padding: 7px 11px; cursor: pointer; }
   </table>
 </div>
 
-<div class="card">
+<div class="card section-gap">
   <h2>BGP</h2>
   <table>
     <tr><td>Status</td><td>{{if .BGP.Enabled}}<span class="badge {{.BGP.State}}">{{.BGP.State}}</span>{{else}}<span class="badge disabled">disabled</span>{{end}}</td></tr>
@@ -87,7 +53,7 @@ button { padding: 7px 11px; cursor: pointer; }
   </table>
 </div>
 
-<div class="card">
+<div class="card section-gap">
   <h2>Counters</h2>
   <table>
     <tr><td>Total queries</td><td>{{.TotalQueries}}</td></tr>
@@ -112,7 +78,7 @@ button { padding: 7px 11px; cursor: pointer; }
   </table>
 </div>
 
-<div class="card">
+<div class="card section-gap">
   <h2>Outbound policies</h2>
   <table>
     <tr><th>Policy</th><th>Selected</th><th>Success</th><th>DNS errors</th><th>Transport errors</th></tr>
@@ -122,7 +88,7 @@ button { padding: 7px 11px; cursor: pointer; }
   </table>
 </div>
 
-<div class="card">
+<div class="card section-gap">
   <h2>Listeners</h2>
   <table>
     <tr><th>Network</th><th>Address</th><th>State</th><th>FreeBind</th><th>Attempts / time</th><th>Last error</th></tr>
@@ -139,7 +105,7 @@ button { padding: 7px 11px; cursor: pointer; }
   </table>
 </div>
 
-<div class="card">
+<div class="card section-gap">
   <h2>Upstream circuit breakers</h2>
   <table>
     <tr>
@@ -162,5 +128,5 @@ button { padding: 7px 11px; cursor: pointer; }
     {{else}}<tr><td colspan="10" class="muted">No upstreams configured.</td></tr>{{end}}
   </table>
 </div>
-</body>
-</html>
+{{template "admin_footer" .}}
+{{end}}

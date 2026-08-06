@@ -429,6 +429,9 @@ type recordRow struct {
 }
 
 type statsData struct {
+	Title            string
+	Path             string
+	Message          string
 	Uptime           string
 	StartedAt        string
 	CacheEntries     int
@@ -1129,7 +1132,11 @@ func (a *App) validateTemplates() error {
 			return fmt.Errorf("%s: %w", item.name, err)
 		}
 	}
-	if err := templates.ExecuteTemplate(io.Discard, "stats.html.tmpl", a.statsSnapshot()); err != nil {
+	stats := a.statsSnapshot()
+	stats.Title = "Statistics"
+	stats.Path = "/statistics"
+	stats.Message = a.adminAddr
+	if err := templates.ExecuteTemplate(io.Discard, "stats.html.tmpl", stats); err != nil {
 		return fmt.Errorf("stats.html.tmpl: %w", err)
 	}
 	if err := templates.ExecuteTemplate(io.Discard, "error.html.tmpl", struct{ Error string }{Error: "test"}); err != nil {
@@ -1914,7 +1921,8 @@ func (a *App) startHTTP() {
 	mux.HandleFunc("/reload", a.handleReload)
 	mux.HandleFunc("/routes/reload", a.handleRoutesReload)
 	mux.HandleFunc("/routes/errors", a.handleRouteErrors)
-	mux.HandleFunc("/stats", a.handleStats)
+	mux.HandleFunc("/statistics", a.handleStatistics)
+	mux.HandleFunc("/stats", a.handleStatsRedirect)
 	mux.HandleFunc("/metrics", a.handleMetrics)
 	mux.HandleFunc("/settings/save", a.handleSettingsSave)
 	mux.HandleFunc("/listen/add", a.handleListenAdd)
@@ -2009,19 +2017,39 @@ func (a *App) handleDNSRecordsPage(w http.ResponseWriter, r *http.Request) {
 	a.renderAdminPage(w, r, "/dns-records", "DNS records", "dns_records.html.tmpl")
 }
 
-func (a *App) handleStats(w http.ResponseWriter, r *http.Request) {
+func (a *App) handleStatistics(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/statistics" {
+		http.NotFound(w, r)
+		return
+	}
+	if r.Method != http.MethodGet {
+		renderError(w, http.StatusMethodNotAllowed, fmt.Errorf("method not allowed"))
+		return
+	}
+	data := a.statsSnapshot()
+	data.Title = "Statistics"
+	data.Path = "/statistics"
+	data.Message = a.adminAddr
+	if err := templates.ExecuteTemplate(w, "stats.html.tmpl", data); err != nil {
+		renderError(w, http.StatusInternalServerError, err)
+	}
+}
+
+func (a *App) handleStatsRedirect(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/stats" {
 		http.NotFound(w, r)
 		return
 	}
-	if err := templates.ExecuteTemplate(w, "stats.html.tmpl", a.statsSnapshot()); err != nil {
-		renderError(w, 500, err)
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		renderError(w, http.StatusMethodNotAllowed, fmt.Errorf("method not allowed"))
+		return
 	}
+	http.Redirect(w, r, "/statistics", http.StatusPermanentRedirect)
 }
 func adminReturnPath(r *http.Request, fallback string) string {
 	path := strings.TrimSpace(r.FormValue("return"))
 	switch path {
-	case "/", "/settings", "/upstreams", "/special-domains", "/dns-records":
+	case "/", "/settings", "/upstreams", "/special-domains", "/dns-records", "/statistics":
 		return path
 	default:
 		return fallback
