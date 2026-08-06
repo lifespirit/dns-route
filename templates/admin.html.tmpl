@@ -22,16 +22,19 @@ small, .muted { opacity: .72; }
 button { padding: 7px 11px; cursor: pointer; }
 .actions { margin-top: 16px; display: flex; flex-wrap: wrap; gap: 8px; }
 .form-grid { display: grid; grid-template-columns: minmax(220px, 1fr) 140px auto; gap: 8px; align-items: end; }
+.forward-grid { grid-template-columns: minmax(180px, .7fr) minmax(260px, 1fr) 140px auto; }
 .badge { display: inline-block; padding: 2px 7px; border-radius: 999px; font-size: .82rem; font-weight: 600; }
 .badge.closed { background: #2e7d3230; }
 .badge.open { background: #c6282830; }
 .badge.half_open { background: #ef6c0030; }
+.badge.active { background: #2e7d3230; }
+.badge.pending { background: #ef6c0030; }
 .nowrap { white-space: nowrap; }
 .error-text { max-width: 520px; overflow-wrap: anywhere; }
 @media (max-width: 900px) {
   body { margin: 12px; }
   .grid { grid-template-columns: 1fr; }
-  .form-grid { grid-template-columns: 1fr; }
+  .form-grid, .forward-grid { grid-template-columns: 1fr; }
 }
 </style>
 </head>
@@ -71,6 +74,14 @@ button { padding: 7px 11px; cursor: pointer; }
             <small>Enabled: answer immediately, install route asynchronously, then reset conntrack only if a route was actually installed. Disabled: wait for route installation; return SERVFAIL on route failure.</small>
           </td>
         </tr>
+        <tr>
+          <td>listener_freebind</td>
+          <td>
+            <input type="hidden" name="listener_freebind" value="0">
+            <label><input type="checkbox" name="listener_freebind" value="1" {{if .Config.ListenerFreeBind}}checked{{end}}> Bind addresses before they exist</label><br>
+            <small>Uses Linux IP_FREEBIND/IPV6_FREEBIND. When disabled, unavailable addresses remain pending and are retried every 3 seconds.</small>
+          </td>
+        </tr>
       </table>
       <p><button type="submit">Save settings</button></p>
     </form>
@@ -80,7 +91,8 @@ button { padding: 7px 11px; cursor: pointer; }
     <h2>Runtime</h2>
     <table>
       <tr><td>Listen addrs</td><td>{{len .Config.ListenAddrs}}</td></tr>
-      <tr><td>Upstreams</td><td>{{len .Config.Upstreams}}</td></tr>
+      <tr><td>Default upstreams</td><td>{{len .Config.Upstreams}}</td></tr>
+      <tr><td>Conditional forward zones</td><td>{{len .ForwardZones}}</td></tr>
       <tr><td>Special domains</td><td>{{len .SpecialDomains}}</td></tr>
       <tr><td>Local A domains</td><td>{{len .Config.LocalA}}</td></tr>
       <tr><td>Local AAAA domains</td><td>{{len .Config.LocalAAAA}}</td></tr>
@@ -89,6 +101,7 @@ button { padding: 7px 11px; cursor: pointer; }
       <tr><td>Route IPv6</td><td>{{.Config.RouteIPv6}}</td></tr>
       <tr><td>Team Cymru prefix lookup</td><td>{{.Config.LookupCIDR}}</td></tr>
       <tr><td>Reply before route</td><td>{{.Config.ReplyBeforeRoute}}</td></tr>
+      <tr><td>Listener freebind</td><td>{{.Config.ListenerFreeBind}}</td></tr>
       <tr><td>WG interface</td><td>{{.Config.WGInterface}}</td></tr>
       <tr><td>WG gateway</td><td>{{.Config.WGGateway}}</td></tr>
       <tr><td>WG gateway v4</td><td>{{.Config.WGGatewayV4}}</td></tr>
@@ -112,13 +125,27 @@ button { padding: 7px 11px; cursor: pointer; }
       <p><button type="submit">Add listen address</button></p>
     </form>
     <table>
-      <tr><th>Address</th><th>Action</th></tr>
+      <tr><th>Configured address</th><th>Action</th></tr>
       {{range .ListenAddrs}}<tr><td>{{.}}</td><td><form class="inline" method="post" action="/listen/delete"><input type="hidden" name="addr" value="{{.}}"><button type="submit">Delete</button></form></td></tr>{{else}}<tr><td colspan="2" class="muted">No listen addresses configured.</td></tr>{{end}}
+    </table>
+    <h3>Runtime listener state</h3>
+    <table>
+      <tr><th>Network</th><th>Address</th><th>State</th><th>FreeBind</th><th>Attempts / time</th><th>Last error</th></tr>
+      {{range .ListenerStates}}
+      <tr>
+        <td>{{.Net}}</td>
+        <td>{{.Addr}}</td>
+        <td><span class="badge {{.State}}">{{.State}}</span></td>
+        <td>{{.FreeBind}}</td>
+        <td>{{if eq .State "active"}}started: {{.StartedAt}}{{else}}attempts: {{.Attempts}}<br>last: {{.LastAttempt}}{{end}}</td>
+        <td class="error-text">{{if .LastError}}{{.LastError}}{{else}}<span class="muted">—</span>{{end}}</td>
+      </tr>
+      {{else}}<tr><td colspan="6" class="muted">No listener sockets configured.</td></tr>{{end}}
     </table>
   </div>
 
   <div class="card">
-    <h2>Upstreams</h2>
+    <h2>Default upstreams</h2>
     <form method="post" action="/upstream/add" class="form-grid">
       <label>Address
         <input type="text" name="addr" placeholder="10.0.0.2:53 or https://dns.google/dns-query" required>
@@ -134,7 +161,7 @@ button { padding: 7px 11px; cursor: pointer; }
       </label>
       <button type="submit">Add / update</button>
     </form>
-    <p><small>With auto: https URL → DoH; port 853 → DoT; other addresses → UDP DNS. UDP automatically retries truncated replies over TCP.</small></p>
+    <p><small>Used only when no conditional forwarding zone matches. With auto: https URL → DoH; port 853 → DoT; other addresses → UDP DNS. UDP automatically retries truncated replies over TCP.</small></p>
     <table>
       <tr><th>Upstream</th><th>Configured</th><th>Effective</th><th>Circuit</th><th>Failures</th><th>Action</th></tr>
       {{range .Upstreams}}
@@ -149,6 +176,46 @@ button { padding: 7px 11px; cursor: pointer; }
       {{else}}<tr><td colspan="6" class="muted">No upstreams configured.</td></tr>{{end}}
     </table>
   </div>
+</div>
+
+<div class="card section-gap">
+  <h2>Conditional forwarding</h2>
+  <form method="post" action="/forward-zone/add" class="form-grid forward-grid">
+    <label>Domain suffix
+      <input type="text" name="domain" placeholder="*.ru or *.lan" required>
+    </label>
+    <label>Upstream
+      <input type="text" name="addr" placeholder="77.88.8.8:53 or 127.0.0.1:5353" required>
+    </label>
+    <label>Protocol
+      <select name="proto">
+        <option value="auto">auto</option>
+        <option value="udp">udp</option>
+        <option value="tcp">tcp</option>
+        <option value="tls">tls / DoT</option>
+        <option value="https">https / DoH</option>
+      </select>
+    </label>
+    <button type="submit">Add / update</button>
+  </form>
+  <p><small>Rules match the queried name by suffix; the longest suffix wins. <code>*.ru</code>, <code>.ru</code>, and <code>ru</code> are normalized to the same zone. A matched zone never falls back to the default upstream set, preventing private names such as <code>*.lan</code> from leaking to public DNS. Add the same zone again with another address to create a load-balanced pool.</small></p>
+  {{range .ForwardZones}}
+  <h3>{{.Pattern}}</h3>
+  <table>
+    <tr><th>Upstream</th><th>Configured</th><th>Effective</th><th>Circuit</th><th>Failures</th><th>Action</th></tr>
+    {{range .Upstreams}}
+    <tr>
+      <td><strong>{{.View.Addr}}</strong><br><small>{{.View.Endpoint}}</small></td>
+      <td>{{.View.ConfiguredProto}}</td>
+      <td>{{.View.Proto}}</td>
+      <td class="nowrap"><span class="badge {{.View.State}}">{{.View.State}}</span>{{if ne .View.OpenRemaining "—"}}<br><small>{{.View.OpenRemaining}} remaining</small>{{end}}</td>
+      <td>{{.View.ConsecutiveFailures}}{{if .View.LastError}}<br><small class="error-text" title="{{.View.LastError}}">{{.View.LastError}}</small>{{end}}</td>
+      <td><form class="inline" method="post" action="/forward-zone/upstream/delete"><input type="hidden" name="id" value="{{.ID}}"><button type="submit">Delete upstream</button></form></td>
+    </tr>
+    {{else}}<tr><td colspan="6" class="muted">No upstreams. This empty zone is ignored until an upstream is added.</td></tr>{{end}}
+  </table>
+  <div class="actions"><form class="inline" method="post" action="/forward-zone/delete"><input type="hidden" name="id" value="{{.ID}}"><button type="submit">Delete zone {{.Pattern}}</button></form></div>
+  {{else}}<p class="muted">No conditional forwarding zones configured.</p>{{end}}
 </div>
 
 <div class="card section-gap">

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"database/sql"
 	"embed"
@@ -32,11 +33,13 @@ import (
 
 const (
 	cacheCleanupInterval       = time.Minute
+	listenerRetryInterval      = 3 * time.Second
 	mainRouteTable             = 254
 	routeErrorHistoryLen       = 100
 	upstreamFailureThreshold   = 2
 	upstreamCircuitBaseBackoff = 30 * time.Second
 	upstreamCircuitMaxBackoff  = 5 * time.Minute
+	ipv6FreeBind               = 78
 )
 
 //go:embed templates/*.tmpl
@@ -63,8 +66,9 @@ const (
 )
 
 type upstreamCircuit struct {
-	RawAddr string
-	Proto   string
+	RawAddr         string
+	ConfiguredProto string
+	Proto           string
 
 	State               upstreamCircuitState
 	ConsecutiveFailures uint64
@@ -94,6 +98,7 @@ type upstreamCircuitAttempt struct {
 
 type upstreamCircuitSnapshot struct {
 	RawAddr             string
+	ConfiguredProto     string
 	Proto               string
 	State               upstreamCircuitState
 	ConsecutiveFailures uint64
@@ -116,10 +121,37 @@ type LocalRecord struct {
 	NoData bool
 }
 
+type upstreamTarget struct {
+	Addr  string
+	Proto string
+}
+
+type ForwardZoneUpstream struct {
+	ID       int64
+	Addr     string
+	Proto    string
+	Priority int
+}
+
+type ForwardZone struct {
+	ID        int64
+	Domain    string
+	Upstreams []ForwardZoneUpstream
+}
+
+type forwardPolicy struct {
+	Key       string
+	Domain    string
+	CacheKey  string
+	Upstreams []upstreamTarget
+}
+
 type Config struct {
 	ListenAddrs      []string
+	ListenerFreeBind bool
 	Upstreams        []string
 	UpstreamProto    map[string]string
+	ForwardZones     []ForwardZone
 	SpecialDomains   map[string]struct{}
 	LocalA           map[string][]LocalRecord
 	LocalAAAA        map[string][]LocalRecord
@@ -141,6 +173,32 @@ type listenerSpec struct {
 }
 
 func (s listenerSpec) Key() string { return s.Net + "|" + s.Addr }
+
+type managedListener struct {
+	Server    *dns.Server
+	Spec      listenerSpec
+	FreeBind  bool
+	StartedAt time.Time
+}
+
+type pendingListener struct {
+	Spec        listenerSpec
+	FreeBind    bool
+	Attempts    uint64
+	LastAttempt time.Time
+	LastError   string
+}
+
+type listenerView struct {
+	Net         string
+	Addr        string
+	State       string
+	FreeBind    bool
+	Attempts    uint64
+	StartedAt   string
+	LastAttempt string
+	LastError   string
+}
 
 type RouteState string
 
@@ -240,8 +298,13 @@ type App struct {
 	lastForwardErrorLog    time.Time
 	forwardErrorSuppressed uint64
 
-	servers map[string]*dns.Server
-	srvMu   sync.Mutex
+	forwardPolicyMu    sync.Mutex
+	forwardPolicyStats map[string]*forwardPolicyCounter
+
+	servers             map[string]*managedListener
+	pendingListeners    map[string]*pendingListener
+	srvMu               sync.Mutex
+	listenerReconcileMu sync.Mutex
 
 	adminAddr string
 	startedAt time.Time
@@ -266,11 +329,16 @@ type App struct {
 	conntrackResetAttempts uint64
 	conntrackResetDeleted  uint64
 	conntrackResetErrors   uint64
+	listenerBindAttempts   uint64
+	listenerBindErrors     uint64
+	listenerStarts         uint64
+	listenerRecoveries     uint64
 }
 
 type upstreamView struct {
 	Addr                string
 	ConfiguredProto     string
+	Scopes              string
 	Proto               string
 	Endpoint            string
 	State               string
@@ -288,11 +356,40 @@ type upstreamView struct {
 	LastError           string
 }
 
+type forwardZoneUpstreamView struct {
+	ID   int64
+	View upstreamView
+}
+
+type forwardZoneView struct {
+	ID        int64
+	Domain    string
+	Pattern   string
+	Upstreams []forwardZoneUpstreamView
+}
+
+type forwardPolicyCounter struct {
+	Selected    uint64
+	Success     uint64
+	DNSFailures uint64
+	Errors      uint64
+}
+
+type forwardPolicyView struct {
+	Policy      string
+	Selected    uint64
+	Success     uint64
+	DNSFailures uint64
+	Errors      uint64
+}
+
 type pageData struct {
 	Config         *Config
 	Settings       map[string]string
 	ListenAddrs    []string
+	ListenerStates []listenerView
 	Upstreams      []upstreamView
+	ForwardZones   []forwardZoneView
 	SpecialDomains []string
 	Records        []recordRow
 	Message        string
@@ -312,13 +409,17 @@ type statsData struct {
 	StartedAt        string
 	CacheEntries     int
 	ActiveListeners  int
+	PendingListeners int
 	ListenAddrs      int
 	Upstreams        int
+	ForwardZones     int
+	ForwardUpstreams int
 	SpecialDomains   int
 	LocalADomains    int
 	LocalAAAADomains int
 	LookupCIDR       bool
 	ReplyBeforeRoute bool
+	ListenerFreeBind bool
 	RouteIPv4        bool
 	RouteIPv6        bool
 	RouteTable       int
@@ -345,8 +446,14 @@ type statsData struct {
 	ConntrackResetAttempts uint64
 	ConntrackResetDeleted  uint64
 	ConntrackResetErrors   uint64
+	ListenerBindAttempts   uint64
+	ListenerBindErrors     uint64
+	ListenerStarts         uint64
+	ListenerRecoveries     uint64
 
 	UpstreamCircuits []upstreamView
+	ForwardPolicies  []forwardPolicyView
+	ListenerStates   []listenerView
 }
 
 func main() {
@@ -370,14 +477,16 @@ func main() {
 	}
 
 	app := &App{
-		db:               db,
-		cfg:              cfg,
-		cache:            make(map[string]cacheEntry),
-		dohClient:        newDoHClient(),
-		upstreamCircuits: make(map[string]*upstreamCircuit),
-		servers:          make(map[string]*dns.Server),
-		adminAddr:        *httpAddr,
-		startedAt:        time.Now(),
+		db:                 db,
+		cfg:                cfg,
+		cache:              make(map[string]cacheEntry),
+		dohClient:          newDoHClient(),
+		upstreamCircuits:   make(map[string]*upstreamCircuit),
+		forwardPolicyStats: make(map[string]*forwardPolicyCounter),
+		servers:            make(map[string]*managedListener),
+		pendingListeners:   make(map[string]*pendingListener),
+		adminAddr:          *httpAddr,
+		startedAt:          time.Now(),
 	}
 	app.syncUpstreamCircuits(cfg)
 	app.routeMgr = NewRouteManager(app, 8)
@@ -388,12 +497,12 @@ func main() {
 	logConfig("CONFIG", cfg)
 	rand.Seed(time.Now().UnixNano())
 	app.startCacheCleanup()
-
-	if err := app.reconcileListeners(cfg.ListenAddrs); err != nil {
-		log.Fatalf("start listeners: %v", err)
+	if err := app.validateTemplates(); err != nil {
+		log.Fatalf("validate templates: %v", err)
 	}
-
 	app.startHTTP()
+	app.reconcileListeners(cfg)
+	app.startListenerRetry()
 	select {}
 }
 
@@ -777,8 +886,8 @@ func effectiveRouteTable(table int) int {
 
 func logConfig(prefix string, cfg *Config) {
 	log.Printf(
-		"%s: LISTEN=%v UPSTREAMS=%v WG_INTERFACE=%s WG_GATEWAY=%s WG_GATEWAY_V4=%s WG_GATEWAY_V6=%s ROUTE_TABLE=%d ROUTE_IPV4=%t ROUTE_IPV6=%t LOOKUP_CYMRU_PREFIX=%t REPLY_BEFORE_ROUTE=%t SPECIAL_DOMAINS=%d LOCAL_A=%d LOCAL_AAAA=%d",
-		prefix, cfg.ListenAddrs, cfg.Upstreams, cfg.WGInterface, cfg.WGGateway, cfg.WGGatewayV4, cfg.WGGatewayV6, cfg.RouteTable,
+		"%s: LISTEN=%v LISTENER_FREEBIND=%t UPSTREAMS=%v FORWARD_ZONES=%d FORWARD_ZONE_UPSTREAMS=%d WG_INTERFACE=%s WG_GATEWAY=%s WG_GATEWAY_V4=%s WG_GATEWAY_V6=%s ROUTE_TABLE=%d ROUTE_IPV4=%t ROUTE_IPV6=%t LOOKUP_CYMRU_PREFIX=%t REPLY_BEFORE_ROUTE=%t SPECIAL_DOMAINS=%d LOCAL_A=%d LOCAL_AAAA=%d",
+		prefix, cfg.ListenAddrs, cfg.ListenerFreeBind, cfg.Upstreams, len(cfg.ForwardZones), forwardZoneUpstreamCount(cfg), cfg.WGInterface, cfg.WGGateway, cfg.WGGatewayV4, cfg.WGGatewayV6, cfg.RouteTable,
 		cfg.RouteIPv4, cfg.RouteIPv6, cfg.LookupCIDR, cfg.ReplyBeforeRoute, len(cfg.SpecialDomains), len(cfg.LocalA), len(cfg.LocalAAAA),
 	)
 }
@@ -789,6 +898,31 @@ func renderError(w http.ResponseWriter, status int, err error) {
 	if tplErr := templates.ExecuteTemplate(w, "error.html.tmpl", data); tplErr != nil {
 		http.Error(w, err.Error(), status)
 	}
+}
+
+func (a *App) validateTemplates() error {
+	cfg := a.getConfig()
+	adminData := pageData{
+		Config:         cfg,
+		Settings:       map[string]string{},
+		ListenAddrs:    append([]string(nil), cfg.ListenAddrs...),
+		ListenerStates: a.listenerViews(),
+		Upstreams:      a.defaultUpstreamViews(cfg),
+		ForwardZones:   a.forwardZoneViews(cfg),
+		SpecialDomains: []string{},
+		Records:        []recordRow{},
+		Message:        a.adminAddr,
+	}
+	if err := templates.ExecuteTemplate(io.Discard, "admin.html.tmpl", adminData); err != nil {
+		return fmt.Errorf("admin.html.tmpl: %w", err)
+	}
+	if err := templates.ExecuteTemplate(io.Discard, "stats.html.tmpl", a.statsSnapshot()); err != nil {
+		return fmt.Errorf("stats.html.tmpl: %w", err)
+	}
+	if err := templates.ExecuteTemplate(io.Discard, "error.html.tmpl", struct{ Error string }{Error: "test"}); err != nil {
+		return fmt.Errorf("error.html.tmpl: %w", err)
+	}
+	return nil
 }
 
 func loadConfigFromDB(db *sql.DB) (*Config, error) {
@@ -803,6 +937,7 @@ func loadConfigFromDB(db *sql.DB) (*Config, error) {
 		RouteIPv6:        true,
 		LookupCIDR:       true,
 		ReplyBeforeRoute: false,
+		ListenerFreeBind: false,
 	}
 	settings, err := readSettings(db)
 	if err != nil {
@@ -838,10 +973,16 @@ func loadConfigFromDB(db *sql.DB) (*Config, error) {
 	if v := strings.TrimSpace(settings["reply_before_route"]); v != "" {
 		cfg.ReplyBeforeRoute = isTrueString(v)
 	}
+	if v := strings.TrimSpace(settings["listener_freebind"]); v != "" {
+		cfg.ListenerFreeBind = isTrueString(v)
+	}
 	if err := readListenAddrs(db, cfg); err != nil {
 		return nil, err
 	}
 	if err := readUpstreams(db, cfg); err != nil {
+		return nil, err
+	}
+	if err := readForwardZones(db, cfg); err != nil {
 		return nil, err
 	}
 	if err := readSpecialDomains(db, cfg); err != nil {
@@ -888,6 +1029,9 @@ func initDB(db *sql.DB) error {
 		`CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);`,
 		`CREATE TABLE IF NOT EXISTS listen_addrs (id INTEGER PRIMARY KEY AUTOINCREMENT, addr TEXT NOT NULL UNIQUE, enabled INTEGER NOT NULL DEFAULT 1);`,
 		`CREATE TABLE IF NOT EXISTS upstreams (id INTEGER PRIMARY KEY AUTOINCREMENT, addr TEXT NOT NULL UNIQUE, proto TEXT NOT NULL DEFAULT 'auto', enabled INTEGER NOT NULL DEFAULT 1, priority INTEGER NOT NULL DEFAULT 100);`,
+		`CREATE TABLE IF NOT EXISTS forward_zones (id INTEGER PRIMARY KEY AUTOINCREMENT, domain TEXT NOT NULL UNIQUE, enabled INTEGER NOT NULL DEFAULT 1);`,
+		`CREATE TABLE IF NOT EXISTS forward_zone_upstreams (id INTEGER PRIMARY KEY AUTOINCREMENT, zone_id INTEGER NOT NULL, addr TEXT NOT NULL, proto TEXT NOT NULL DEFAULT 'auto', enabled INTEGER NOT NULL DEFAULT 1, priority INTEGER NOT NULL DEFAULT 100, UNIQUE(zone_id, addr));`,
+		`CREATE INDEX IF NOT EXISTS idx_forward_zone_upstreams_zone ON forward_zone_upstreams(zone_id, enabled, priority, id);`,
 		`CREATE TABLE IF NOT EXISTS special_domains (id INTEGER PRIMARY KEY AUTOINCREMENT, domain TEXT NOT NULL UNIQUE, enabled INTEGER NOT NULL DEFAULT 1);`,
 		`CREATE TABLE IF NOT EXISTS dns_records (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, type TEXT NOT NULL, value TEXT NOT NULL, ttl INTEGER NOT NULL DEFAULT 0, enabled INTEGER NOT NULL DEFAULT 1);`,
 		`CREATE INDEX IF NOT EXISTS idx_dns_records_name_type ON dns_records(name, type, enabled);`,
@@ -958,6 +1102,57 @@ func readUpstreams(db *sql.DB, cfg *Config) error {
 	}
 	return rows.Err()
 }
+func readForwardZones(db *sql.DB, cfg *Config) error {
+	rows, err := db.Query(`SELECT id, domain FROM forward_zones WHERE enabled = 1 ORDER BY length(domain) DESC, domain`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	var zones []ForwardZone
+	for rows.Next() {
+		var zone ForwardZone
+		if err := rows.Scan(&zone.ID, &zone.Domain); err != nil {
+			return err
+		}
+		zone.Domain = normalizeName(zone.Domain)
+		if zone.Domain == "" {
+			continue
+		}
+		zones = append(zones, zone)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	for i := range zones {
+		upRows, err := db.Query(`SELECT id, addr, proto, priority FROM forward_zone_upstreams WHERE zone_id = ? AND enabled = 1 ORDER BY priority, id`, zones[i].ID)
+		if err != nil {
+			return err
+		}
+		for upRows.Next() {
+			var upstream ForwardZoneUpstream
+			if err := upRows.Scan(&upstream.ID, &upstream.Addr, &upstream.Proto, &upstream.Priority); err != nil {
+				_ = upRows.Close()
+				return err
+			}
+			upstream.Addr = strings.TrimSpace(upstream.Addr)
+			upstream.Proto = canonicalUpstreamProto(upstream.Proto)
+			if upstream.Addr == "" {
+				continue
+			}
+			zones[i].Upstreams = append(zones[i].Upstreams, upstream)
+		}
+		if err := upRows.Err(); err != nil {
+			_ = upRows.Close()
+			return err
+		}
+		_ = upRows.Close()
+	}
+	cfg.ForwardZones = zones
+	return nil
+}
+
 func readSpecialDomains(db *sql.DB, cfg *Config) error {
 	rows, err := db.Query(`SELECT domain FROM special_domains WHERE enabled = 1 ORDER BY domain`)
 	if err != nil {
@@ -1029,6 +1224,114 @@ func readDNSRecords(db *sql.DB, cfg *Config) error {
 func normalizeName(name string) string {
 	return strings.ToLower(strings.TrimSuffix(strings.TrimSpace(name), "."))
 }
+func normalizeForwardZone(value string) (string, error) {
+	value = strings.ToLower(strings.TrimSpace(value))
+	value = strings.TrimPrefix(value, "*.")
+	value = strings.TrimPrefix(value, ".")
+	value = normalizeName(value)
+	if value == "" || value == "*" {
+		return "", fmt.Errorf("forward zone cannot be empty or the default root")
+	}
+	if _, ok := dns.IsDomainName(dns.Fqdn(value)); !ok {
+		return "", fmt.Errorf("invalid forward zone %q", value)
+	}
+	return value, nil
+}
+
+func domainMatchesZone(name, zone string) bool {
+	name = normalizeName(name)
+	zone = normalizeName(zone)
+	return name == zone || strings.HasSuffix(name, "."+zone)
+}
+
+func defaultUpstreamTargets(cfg *Config) []upstreamTarget {
+	if cfg == nil {
+		return nil
+	}
+	out := make([]upstreamTarget, 0, len(cfg.Upstreams))
+	for _, addr := range cfg.Upstreams {
+		out = append(out, upstreamTarget{Addr: addr, Proto: cfg.UpstreamProto[addr]})
+	}
+	return out
+}
+
+func allConfiguredUpstreamTargets(cfg *Config) []upstreamTarget {
+	if cfg == nil {
+		return nil
+	}
+	seen := make(map[string]struct{})
+	var out []upstreamTarget
+	add := func(target upstreamTarget) {
+		target.Addr = strings.TrimSpace(target.Addr)
+		target.Proto = canonicalUpstreamProto(target.Proto)
+		if target.Addr == "" {
+			return
+		}
+		key := upstreamCircuitKey(target.Addr, target.Proto)
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		out = append(out, target)
+	}
+	for _, target := range defaultUpstreamTargets(cfg) {
+		add(target)
+	}
+	for _, zone := range cfg.ForwardZones {
+		for _, upstream := range zone.Upstreams {
+			add(upstreamTarget{Addr: upstream.Addr, Proto: upstream.Proto})
+		}
+	}
+	return out
+}
+
+func forwardZoneUpstreamCount(cfg *Config) int {
+	if cfg == nil {
+		return 0
+	}
+	total := 0
+	for _, zone := range cfg.ForwardZones {
+		total += len(zone.Upstreams)
+	}
+	return total
+}
+
+func buildForwardPolicy(key, domain string, targets []upstreamTarget) forwardPolicy {
+	fingerprint := make([]string, 0, len(targets))
+	for _, target := range targets {
+		fingerprint = append(fingerprint, upstreamCircuitKey(target.Addr, target.Proto))
+	}
+	sort.Strings(fingerprint)
+	return forwardPolicy{
+		Key:       key,
+		Domain:    domain,
+		CacheKey:  key + "|" + strings.Join(fingerprint, ","),
+		Upstreams: append([]upstreamTarget(nil), targets...),
+	}
+}
+
+func forwardPolicyForName(name string, cfg *Config) forwardPolicy {
+	name = normalizeName(name)
+	var best *ForwardZone
+	for i := range cfg.ForwardZones {
+		zone := &cfg.ForwardZones[i]
+		if len(zone.Upstreams) == 0 || !domainMatchesZone(name, zone.Domain) {
+			continue
+		}
+		if best == nil || len(zone.Domain) > len(best.Domain) {
+			best = zone
+		}
+	}
+	if best != nil {
+		targets := make([]upstreamTarget, 0, len(best.Upstreams))
+		for _, upstream := range best.Upstreams {
+			targets = append(targets, upstreamTarget{Addr: upstream.Addr, Proto: upstream.Proto})
+		}
+		return buildForwardPolicy(best.Domain, best.Domain, targets)
+	}
+	return buildForwardPolicy("default", "", defaultUpstreamTargets(cfg))
+}
+
 func uniqueStrings(in []string) []string {
 	seen := map[string]struct{}{}
 	out := make([]string, 0, len(in))
@@ -1085,11 +1388,9 @@ func (a *App) reloadConfig() error {
 	if err != nil {
 		return err
 	}
-	if err := a.reconcileListeners(cfg.ListenAddrs); err != nil {
-		return err
-	}
 	a.syncUpstreamCircuits(cfg)
 	a.setConfig(cfg)
+	a.reconcileListeners(cfg)
 	a.routeMgr.ResetCaches()
 	if err := a.routeMgr.ReloadSnapshot(); err != nil {
 		return fmt.Errorf("reload route snapshot after config change: %w", err)
@@ -1098,86 +1399,250 @@ func (a *App) reloadConfig() error {
 	return nil
 }
 
-func (a *App) reconcileListeners(listenAddrs []string) error {
-	desiredSpecs := buildListenerSpecs(listenAddrs)
-	desired := map[string]listenerSpec{}
-	for _, s := range desiredSpecs {
-		desired[s.Key()] = s
+func (a *App) startListenerRetry() {
+	go func() {
+		ticker := time.NewTicker(listenerRetryInterval)
+		defer ticker.Stop()
+		for range ticker.C {
+			a.reconcileListeners(a.getConfig())
+		}
+	}()
+}
+
+func (a *App) reconcileListeners(cfg *Config) {
+	if cfg == nil {
+		return
+	}
+	a.listenerReconcileMu.Lock()
+	defer a.listenerReconcileMu.Unlock()
+
+	desiredSpecs := buildListenerSpecs(cfg.ListenAddrs)
+	desired := make(map[string]listenerSpec, len(desiredSpecs))
+	for _, spec := range desiredSpecs {
+		desired[spec.Key()] = spec
 	}
 
+	var toStop []*managedListener
 	a.srvMu.Lock()
-	current := make(map[string]*dns.Server, len(a.servers))
-	for k, v := range a.servers {
-		current[k] = v
+	for key, active := range a.servers {
+		_, wanted := desired[key]
+		if !wanted || active.FreeBind != cfg.ListenerFreeBind {
+			delete(a.servers, key)
+			toStop = append(toStop, active)
+		}
+	}
+	for key, pending := range a.pendingListeners {
+		_, wanted := desired[key]
+		if !wanted || pending.FreeBind != cfg.ListenerFreeBind {
+			delete(a.pendingListeners, key)
+		}
 	}
 	a.srvMu.Unlock()
 
-	started := map[string]*dns.Server{}
-	for key, spec := range desired {
-		if _, ok := current[key]; ok {
+	for _, active := range toStop {
+		if err := active.Server.Shutdown(); err != nil && !errors.Is(err, net.ErrClosed) {
+			log.Printf("listener shutdown error for %s: %v", active.Spec.Key(), err)
+		}
+	}
+
+	for _, spec := range desiredSpecs {
+		key := spec.Key()
+		a.srvMu.Lock()
+		_, active := a.servers[key]
+		previousPending := a.pendingListeners[key]
+		a.srvMu.Unlock()
+		if active {
 			continue
 		}
-		srv, err := a.newServer(spec)
-		if err != nil {
-			for _, s := range started {
-				_ = s.Shutdown()
-			}
-			return err
-		}
-		started[key] = srv
-		log.Printf("listener started: %s %s", spec.Net, spec.Addr)
-	}
 
-	var toStop []*dns.Server
-	var stopDesc []string
-	a.srvMu.Lock()
-	for k, v := range started {
-		a.servers[k] = v
-	}
-	for k, v := range a.servers {
-		if _, ok := desired[k]; !ok {
-			toStop = append(toStop, v)
-			stopDesc = append(stopDesc, k)
-			delete(a.servers, k)
+		atomic.AddUint64(&a.listenerBindAttempts, 1)
+		srv, err := a.newServer(spec, cfg.ListenerFreeBind)
+		now := time.Now()
+		if err != nil {
+			atomic.AddUint64(&a.listenerBindErrors, 1)
+			a.srvMu.Lock()
+			pending := a.pendingListeners[key]
+			if pending == nil {
+				pending = &pendingListener{Spec: spec, FreeBind: cfg.ListenerFreeBind}
+				a.pendingListeners[key] = pending
+			}
+			oldError := pending.LastError
+			pending.Attempts++
+			pending.LastAttempt = now
+			pending.LastError = err.Error()
+			attempts := pending.Attempts
+			a.srvMu.Unlock()
+
+			if previousPending == nil || oldError != err.Error() || attempts%20 == 0 {
+				log.Printf(
+					"LISTENER_PENDING network=%s addr=%q freebind=%t attempts=%d retry_in=%s error=%v",
+					spec.Net,
+					spec.Addr,
+					cfg.ListenerFreeBind,
+					attempts,
+					listenerRetryInterval,
+					err,
+				)
+			}
+			continue
 		}
-	}
-	a.srvMu.Unlock()
-	for i, srv := range toStop {
-		if err := srv.Shutdown(); err != nil {
-			log.Printf("listener shutdown error for %s: %v", stopDesc[i], err)
+
+		managed := &managedListener{
+			Server:    srv,
+			Spec:      spec,
+			FreeBind:  cfg.ListenerFreeBind,
+			StartedAt: now,
 		}
+		a.srvMu.Lock()
+		_, recovered := a.pendingListeners[key]
+		delete(a.pendingListeners, key)
+		a.servers[key] = managed
+		a.srvMu.Unlock()
+
+		atomic.AddUint64(&a.listenerStarts, 1)
+		if recovered {
+			atomic.AddUint64(&a.listenerRecoveries, 1)
+		}
+		log.Printf(
+			"LISTENER_ACTIVE network=%s addr=%q freebind=%t recovered=%t",
+			spec.Net,
+			spec.Addr,
+			cfg.ListenerFreeBind,
+			recovered,
+		)
+		go a.serveLoop(managed)
+	}
+}
+
+func enableListenerFreeBind(fd uintptr, network, address string) error {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return fmt.Errorf("split listen address %q: %w", address, err)
+	}
+	host = strings.Trim(host, "[]")
+	if zoneIndex := strings.LastIndexByte(host, '%'); zoneIndex >= 0 {
+		host = host[:zoneIndex]
+	}
+	ip := net.ParseIP(host)
+	isIPv6 := strings.HasSuffix(network, "6") || (ip != nil && ip.To4() == nil)
+	if isIPv6 {
+		if err := syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IPV6, ipv6FreeBind, 1); err != nil {
+			return fmt.Errorf("set IPV6_FREEBIND: %w", err)
+		}
+		return nil
+	}
+	if err := syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, syscall.IP_FREEBIND, 1); err != nil {
+		return fmt.Errorf("set IP_FREEBIND: %w", err)
 	}
 	return nil
 }
 
-func (a *App) newServer(spec listenerSpec) (*dns.Server, error) {
+func listenerListenConfig(freeBind bool) net.ListenConfig {
+	lc := net.ListenConfig{}
+	if !freeBind {
+		return lc
+	}
+	lc.Control = func(network, address string, raw syscall.RawConn) error {
+		var socketErr error
+		if err := raw.Control(func(fd uintptr) {
+			socketErr = enableListenerFreeBind(fd, network, address)
+		}); err != nil {
+			return err
+		}
+		return socketErr
+	}
+	return lc
+}
+
+func (a *App) newServer(spec listenerSpec, freeBind bool) (*dns.Server, error) {
 	handler := dns.HandlerFunc(a.handleDNS)
+	lc := listenerListenConfig(freeBind)
 	switch spec.Net {
 	case "udp":
-		pc, err := net.ListenPacket("udp", spec.Addr)
+		pc, err := lc.ListenPacket(context.Background(), "udp", spec.Addr)
 		if err != nil {
 			return nil, err
 		}
-		srv := &dns.Server{Net: "udp", PacketConn: pc, Handler: handler}
-		go a.serveLoop(srv, spec)
-		return srv, nil
+		return &dns.Server{Net: "udp", PacketConn: pc, Handler: handler}, nil
 	case "tcp":
-		ln, err := net.Listen("tcp", spec.Addr)
+		ln, err := lc.Listen(context.Background(), "tcp", spec.Addr)
 		if err != nil {
 			return nil, err
 		}
-		srv := &dns.Server{Net: "tcp", Listener: ln, Handler: handler}
-		go a.serveLoop(srv, spec)
-		return srv, nil
+		return &dns.Server{Net: "tcp", Listener: ln, Handler: handler}, nil
 	default:
 		return nil, fmt.Errorf("unsupported network %q", spec.Net)
 	}
 }
-func (a *App) serveLoop(srv *dns.Server, spec listenerSpec) {
-	err := srv.ActivateAndServe()
-	if err != nil && !errors.Is(err, net.ErrClosed) {
-		log.Printf("listener serve error %s %s: %v", spec.Net, spec.Addr, err)
+
+func (a *App) serveLoop(active *managedListener) {
+	err := active.Server.ActivateAndServe()
+	if err == nil {
+		err = fmt.Errorf("listener stopped unexpectedly")
 	}
+
+	key := active.Spec.Key()
+	a.srvMu.Lock()
+	current, stillActive := a.servers[key]
+	if stillActive && current == active {
+		delete(a.servers, key)
+		a.pendingListeners[key] = &pendingListener{
+			Spec:        active.Spec,
+			FreeBind:    active.FreeBind,
+			LastAttempt: time.Now(),
+			LastError:   err.Error(),
+		}
+	}
+	a.srvMu.Unlock()
+
+	if stillActive && current == active {
+		log.Printf(
+			"LISTENER_EXITED network=%s addr=%q freebind=%t retry_in=%s error=%v",
+			active.Spec.Net,
+			active.Spec.Addr,
+			active.FreeBind,
+			listenerRetryInterval,
+			err,
+		)
+	}
+}
+
+func (a *App) listenerViews() []listenerView {
+	a.srvMu.Lock()
+	out := make([]listenerView, 0, len(a.servers)+len(a.pendingListeners))
+	for _, active := range a.servers {
+		out = append(out, listenerView{
+			Net:       active.Spec.Net,
+			Addr:      active.Spec.Addr,
+			State:     "active",
+			FreeBind:  active.FreeBind,
+			StartedAt: active.StartedAt.Format(time.RFC3339),
+		})
+	}
+	for _, pending := range a.pendingListeners {
+		lastAttempt := "—"
+		if !pending.LastAttempt.IsZero() {
+			lastAttempt = pending.LastAttempt.Format(time.RFC3339)
+		}
+		out = append(out, listenerView{
+			Net:         pending.Spec.Net,
+			Addr:        pending.Spec.Addr,
+			State:       "pending",
+			FreeBind:    pending.FreeBind,
+			Attempts:    pending.Attempts,
+			LastAttempt: lastAttempt,
+			LastError:   pending.LastError,
+		})
+	}
+	a.srvMu.Unlock()
+
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Addr != out[j].Addr {
+			return out[i].Addr < out[j].Addr
+		}
+		return out[i].Net < out[j].Net
+	})
+	return out
 }
 
 func (a *App) startHTTP() {
@@ -1193,6 +1658,9 @@ func (a *App) startHTTP() {
 	mux.HandleFunc("/listen/delete", a.handleListenDelete)
 	mux.HandleFunc("/upstream/add", a.handleUpstreamAdd)
 	mux.HandleFunc("/upstream/delete", a.handleUpstreamDelete)
+	mux.HandleFunc("/forward-zone/add", a.handleForwardZoneAdd)
+	mux.HandleFunc("/forward-zone/upstream/delete", a.handleForwardZoneUpstreamDelete)
+	mux.HandleFunc("/forward-zone/delete", a.handleForwardZoneDelete)
 	mux.HandleFunc("/special/add", a.handleSpecialAdd)
 	mux.HandleFunc("/special/delete", a.handleSpecialDelete)
 	mux.HandleFunc("/record/add", a.handleRecordAdd)
@@ -1221,7 +1689,7 @@ func (a *App) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cfg := a.getConfig()
-	upstreams := a.upstreamViews(cfg)
+	upstreams := a.defaultUpstreamViews(cfg)
 	specials, err := a.listSimple(`SELECT domain FROM special_domains WHERE enabled = 1 ORDER BY domain`)
 	if err != nil {
 		renderError(w, 500, err)
@@ -1232,7 +1700,7 @@ func (a *App) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		renderError(w, 500, err)
 		return
 	}
-	data := pageData{Config: cfg, Settings: settings, ListenAddrs: listenAddrs, Upstreams: upstreams, SpecialDomains: specials, Records: records, Message: a.adminAddr}
+	data := pageData{Config: cfg, Settings: settings, ListenAddrs: listenAddrs, ListenerStates: a.listenerViews(), Upstreams: upstreams, ForwardZones: a.forwardZoneViews(cfg), SpecialDomains: specials, Records: records, Message: a.adminAddr}
 	if err := templates.ExecuteTemplate(w, "admin.html.tmpl", data); err != nil {
 		renderError(w, 500, err)
 	}
@@ -1303,6 +1771,7 @@ func (a *App) handleSettingsSave(w http.ResponseWriter, r *http.Request) {
 	}
 	lookupCIDR := boolSetting(formBoolean(r, "lookup_cidr"))
 	replyBeforeRoute := boolSetting(formBoolean(r, "reply_before_route"))
+	listenerFreeBind := boolSetting(formBoolean(r, "listener_freebind"))
 	routeIPv4 := boolSetting(formBoolean(r, "route_ipv4"))
 	routeIPv6 := boolSetting(formBoolean(r, "route_ipv6"))
 	settings := map[string]string{
@@ -1316,6 +1785,7 @@ func (a *App) handleSettingsSave(w http.ResponseWriter, r *http.Request) {
 		"local_record_ttl":   strings.TrimSpace(r.FormValue("local_record_ttl")),
 		"lookup_cidr":        lookupCIDR,
 		"reply_before_route": replyBeforeRoute,
+		"listener_freebind":  listenerFreeBind,
 	}
 	for k, v := range settings {
 		if _, err := a.db.Exec(`INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`, k, v); err != nil {
@@ -1390,6 +1860,117 @@ func (a *App) handleUpstreamAdd(w http.ResponseWriter, r *http.Request) {
 func (a *App) handleUpstreamDelete(w http.ResponseWriter, r *http.Request) {
 	a.handleSimpleDelete(w, r, `DELETE FROM upstreams WHERE addr = ?`, strings.TrimSpace(r.FormValue("addr")))
 }
+func (a *App) handleForwardZoneAdd(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		renderError(w, http.StatusMethodNotAllowed, fmt.Errorf("method not allowed"))
+		return
+	}
+	domain, err := normalizeForwardZone(r.FormValue("domain"))
+	if err != nil {
+		renderError(w, http.StatusBadRequest, err)
+		return
+	}
+	addr := strings.TrimSpace(r.FormValue("addr"))
+	if addr == "" {
+		renderError(w, http.StatusBadRequest, fmt.Errorf("upstream address is required"))
+		return
+	}
+	proto := canonicalUpstreamProto(r.FormValue("proto"))
+	if !validUpstreamProto(proto) {
+		renderError(w, http.StatusBadRequest, fmt.Errorf("unsupported upstream protocol %q", proto))
+		return
+	}
+	if _, _, err := resolveUpstream(addr, proto); err != nil {
+		renderError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	tx, err := a.db.Begin()
+	if err != nil {
+		renderError(w, http.StatusInternalServerError, err)
+		return
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.Exec(`INSERT INTO forward_zones(domain, enabled) VALUES(?, 1) ON CONFLICT(domain) DO UPDATE SET enabled = 1`, domain); err != nil {
+		renderError(w, http.StatusInternalServerError, err)
+		return
+	}
+	var zoneID int64
+	if err := tx.QueryRow(`SELECT id FROM forward_zones WHERE domain = ?`, domain).Scan(&zoneID); err != nil {
+		renderError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if _, err := tx.Exec(`INSERT INTO forward_zone_upstreams(zone_id, addr, proto, enabled, priority) VALUES(?, ?, ?, 1, 100) ON CONFLICT(zone_id, addr) DO UPDATE SET proto = excluded.proto, enabled = 1`, zoneID, addr, proto); err != nil {
+		renderError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		renderError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if err := a.reloadConfig(); err != nil {
+		renderError(w, http.StatusInternalServerError, err)
+		return
+	}
+	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
+func (a *App) handleForwardZoneUpstreamDelete(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		renderError(w, http.StatusMethodNotAllowed, fmt.Errorf("method not allowed"))
+		return
+	}
+	id, err := strconv.ParseInt(strings.TrimSpace(r.FormValue("id")), 10, 64)
+	if err != nil || id <= 0 {
+		renderError(w, http.StatusBadRequest, fmt.Errorf("invalid forward-zone upstream id"))
+		return
+	}
+	if _, err := a.db.Exec(`DELETE FROM forward_zone_upstreams WHERE id = ?`, id); err != nil {
+		renderError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if err := a.reloadConfig(); err != nil {
+		renderError(w, http.StatusInternalServerError, err)
+		return
+	}
+	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
+func (a *App) handleForwardZoneDelete(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		renderError(w, http.StatusMethodNotAllowed, fmt.Errorf("method not allowed"))
+		return
+	}
+	id, err := strconv.ParseInt(strings.TrimSpace(r.FormValue("id")), 10, 64)
+	if err != nil || id <= 0 {
+		renderError(w, http.StatusBadRequest, fmt.Errorf("invalid forward-zone id"))
+		return
+	}
+	tx, err := a.db.Begin()
+	if err != nil {
+		renderError(w, http.StatusInternalServerError, err)
+		return
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.Exec(`DELETE FROM forward_zone_upstreams WHERE zone_id = ?`, id); err != nil {
+		renderError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if _, err := tx.Exec(`DELETE FROM forward_zones WHERE id = ?`, id); err != nil {
+		renderError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		renderError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if err := a.reloadConfig(); err != nil {
+		renderError(w, http.StatusInternalServerError, err)
+		return
+	}
+	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
 func (a *App) handleSpecialAdd(w http.ResponseWriter, r *http.Request) {
 	a.handleSimpleInsert(w, r, `INSERT OR IGNORE INTO special_domains(domain, enabled) VALUES(?, 1)`, normalizeName(r.FormValue("domain")))
 }
@@ -1548,7 +2129,6 @@ func (a *App) handleDNS(w dns.ResponseWriter, req *dns.Msg) {
 
 	q := req.Question[0]
 	name := normalizeName(q.Name)
-	key := name + ":" + dns.TypeToString[q.Qtype]
 
 	if resp := a.localResponse(req, q); resp != nil {
 		cfg := a.getConfig()
@@ -1573,6 +2153,10 @@ func (a *App) handleDNS(w dns.ResponseWriter, req *dns.Msg) {
 		_ = writeDNSResponse(w, req, resp)
 		return
 	}
+
+	cfgForPolicy := a.getConfig()
+	policy := forwardPolicyForName(name, cfgForPolicy)
+	key := policy.CacheKey + "|" + name + ":" + dns.TypeToString[q.Qtype]
 
 	a.cacheMu.RLock()
 	if entry, ok := a.cache[key]; ok && time.Now().Before(entry.expiration) {
@@ -1603,7 +2187,7 @@ func (a *App) handleDNS(w dns.ResponseWriter, req *dns.Msg) {
 	a.cacheMu.RUnlock()
 	atomic.AddUint64(&a.cacheMisses, 1)
 
-	resp, err := a.forwardDNS(req)
+	resp, err := a.forwardDNSWithPolicy(req, policy)
 	if err != nil {
 		atomic.AddUint64(&a.forwardErrors, 1)
 		atomic.AddUint64(&a.servfailCount, 1)
@@ -1926,23 +2510,28 @@ func upstreamCircuitProtoLabel(rawAddr, configuredProto string) string {
 }
 
 func (a *App) syncUpstreamCircuits(cfg *Config) {
-	wanted := make(map[string]struct{}, len(cfg.Upstreams))
+	targets := allConfiguredUpstreamTargets(cfg)
+	wanted := make(map[string]struct{}, len(targets))
 
 	a.upstreamMu.Lock()
 	defer a.upstreamMu.Unlock()
 	if a.upstreamCircuits == nil {
 		a.upstreamCircuits = make(map[string]*upstreamCircuit)
 	}
-	for _, rawAddr := range cfg.Upstreams {
-		configuredProto := cfg.UpstreamProto[rawAddr]
-		key := upstreamCircuitKey(rawAddr, configuredProto)
+	for _, target := range targets {
+		configuredProto := canonicalUpstreamProto(target.Proto)
+		key := upstreamCircuitKey(target.Addr, configuredProto)
 		wanted[key] = struct{}{}
-		if _, ok := a.upstreamCircuits[key]; !ok {
-			a.upstreamCircuits[key] = &upstreamCircuit{
-				RawAddr: strings.TrimSpace(rawAddr),
-				Proto:   upstreamCircuitProtoLabel(rawAddr, configuredProto),
-				State:   upstreamCircuitClosed,
-			}
+		if existing, ok := a.upstreamCircuits[key]; ok {
+			existing.RawAddr = strings.TrimSpace(target.Addr)
+			existing.ConfiguredProto = configuredProto
+			continue
+		}
+		a.upstreamCircuits[key] = &upstreamCircuit{
+			RawAddr:         strings.TrimSpace(target.Addr),
+			ConfiguredProto: configuredProto,
+			Proto:           upstreamCircuitProtoLabel(target.Addr, configuredProto),
+			State:           upstreamCircuitClosed,
 		}
 	}
 	for key := range a.upstreamCircuits {
@@ -2115,6 +2704,7 @@ func (a *App) upstreamCircuitSnapshots() []upstreamCircuitSnapshot {
 	for _, c := range a.upstreamCircuits {
 		out = append(out, upstreamCircuitSnapshot{
 			RawAddr:             c.RawAddr,
+			ConfiguredProto:     c.ConfiguredProto,
 			Proto:               c.Proto,
 			State:               c.State,
 			ConsecutiveFailures: c.ConsecutiveFailures,
@@ -2142,24 +2732,96 @@ func (a *App) upstreamCircuitSnapshots() []upstreamCircuitSnapshot {
 	return out
 }
 
+func (a *App) recordForwardPolicy(policy string, result string) {
+	if policy == "" {
+		policy = "default"
+	}
+	a.forwardPolicyMu.Lock()
+	if a.forwardPolicyStats == nil {
+		a.forwardPolicyStats = make(map[string]*forwardPolicyCounter)
+	}
+	counter := a.forwardPolicyStats[policy]
+	if counter == nil {
+		counter = &forwardPolicyCounter{}
+		a.forwardPolicyStats[policy] = counter
+	}
+	switch result {
+	case "selected":
+		counter.Selected++
+	case "success":
+		counter.Success++
+	case "dns_error":
+		counter.DNSFailures++
+	case "error":
+		counter.Errors++
+	}
+	a.forwardPolicyMu.Unlock()
+}
+
+func (a *App) forwardPolicyViews(cfg *Config) []forwardPolicyView {
+	wanted := map[string]struct{}{"default": {}}
+	for _, zone := range cfg.ForwardZones {
+		if len(zone.Upstreams) > 0 {
+			wanted[zone.Domain] = struct{}{}
+		}
+	}
+
+	a.forwardPolicyMu.Lock()
+	out := make([]forwardPolicyView, 0, len(wanted))
+	for policy := range wanted {
+		view := forwardPolicyView{Policy: policy}
+		if counter := a.forwardPolicyStats[policy]; counter != nil {
+			view.Selected = counter.Selected
+			view.Success = counter.Success
+			view.DNSFailures = counter.DNSFailures
+			view.Errors = counter.Errors
+		}
+		out = append(out, view)
+	}
+	a.forwardPolicyMu.Unlock()
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Policy == "default" {
+			return true
+		}
+		if out[j].Policy == "default" {
+			return false
+		}
+		return out[i].Policy < out[j].Policy
+	})
+	return out
+}
+
 func (a *App) forwardDNS(req *dns.Msg) (*dns.Msg, error) {
 	cfg := a.getConfig()
-	if len(cfg.Upstreams) == 0 {
-		return nil, fmt.Errorf("no upstreams configured")
+	name := ""
+	if req != nil && len(req.Question) > 0 {
+		name = normalizeName(req.Question[0].Name)
+	}
+	return a.forwardDNSWithPolicy(req, forwardPolicyForName(name, cfg))
+}
+
+func (a *App) forwardDNSWithPolicy(req *dns.Msg, policy forwardPolicy) (*dns.Msg, error) {
+	a.recordForwardPolicy(policy.Key, "selected")
+	if len(policy.Upstreams) == 0 {
+		a.recordForwardPolicy(policy.Key, "error")
+		if policy.Domain != "" {
+			return nil, fmt.Errorf("no upstreams configured for forward zone *.%s", policy.Domain)
+		}
+		return nil, fmt.Errorf("no default upstreams configured")
 	}
 
 	var attemptErrors []string
 	var lastRetryableResponse *dns.Msg
 	attempted := 0
-	for _, upstream := range shuffledUpstreams(cfg.Upstreams) {
-		configuredProto := cfg.UpstreamProto[upstream]
-		proto, endpoint, err := resolveUpstream(upstream, configuredProto)
+	for _, target := range shuffledUpstreamTargets(policy.Upstreams) {
+		configuredProto := canonicalUpstreamProto(target.Proto)
+		proto, endpoint, err := resolveUpstream(target.Addr, configuredProto)
 		if err != nil {
-			attemptErrors = append(attemptErrors, fmt.Sprintf("%s: %v", upstream, err))
+			attemptErrors = append(attemptErrors, fmt.Sprintf("%s: %v", target.Addr, err))
 			continue
 		}
 
-		attempt, allowed, remaining := a.beginUpstreamAttempt(upstream, configuredProto, proto)
+		attempt, allowed, remaining := a.beginUpstreamAttempt(target.Addr, configuredProto, proto)
 		if !allowed {
 			if remaining > 0 {
 				attemptErrors = append(attemptErrors, fmt.Sprintf("%s[%s]: circuit open for %s", endpoint, proto, remaining.Truncate(time.Millisecond)))
@@ -2188,19 +2850,26 @@ func (a *App) forwardDNS(req *dns.Msg) (*dns.Msg, error) {
 			continue
 		}
 		a.completeUpstreamSuccess(attempt)
+		a.recordForwardPolicy(policy.Key, "success")
 		return resp, nil
 	}
 
 	if lastRetryableResponse != nil {
+		a.recordForwardPolicy(policy.Key, "dns_error")
 		return lastRetryableResponse, nil
 	}
+	a.recordForwardPolicy(policy.Key, "error")
+	prefix := "default"
+	if policy.Domain != "" {
+		prefix = "*." + policy.Domain
+	}
 	if len(attemptErrors) == 0 {
-		return nil, fmt.Errorf("no usable upstreams configured")
+		return nil, fmt.Errorf("forward policy %s has no usable upstreams", prefix)
 	}
 	if attempted == 0 {
-		return nil, fmt.Errorf("all upstream circuits unavailable: %s", strings.Join(attemptErrors, "; "))
+		return nil, fmt.Errorf("all upstream circuits unavailable for policy %s: %s", prefix, strings.Join(attemptErrors, "; "))
 	}
-	return nil, fmt.Errorf("all attempted upstreams failed: %s", strings.Join(attemptErrors, "; "))
+	return nil, fmt.Errorf("all attempted upstreams failed for policy %s: %s", prefix, strings.Join(attemptErrors, "; "))
 }
 
 func (a *App) logForwardError(name string, qtype uint16, err error) {
@@ -2226,8 +2895,8 @@ func (a *App) logForwardError(name string, qtype uint16, err error) {
 	)
 }
 
-func shuffledUpstreams(upstreams []string) []string {
-	res := append([]string(nil), upstreams...)
+func shuffledUpstreamTargets(upstreams []upstreamTarget) []upstreamTarget {
+	res := append([]upstreamTarget(nil), upstreams...)
 	rand.Shuffle(len(res), func(i, j int) { res[i], res[j] = res[j], res[i] })
 	return res
 }
@@ -2299,7 +2968,8 @@ func (a *App) lookupCIDR(ip string) string {
 	req.SetQuestion(queryName, dns.TypeTXT)
 	req.RecursionDesired = true
 
-	resp, err := a.forwardDNS(req)
+	cfg := a.getConfig()
+	resp, err := a.forwardDNSWithPolicy(req, buildForwardPolicy("default", "", defaultUpstreamTargets(cfg)))
 	if err != nil || resp == nil || resp.Rcode != dns.RcodeSuccess {
 		return ""
 	}
@@ -2680,56 +3350,121 @@ func formatWebTime(value time.Time) string {
 	return value.Format(time.RFC3339)
 }
 
-func (a *App) upstreamViews(cfg *Config) []upstreamView {
+func (a *App) upstreamSnapshotMap() map[string]upstreamCircuitSnapshot {
 	snapshots := a.upstreamCircuitSnapshots()
-	byAddr := make(map[string]upstreamCircuitSnapshot, len(snapshots))
+	out := make(map[string]upstreamCircuitSnapshot, len(snapshots))
 	for _, snapshot := range snapshots {
-		byAddr[snapshot.RawAddr] = snapshot
+		out[upstreamCircuitKey(snapshot.RawAddr, snapshot.ConfiguredProto)] = snapshot
 	}
+	return out
+}
 
-	now := time.Now()
-	out := make([]upstreamView, 0, len(cfg.Upstreams))
-	for _, addr := range cfg.Upstreams {
-		configuredProto := canonicalUpstreamProto(cfg.UpstreamProto[addr])
-		if configuredProto == "" {
-			configuredProto = "auto"
-		}
-
-		proto, endpoint, resolveErr := resolveUpstream(addr, configuredProto)
-		if resolveErr != nil {
-			proto = configuredProto
-			endpoint = "invalid: " + resolveErr.Error()
-		}
-
-		view := upstreamView{
-			Addr:            addr,
-			ConfiguredProto: configuredProto,
-			Proto:           proto,
-			Endpoint:        endpoint,
-			State:           string(upstreamCircuitClosed),
-			OpenRemaining:   "—",
-			LastSuccess:     "—",
-			LastFailure:     "—",
-		}
-		if snapshot, ok := byAddr[addr]; ok {
-			view.State = string(snapshot.State)
-			view.ConsecutiveFailures = snapshot.ConsecutiveFailures
-			view.Successes = snapshot.Successes
-			view.Failures = snapshot.Failures
-			view.DNSFailures = snapshot.DNSFailures
-			view.Skipped = snapshot.Skipped
-			view.OpenEvents = snapshot.OpenEvents
-			view.Recoveries = snapshot.Recoveries
-			view.HalfOpenProbes = snapshot.HalfOpenProbes
-			view.LastSuccess = formatWebTime(snapshot.LastSuccess)
-			view.LastFailure = formatWebTime(snapshot.LastFailure)
-			view.LastError = snapshot.LastError
-			if snapshot.State == upstreamCircuitOpen && snapshot.OpenUntil.After(now) {
-				view.OpenRemaining = time.Until(snapshot.OpenUntil).Truncate(time.Second).String()
+func upstreamTargetScopes(cfg *Config) map[string][]string {
+	out := make(map[string][]string)
+	add := func(target upstreamTarget, scope string) {
+		key := upstreamCircuitKey(target.Addr, target.Proto)
+		for _, existing := range out[key] {
+			if existing == scope {
+				return
 			}
+		}
+		out[key] = append(out[key], scope)
+	}
+	for _, target := range defaultUpstreamTargets(cfg) {
+		add(target, "default")
+	}
+	for _, zone := range cfg.ForwardZones {
+		for _, upstream := range zone.Upstreams {
+			add(upstreamTarget{Addr: upstream.Addr, Proto: upstream.Proto}, "*."+zone.Domain)
+		}
+	}
+	for key := range out {
+		sort.Strings(out[key])
+	}
+	return out
+}
+
+func (a *App) upstreamViewForTarget(target upstreamTarget, scopes []string, snapshots map[string]upstreamCircuitSnapshot) upstreamView {
+	configuredProto := canonicalUpstreamProto(target.Proto)
+	if configuredProto == "" {
+		configuredProto = "auto"
+	}
+	proto, endpoint, resolveErr := resolveUpstream(target.Addr, configuredProto)
+	if resolveErr != nil {
+		proto = configuredProto
+		endpoint = "invalid: " + resolveErr.Error()
+	}
+	view := upstreamView{
+		Addr:            target.Addr,
+		ConfiguredProto: configuredProto,
+		Scopes:          strings.Join(scopes, ", "),
+		Proto:           proto,
+		Endpoint:        endpoint,
+		State:           string(upstreamCircuitClosed),
+		OpenRemaining:   "—",
+		LastSuccess:     "—",
+		LastFailure:     "—",
+	}
+	if snapshot, ok := snapshots[upstreamCircuitKey(target.Addr, configuredProto)]; ok {
+		view.State = string(snapshot.State)
+		view.ConsecutiveFailures = snapshot.ConsecutiveFailures
+		view.Successes = snapshot.Successes
+		view.Failures = snapshot.Failures
+		view.DNSFailures = snapshot.DNSFailures
+		view.Skipped = snapshot.Skipped
+		view.OpenEvents = snapshot.OpenEvents
+		view.Recoveries = snapshot.Recoveries
+		view.HalfOpenProbes = snapshot.HalfOpenProbes
+		view.LastSuccess = formatWebTime(snapshot.LastSuccess)
+		view.LastFailure = formatWebTime(snapshot.LastFailure)
+		view.LastError = snapshot.LastError
+		if snapshot.State == upstreamCircuitOpen && snapshot.OpenUntil.After(time.Now()) {
+			view.OpenRemaining = time.Until(snapshot.OpenUntil).Truncate(time.Second).String()
+		}
+	}
+	return view
+}
+
+func (a *App) defaultUpstreamViews(cfg *Config) []upstreamView {
+	snapshots := a.upstreamSnapshotMap()
+	out := make([]upstreamView, 0, len(cfg.Upstreams))
+	for _, target := range defaultUpstreamTargets(cfg) {
+		out = append(out, a.upstreamViewForTarget(target, []string{"default"}, snapshots))
+	}
+	return out
+}
+
+func (a *App) forwardZoneViews(cfg *Config) []forwardZoneView {
+	snapshots := a.upstreamSnapshotMap()
+	out := make([]forwardZoneView, 0, len(cfg.ForwardZones))
+	for _, zone := range cfg.ForwardZones {
+		view := forwardZoneView{ID: zone.ID, Domain: zone.Domain, Pattern: "*." + zone.Domain}
+		for _, upstream := range zone.Upstreams {
+			target := upstreamTarget{Addr: upstream.Addr, Proto: upstream.Proto}
+			view.Upstreams = append(view.Upstreams, forwardZoneUpstreamView{
+				ID:   upstream.ID,
+				View: a.upstreamViewForTarget(target, []string{"*." + zone.Domain}, snapshots),
+			})
 		}
 		out = append(out, view)
 	}
+	return out
+}
+
+func (a *App) upstreamViews(cfg *Config) []upstreamView {
+	snapshots := a.upstreamSnapshotMap()
+	scopes := upstreamTargetScopes(cfg)
+	targets := allConfiguredUpstreamTargets(cfg)
+	out := make([]upstreamView, 0, len(targets))
+	for _, target := range targets {
+		out = append(out, a.upstreamViewForTarget(target, scopes[upstreamCircuitKey(target.Addr, target.Proto)], snapshots))
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Addr != out[j].Addr {
+			return out[i].Addr < out[j].Addr
+		}
+		return out[i].ConfiguredProto < out[j].ConfiguredProto
+	})
 	return out
 }
 
@@ -2740,7 +3475,9 @@ func (a *App) statsSnapshot() statsData {
 	a.cacheMu.RUnlock()
 	a.srvMu.Lock()
 	activeListeners := len(a.servers)
+	pendingListeners := len(a.pendingListeners)
 	a.srvMu.Unlock()
+	listenerStates := a.listenerViews()
 	a.routeMgr.snapMu.RLock()
 	routeSnapshot := len(a.routeMgr.snapshot)
 	a.routeMgr.snapMu.RUnlock()
@@ -2751,20 +3488,24 @@ func (a *App) statsSnapshot() statsData {
 	cidrEntries := len(a.routeMgr.cidrCache)
 	a.routeMgr.cidrMu.RUnlock()
 	return statsData{
-		Uptime:          time.Since(a.startedAt).Truncate(time.Second).String(),
-		StartedAt:       a.startedAt.Format(time.RFC3339),
-		CacheEntries:    cacheEntries,
-		ActiveListeners: activeListeners,
-		ListenAddrs:     len(cfg.ListenAddrs), Upstreams: len(cfg.Upstreams), SpecialDomains: len(cfg.SpecialDomains),
+		Uptime:           time.Since(a.startedAt).Truncate(time.Second).String(),
+		StartedAt:        a.startedAt.Format(time.RFC3339),
+		CacheEntries:     cacheEntries,
+		ActiveListeners:  activeListeners,
+		PendingListeners: pendingListeners,
+		ListenAddrs:      len(cfg.ListenAddrs), Upstreams: len(cfg.Upstreams), ForwardZones: len(cfg.ForwardZones), ForwardUpstreams: forwardZoneUpstreamCount(cfg), SpecialDomains: len(cfg.SpecialDomains),
 		LocalADomains: len(cfg.LocalA), LocalAAAADomains: len(cfg.LocalAAAA), LookupCIDR: cfg.LookupCIDR,
-		ReplyBeforeRoute: cfg.ReplyBeforeRoute, RouteIPv4: cfg.RouteIPv4, RouteIPv6: cfg.RouteIPv6, RouteTable: cfg.RouteTable, WGInterface: cfg.WGInterface, WGGateway: cfg.WGGateway, WGGatewayV4: cfg.WGGatewayV4, WGGatewayV6: cfg.WGGatewayV6,
+		ReplyBeforeRoute: cfg.ReplyBeforeRoute, ListenerFreeBind: cfg.ListenerFreeBind, RouteIPv4: cfg.RouteIPv4, RouteIPv6: cfg.RouteIPv6, RouteTable: cfg.RouteTable, WGInterface: cfg.WGInterface, WGGateway: cfg.WGGateway, WGGatewayV4: cfg.WGGatewayV4, WGGatewayV6: cfg.WGGatewayV6,
 		RouteSnapshot: routeSnapshot, IPCacheEntries: ipEntries, CIDRCacheEntries: cidrEntries,
 		TotalQueries: atomic.LoadUint64(&a.totalQueries), CacheHits: atomic.LoadUint64(&a.cacheHits), CacheMisses: atomic.LoadUint64(&a.cacheMisses),
 		LocalAnswers: atomic.LoadUint64(&a.localAnswers), ForwardedOK: atomic.LoadUint64(&a.forwardedOK), ServfailCount: atomic.LoadUint64(&a.servfailCount),
 		RouteAdds: atomic.LoadUint64(&a.routeAdds), RouteAddErrors: atomic.LoadUint64(&a.routeAddErrors), ForwardErrors: atomic.LoadUint64(&a.forwardErrors),
 		LookupCIDRAttempts: atomic.LoadUint64(&a.lookupCIDRAttempts), LookupCIDRFailed: atomic.LoadUint64(&a.lookupCIDRFailed), RouteQueueDrops: atomic.LoadUint64(&a.routeQueueDrops),
 		ConntrackResetAttempts: atomic.LoadUint64(&a.conntrackResetAttempts), ConntrackResetDeleted: atomic.LoadUint64(&a.conntrackResetDeleted), ConntrackResetErrors: atomic.LoadUint64(&a.conntrackResetErrors),
+		ListenerBindAttempts: atomic.LoadUint64(&a.listenerBindAttempts), ListenerBindErrors: atomic.LoadUint64(&a.listenerBindErrors), ListenerStarts: atomic.LoadUint64(&a.listenerStarts), ListenerRecoveries: atomic.LoadUint64(&a.listenerRecoveries),
 		UpstreamCircuits: a.upstreamViews(cfg),
+		ForwardPolicies:  a.forwardPolicyViews(cfg),
+		ListenerStates:   listenerStates,
 	}
 }
 
@@ -2787,8 +3528,13 @@ func (a *App) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	gauge("dns_route_uptime_seconds", int64(time.Since(a.startedAt).Seconds()), "process uptime in seconds")
 	gauge("dns_route_cache_entries", s.CacheEntries, "number of cache entries")
 	gauge("dns_route_active_listeners", s.ActiveListeners, "number of active listeners")
+	gauge("dns_route_pending_listeners", s.PendingListeners, "number of listeners waiting for a successful bind")
+	gauge("dns_route_listener_freebind_enabled", boolToInt(s.ListenerFreeBind), "IP_FREEBIND/IPV6_FREEBIND enabled for newly created listeners")
+	gauge("dns_route_listener_retry_interval_seconds", int64(listenerRetryInterval.Seconds()), "listener bind retry interval in seconds")
 	gauge("dns_route_listen_addrs", s.ListenAddrs, "number of configured listen addresses")
-	gauge("dns_route_upstreams", s.Upstreams, "number of configured upstreams")
+	gauge("dns_route_upstreams", s.Upstreams, "number of configured default upstreams")
+	gauge("dns_route_forward_zones", s.ForwardZones, "number of configured conditional forwarding zones")
+	gauge("dns_route_forward_zone_upstreams", s.ForwardUpstreams, "number of upstream entries assigned to conditional forwarding zones")
 	gauge("dns_route_special_domains", s.SpecialDomains, "number of special domains")
 	gauge("dns_route_local_a_domains", s.LocalADomains, "number of local A domains")
 	gauge("dns_route_local_aaaa_domains", s.LocalAAAADomains, "number of local AAAA domains")
@@ -2812,10 +3558,47 @@ func (a *App) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	counter("dns_route_conntrack_reset_attempts_total", s.ConntrackResetAttempts, "conntrack reset attempts after an early DNS reply and route installation")
 	counter("dns_route_conntrack_reset_deleted_total", s.ConntrackResetDeleted, "conntrack flows deleted after destination route installation")
 	counter("dns_route_conntrack_reset_errors_total", s.ConntrackResetErrors, "conntrack reset errors")
+	counter("dns_route_listener_bind_attempts_total", s.ListenerBindAttempts, "listener socket bind attempts")
+	counter("dns_route_listener_bind_errors_total", s.ListenerBindErrors, "listener socket bind errors")
+	counter("dns_route_listener_starts_total", s.ListenerStarts, "listeners successfully started")
+	counter("dns_route_listener_recoveries_total", s.ListenerRecoveries, "pending listeners that later started successfully")
 	counter("dns_route_forward_errors_total", s.ForwardErrors, "forward errors")
 	fmt.Fprintf(w, "# HELP dns_route_lookup_cidr_total Team Cymru BGP prefix lookup counters; legacy metric name\n# TYPE dns_route_lookup_cidr_total counter\n")
 	fmt.Fprintf(w, "dns_route_lookup_cidr_total{result=\"attempts\"} %d\n", s.LookupCIDRAttempts)
 	fmt.Fprintf(w, "dns_route_lookup_cidr_total{result=\"failed\"} %d\n", s.LookupCIDRFailed)
+
+	fmt.Fprintln(w, "# HELP dns_route_listener_state Current listener state as a one-hot gauge")
+	fmt.Fprintln(w, "# TYPE dns_route_listener_state gauge")
+	fmt.Fprintln(w, "# HELP dns_route_listener_pending_attempts Number of failed bind attempts for a pending listener")
+	fmt.Fprintln(w, "# TYPE dns_route_listener_pending_attempts gauge")
+	for _, listener := range s.ListenerStates {
+		labels := fmt.Sprintf(
+			"network=\"%s\",addr=\"%s\",freebind=\"%t\"",
+			prometheusLabelValue(listener.Net),
+			prometheusLabelValue(listener.Addr),
+			listener.FreeBind,
+		)
+		for _, state := range []string{"active", "pending"} {
+			value := 0
+			if listener.State == state {
+				value = 1
+			}
+			fmt.Fprintf(w, "dns_route_listener_state{%s,state=\"%s\"} %d\n", labels, state, value)
+		}
+		fmt.Fprintf(w, "dns_route_listener_pending_attempts{%s} %d\n", labels, listener.Attempts)
+	}
+
+	fmt.Fprintln(w, "# HELP dns_route_forward_policy_selected_total Cache-miss queries forwarded through each outbound policy")
+	fmt.Fprintln(w, "# TYPE dns_route_forward_policy_selected_total counter")
+	fmt.Fprintln(w, "# HELP dns_route_forward_policy_results_total Forwarding results for each outbound policy")
+	fmt.Fprintln(w, "# TYPE dns_route_forward_policy_results_total counter")
+	for _, policy := range s.ForwardPolicies {
+		label := prometheusLabelValue(policy.Policy)
+		fmt.Fprintf(w, "dns_route_forward_policy_selected_total{policy=\"%s\"} %d\n", label, policy.Selected)
+		fmt.Fprintf(w, "dns_route_forward_policy_results_total{policy=\"%s\",result=\"success\"} %d\n", label, policy.Success)
+		fmt.Fprintf(w, "dns_route_forward_policy_results_total{policy=\"%s\",result=\"dns_error\"} %d\n", label, policy.DNSFailures)
+		fmt.Fprintf(w, "dns_route_forward_policy_results_total{policy=\"%s\",result=\"error\"} %d\n", label, policy.Errors)
+	}
 
 	gauge("dns_route_upstream_circuit_failure_threshold", upstreamFailureThreshold, "consecutive upstream failures required to open a circuit")
 	gauge("dns_route_upstream_circuit_base_backoff_seconds", int64(upstreamCircuitBaseBackoff.Seconds()), "initial upstream circuit cooldown in seconds")

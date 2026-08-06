@@ -17,6 +17,8 @@ button { padding: 7px 11px; cursor: pointer; }
 .badge.closed { background: #2e7d3230; }
 .badge.open { background: #c6282830; }
 .badge.half_open { background: #ef6c0030; }
+.badge.active { background: #2e7d3230; }
+.badge.pending { background: #ef6c0030; }
 .muted { opacity: .72; }
 .error-text { max-width: 520px; overflow-wrap: anywhere; }
 .nowrap { white-space: nowrap; }
@@ -32,6 +34,7 @@ button { padding: 7px 11px; cursor: pointer; }
     <tr><td>Uptime</td><td>{{.Uptime}}</td></tr>
     <tr><td>Cache entries</td><td>{{.CacheEntries}}</td></tr>
     <tr><td>Active listeners</td><td>{{.ActiveListeners}}</td></tr>
+    <tr><td>Pending listeners</td><td>{{.PendingListeners}}</td></tr>
     <tr><td>Route snapshot entries</td><td>{{.RouteSnapshot}}</td></tr>
     <tr><td>IP cache entries</td><td>{{.IPCacheEntries}}</td></tr>
     <tr><td>Route prefix cache entries</td><td>{{.CIDRCacheEntries}}</td></tr>
@@ -47,12 +50,15 @@ button { padding: 7px 11px; cursor: pointer; }
   <h2>Configuration</h2>
   <table>
     <tr><td>Listen addrs</td><td>{{.ListenAddrs}}</td></tr>
-    <tr><td>Upstreams</td><td>{{.Upstreams}}</td></tr>
+    <tr><td>Default upstreams</td><td>{{.Upstreams}}</td></tr>
+    <tr><td>Conditional forward zones</td><td>{{.ForwardZones}}</td></tr>
+    <tr><td>Conditional forward upstreams</td><td>{{.ForwardUpstreams}}</td></tr>
     <tr><td>Special domains</td><td>{{.SpecialDomains}}</td></tr>
     <tr><td>Local A domains</td><td>{{.LocalADomains}}</td></tr>
     <tr><td>Local AAAA domains</td><td>{{.LocalAAAADomains}}</td></tr>
     <tr><td>Team Cymru prefix lookup</td><td>{{.LookupCIDR}}</td></tr>
     <tr><td>Reply before route</td><td>{{.ReplyBeforeRoute}}</td></tr>
+    <tr><td>Listener freebind</td><td>{{.ListenerFreeBind}}</td></tr>
     <tr><td>Route IPv4</td><td>{{.RouteIPv4}}</td></tr>
     <tr><td>Route IPv6</td><td>{{.RouteIPv6}}</td></tr>
     <tr><td>Route table</td><td>{{.RouteTable}}</td></tr>
@@ -79,8 +85,39 @@ button { padding: 7px 11px; cursor: pointer; }
     <tr><td>Conntrack reset attempts</td><td>{{.ConntrackResetAttempts}}</td></tr>
     <tr><td>Conntrack flows deleted</td><td>{{.ConntrackResetDeleted}}</td></tr>
     <tr><td>Conntrack reset errors</td><td>{{.ConntrackResetErrors}}</td></tr>
+    <tr><td>Listener bind attempts</td><td>{{.ListenerBindAttempts}}</td></tr>
+    <tr><td>Listener bind errors</td><td>{{.ListenerBindErrors}}</td></tr>
+    <tr><td>Listener starts</td><td>{{.ListenerStarts}}</td></tr>
+    <tr><td>Listener recoveries</td><td>{{.ListenerRecoveries}}</td></tr>
     <tr><td>Team Cymru lookup attempts</td><td>{{.LookupCIDRAttempts}}</td></tr>
     <tr><td>Team Cymru lookup failed</td><td>{{.LookupCIDRFailed}}</td></tr>
+  </table>
+</div>
+
+<div class="card">
+  <h2>Outbound policies</h2>
+  <table>
+    <tr><th>Policy</th><th>Selected</th><th>Success</th><th>DNS errors</th><th>Transport errors</th></tr>
+    {{range .ForwardPolicies}}
+    <tr><td>{{if eq .Policy "default"}}default{{else}}*.{{.Policy}}{{end}}</td><td>{{.Selected}}</td><td>{{.Success}}</td><td>{{.DNSFailures}}</td><td>{{.Errors}}</td></tr>
+    {{else}}<tr><td colspan="5" class="muted">No forwarding policies.</td></tr>{{end}}
+  </table>
+</div>
+
+<div class="card">
+  <h2>Listeners</h2>
+  <table>
+    <tr><th>Network</th><th>Address</th><th>State</th><th>FreeBind</th><th>Attempts / time</th><th>Last error</th></tr>
+    {{range .ListenerStates}}
+    <tr>
+      <td>{{.Net}}</td>
+      <td>{{.Addr}}</td>
+      <td><span class="badge {{.State}}">{{.State}}</span></td>
+      <td>{{.FreeBind}}</td>
+      <td>{{if eq .State "active"}}started: {{.StartedAt}}{{else}}attempts: {{.Attempts}}<br>last: {{.LastAttempt}}{{end}}</td>
+      <td class="error-text">{{if .LastError}}{{.LastError}}{{else}}<span class="muted">—</span>{{end}}</td>
+    </tr>
+    {{else}}<tr><td colspan="6" class="muted">No listener sockets configured.</td></tr>{{end}}
   </table>
 </div>
 
@@ -88,12 +125,13 @@ button { padding: 7px 11px; cursor: pointer; }
   <h2>Upstream circuit breakers</h2>
   <table>
     <tr>
-      <th>Upstream</th><th>Protocol</th><th>State</th><th>Consecutive failures</th>
+      <th>Upstream</th><th>Scopes</th><th>Protocol</th><th>State</th><th>Consecutive failures</th>
       <th>Requests</th><th>Skipped</th><th>Open / recover</th><th>Last activity</th><th>Last error</th>
     </tr>
     {{range .UpstreamCircuits}}
     <tr>
       <td><strong>{{.Addr}}</strong><br><small>{{.Endpoint}}</small></td>
+      <td>{{.Scopes}}</td>
       <td>{{.ConfiguredProto}} → {{.Proto}}</td>
       <td class="nowrap"><span class="badge {{.State}}">{{.State}}</span>{{if ne .OpenRemaining "—"}}<br><small>{{.OpenRemaining}} remaining</small>{{end}}</td>
       <td>{{.ConsecutiveFailures}}</td>
@@ -103,7 +141,7 @@ button { padding: 7px 11px; cursor: pointer; }
       <td>success: {{.LastSuccess}}<br>failure: {{.LastFailure}}</td>
       <td class="error-text">{{if .LastError}}{{.LastError}}{{else}}<span class="muted">—</span>{{end}}</td>
     </tr>
-    {{else}}<tr><td colspan="9" class="muted">No upstreams configured.</td></tr>{{end}}
+    {{else}}<tr><td colspan="10" class="muted">No upstreams configured.</td></tr>{{end}}
   </table>
 </div>
 </body>
