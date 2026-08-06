@@ -185,7 +185,7 @@ func TestStatsTemplateRendersBGPStatus(t *testing.T) {
 	if footerIndex < 0 {
 		t.Fatal("statistics HTML is missing the shared footer")
 	}
-	for _, action := range []string{`action="/reload"`, `action="/routes/reload"`, `href="/statistics" class="active">Statistics</a>`} {
+	for _, action := range []string{`<details class="reload-menu">`, `<summary>Reload</summary>`, `action="/reload"`, `action="/routes/reload"`, `action="/record/sources/refresh"`, `href="/statistics" class="active">Statistics</a>`} {
 		index := strings.Index(html, action)
 		if index < 0 || index > headerEnd {
 			t.Fatalf("%q is not located in the header", action)
@@ -194,10 +194,13 @@ func TestStatsTemplateRendersBGPStatus(t *testing.T) {
 			t.Fatalf("%q unexpectedly appears in the footer", action)
 		}
 	}
-	for _, footerItem := range []string{`href="/metrics"`, `href="/routes/errors"`, `action="/record/sources/refresh"`} {
+	for _, footerItem := range []string{`href="/metrics"`, `href="/routes/errors"`} {
 		if index := strings.Index(html, footerItem); index < footerIndex {
 			t.Fatalf("%q is not located in the footer", footerItem)
 		}
+	}
+	if strings.Contains(html[footerIndex:], `action="/record/sources/refresh"`) {
+		t.Fatal("Reload sources action unexpectedly appears in the footer")
 	}
 	for _, unwanted := range []string{
 		"dns-route statistics</h1>",

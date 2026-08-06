@@ -90,8 +90,10 @@ func TestDNSRecordsPageUsesFilePickerAndUnifiedSourceBlock(t *testing.T) {
 		`41 domains · page 2 of 3`,
 		`/dns-records?q=db&amp;page=3`,
 		`<h2>External CSV sources</h2>`,
+		`<details class="reload-menu">`,
+		`<summary>Reload</summary>`,
 		`action="/record/sources/refresh"`,
-		`Refresh sources`,
+		`Reload sources`,
 		`Reload config reuses the current in-memory source snapshot`,
 		`overridden`,
 		`active`,
@@ -108,9 +110,13 @@ func TestDNSRecordsPageUsesFilePickerAndUnifiedSourceBlock(t *testing.T) {
 	if strings.Contains(html, `href="/dns-records">Clear</a>`) {
 		t.Fatal("search clear control is still rendered as a link")
 	}
+	headerEnd := strings.Index(html, `</header>`)
 	footerIndex := strings.Index(html, `<footer class="site-footer">`)
 	refreshIndex := strings.Index(html, `action="/record/sources/refresh"`)
-	if footerIndex < 0 || refreshIndex < footerIndex {
-		t.Fatal("Refresh sources action is not located in the shared footer")
+	if headerEnd < 0 || refreshIndex < 0 || refreshIndex > headerEnd {
+		t.Fatal("Reload sources action is not located in the shared header")
+	}
+	if footerIndex < 0 || strings.Index(html[footerIndex:], `action="/record/sources/refresh"`) >= 0 {
+		t.Fatal("Reload sources action unexpectedly remains in the footer")
 	}
 }

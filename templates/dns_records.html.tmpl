@@ -99,7 +99,7 @@
     <label class="checkbox-field"><input type="checkbox" name="no_data_only" value="1"> NO_DATA only</label>
     <button type="submit">Add / update source</button>
   </form>
-  <p><small>Reload config reuses the current in-memory source snapshot and performs no file or network I/O. Refresh sources explicitly downloads HTTP sources and rereads local files, then atomically replaces the snapshot. If refresh fails, the previous snapshot remains active. Later sources override earlier sources, while enabled local database records have final priority per name and type. NO_DATA only ignores address columns and prevents DNS-address injection.</small></p>
+  <p><small>Reload config reuses the current in-memory source snapshot and performs no file or network I/O. Reload sources explicitly downloads HTTP sources and rereads local files, then atomically replaces the snapshot. If source reload fails, the previous snapshot remains active. Later sources override earlier sources, while enabled local database records have final priority per name and type. NO_DATA only ignores address columns and prevents DNS-address injection.</small></p>
 
   <table>
     <tr><th>ID</th><th>Location</th><th>Kind</th><th>Loaded</th><th>Mode</th><th>Actions</th></tr>
