@@ -259,7 +259,8 @@ type routeErrorDiagnostic struct {
 }
 
 type RouteManager struct {
-	app *App
+	app            *App
+	prefixResolver PrefixResolver
 
 	ipMu    sync.RWMutex
 	ipCache map[string]routeCacheEntry
@@ -510,6 +511,7 @@ func main() {
 func NewRouteManager(app *App, workers int) *RouteManager {
 	rm := &RouteManager{
 		app:             app,
+		prefixResolver:  NewCymruPrefixResolver(app.lookupCymruTXT),
 		ipCache:         make(map[string]routeCacheEntry),
 		cidrCache:       make(map[string]routeCacheEntry),
 		resetAfterApply: make(map[string]struct{}),
@@ -650,7 +652,13 @@ func (rm *RouteManager) processIPOnce(ip string) error {
 	}
 	ip = parsed.String()
 
-	defaultCIDR := defaultCIDRForIP(parsed)
+	addr, ok := netip.AddrFromSlice(parsed)
+	if !ok {
+		return fmt.Errorf("invalid route IP %q", ip)
+	}
+	addr = addr.Unmap()
+	defaultResolution := hostPrefixResolution(addr)
+	defaultCIDR := defaultResolution.Prefix.String()
 	if rm.ipCoveredBySnapshot(parsed) {
 		rm.completeIPApplied(ip, defaultCIDR, false)
 		return nil
@@ -661,16 +669,17 @@ func (rm *RouteManager) processIPOnce(ip string) error {
 		atomic.AddUint64(&rm.app.lookupCIDRAttempts, 1)
 		val, _, _ := rm.lookupGroup.Do(ip, func() (any, error) {
 			if rm.ipCoveredBySnapshot(parsed) {
-				return defaultCIDR, nil
+				return defaultResolution, nil
 			}
-			c := rm.app.lookupCIDR(ip)
-			if c == "" {
+			resolution, resolveErr := rm.prefixResolver.Resolve(context.Background(), addr)
+			if resolveErr != nil || resolution.Source != PrefixSourceCymru {
 				atomic.AddUint64(&rm.app.lookupCIDRFailed, 1)
-				return defaultCIDR, nil
+				return defaultResolution, nil
 			}
-			return c, nil
+			return resolution, nil
 		})
-		cidr = val.(string)
+		resolution := val.(PrefixResolution)
+		cidr = resolution.Prefix.String()
 	}
 
 	rm.ipMu.Lock()
@@ -2988,15 +2997,9 @@ func (a *App) isSpecial(name string) bool {
 	return false
 }
 
-func (a *App) lookupCIDR(ip string) string {
-	parsed := normalizeRouteIP(net.ParseIP(ip))
-	if parsed == nil {
-		return ""
-	}
-
-	queryName := cymruQueryName(parsed)
-	if queryName == "" {
-		return ""
+func (a *App) lookupCymruTXT(ctx context.Context, queryName string) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
 	req := new(dns.Msg)
@@ -3005,71 +3008,28 @@ func (a *App) lookupCIDR(ip string) string {
 
 	cfg := a.getConfig()
 	resp, err := a.forwardDNSWithPolicy(req, buildForwardPolicy("default", "", defaultUpstreamTargets(cfg)))
-	if err != nil || resp == nil || resp.Rcode != dns.RcodeSuccess {
-		return ""
+	if err != nil {
+		return nil, err
+	}
+	if resp == nil {
+		return nil, errors.New("empty Team Cymru DNS response")
+	}
+	if resp.Rcode != dns.RcodeSuccess {
+		return nil, fmt.Errorf("Team Cymru DNS response code: %s", dns.RcodeToString[resp.Rcode])
 	}
 
+	result := make([]string, 0, len(resp.Answer))
 	for _, rr := range resp.Answer {
 		txt, ok := rr.(*dns.TXT)
 		if !ok {
 			continue
 		}
-		if prefix := parseCymruPrefix(strings.Join(txt.Txt, ""), parsed); prefix != "" {
-			return prefix
-		}
+		result = append(result, strings.Join(txt.Txt, ""))
 	}
-	return ""
-}
-
-func cymruQueryName(ip net.IP) string {
-	if v4 := ip.To4(); v4 != nil {
-		return fmt.Sprintf("%d.%d.%d.%d.origin.asn.cymru.com.", v4[3], v4[2], v4[1], v4[0])
+	if len(result) == 0 {
+		return nil, errors.New("Team Cymru DNS response contains no TXT records")
 	}
-	v6 := ip.To16()
-	if v6 == nil {
-		return ""
-	}
-	const hex = "0123456789abcdef"
-	labels := make([]byte, 0, 64+len("origin6.asn.cymru.com."))
-	for i := len(v6) - 1; i >= 0; i-- {
-		b := v6[i]
-		labels = append(labels, hex[b&0x0f], '.', hex[b>>4], '.')
-	}
-	labels = append(labels, "origin6.asn.cymru.com."...)
-	return string(labels)
-}
-
-func parseCymruPrefix(txt string, ip net.IP) string {
-	fields := strings.Split(txt, "|")
-	if len(fields) < 2 {
-		return ""
-	}
-	prefix := strings.TrimSpace(fields[1])
-	_, netw, err := net.ParseCIDR(prefix)
-	if err != nil || netw == nil {
-		return ""
-	}
-
-	if ip4 := ip.To4(); ip4 != nil {
-		if netw.IP.To4() == nil || !netw.Contains(ip4) {
-			return ""
-		}
-		ones, bits := netw.Mask.Size()
-		if bits != 32 || ones >= 32 {
-			return ""
-		}
-		return netw.String()
-	}
-
-	ip16 := ip.To16()
-	if ip16 == nil || ip.To4() != nil || netw.IP.To4() != nil || !netw.Contains(ip16) {
-		return ""
-	}
-	ones, bits := netw.Mask.Size()
-	if bits != 128 || ones >= 128 {
-		return ""
-	}
-	return netw.String()
+	return result, nil
 }
 
 const maxUDPResponseSize = 1232
