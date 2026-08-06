@@ -42,7 +42,9 @@ The default `route_mode` is `kernel`, so upgrading does not enable BGP automatic
 - `bgp` — announce routes only through the embedded GoBGP speaker. The in-memory table is rebuilt from DNS answers after a full process restart.
 - `kernel+bgp` — install the exact prefix in the configured Linux route table first, then announce the same prefix through BGP. Startup and the manual route reload mirror the configured kernel table into BGP.
 
-BGP settings are not yet exposed in the web form. They can be written to the existing `settings` table. Prefer doing this while the service is stopped. Example for IPv4 `kernel+bgp`:
+BGP settings are available in the web admin form. The form validates the route mode, table number, ASNs, router ID, peer/source addresses, next hops and multihop TTL before saving. The configured TCP MD5 password is never rendered back into HTML: leave the password field empty to keep it, or use the clear checkbox to remove it.
+
+The same values can still be written directly to the existing `settings` table. Example for IPv4 `kernel+bgp`:
 
 ```sql
 INSERT INTO settings(key, value) VALUES
@@ -61,3 +63,5 @@ ON CONFLICT(key) DO UPDATE SET value = excluded.value;
 For IPv6 routing, set `bgp_next_hop_v6` to the address that the peer must use as next hop. `bgp_next_hop_v4` and `bgp_next_hop_v6` are required only for enabled route families. `bgp_local_address` is optional. A multihop TTL greater than `1` enables eBGP multihop.
 
 After an offline database change, start or restart the service. If the database was edited while dns-route was running, send `POST /reload`. `POST /routes/reload` rereads the configured kernel table and mirrors it into BGP in `kernel+bgp` mode without reloading unrelated configuration.
+
+The admin and statistics pages show the peer state, backend readiness, ephemeral desired-prefix count and embedded GoBGP Loc-RIB count. Prometheus exports the same state through `dns_route_bgp_*` metrics and exposes the selected mode through `dns_route_route_mode_info`.

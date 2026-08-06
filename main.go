@@ -387,6 +387,26 @@ type forwardPolicyView struct {
 	Errors      uint64
 }
 
+type bgpStatusView struct {
+	Enabled            bool
+	Configured         bool
+	State              string
+	Established        bool
+	Ready              bool
+	RequireEstablished bool
+	DesiredPrefixes    int
+	AnnouncedPrefixes  int
+	LocalASN           uint32
+	PeerASN            uint32
+	PeerAddress        string
+	LocalAddress       string
+	RouterID           string
+	NextHopV4          string
+	NextHopV6          string
+	MultihopTTL        uint32
+	PasswordConfigured bool
+}
+
 type pageData struct {
 	Config         *Config
 	Settings       map[string]string
@@ -396,6 +416,7 @@ type pageData struct {
 	ForwardZones   []forwardZoneView
 	SpecialDomains []string
 	Records        []recordRow
+	BGP            bgpStatusView
 	Message        string
 }
 
@@ -424,9 +445,11 @@ type statsData struct {
 	LookupCIDR       bool
 	ReplyBeforeRoute bool
 	ListenerFreeBind bool
+	RouteMode        string
 	RouteIPv4        bool
 	RouteIPv6        bool
 	RouteTable       int
+	BGP              bgpStatusView
 	WGInterface      string
 	WGGateway        string
 	WGGatewayV4      string
@@ -983,6 +1006,23 @@ func (rm *RouteManager) ReconfigureBackends(ctx context.Context, cfg *Config) er
 	return nil
 }
 
+func (rm *RouteManager) BGPStatus() BGPBackendStatus {
+	if rm == nil {
+		return BGPBackendStatus{}
+	}
+	rm.backendMu.RLock()
+	defer rm.backendMu.RUnlock()
+	backend := rm.backendByName(BGPRouteBackendName)
+	if backend == nil {
+		return BGPBackendStatus{}
+	}
+	provider, ok := backend.(interface{ Status() BGPBackendStatus })
+	if !ok {
+		return BGPBackendStatus{Configured: true}
+	}
+	return provider.Status()
+}
+
 func (rm *RouteManager) BackendSnapshotSize() int {
 	rm.backendMu.RLock()
 	defer rm.backendMu.RUnlock()
@@ -1068,6 +1108,7 @@ func (a *App) validateTemplates() error {
 		ForwardZones:   a.forwardZoneViews(cfg),
 		SpecialDomains: []string{},
 		Records:        []recordRow{},
+		BGP:            a.bgpStatus(cfg),
 		Message:        a.adminAddr,
 	}
 	if err := templates.ExecuteTemplate(io.Discard, "admin.html.tmpl", adminData); err != nil {
@@ -1108,54 +1149,15 @@ func loadConfigFromDB(db *sql.DB) (*Config, error) {
 	cfg.WGGatewayV4 = settings["wg_gateway_v4"]
 	cfg.WGGatewayV6 = settings["wg_gateway_v6"]
 	cfg.WGInterface = settings["wg_interface"]
-	mode, err := parseRouteMode(settings["route_mode"])
+	routing, err := parseRoutingSettings(settings)
 	if err != nil {
 		return nil, err
 	}
-	cfg.RouteMode = mode
-	cfg.BGP.RouterID = strings.TrimSpace(settings["bgp_router_id"])
-	cfg.BGP.PeerAddress = strings.TrimSpace(settings["bgp_peer_address"])
-	cfg.BGP.LocalAddress = strings.TrimSpace(settings["bgp_local_address"])
-	cfg.BGP.NextHopV4 = strings.TrimSpace(settings["bgp_next_hop_v4"])
-	cfg.BGP.NextHopV6 = strings.TrimSpace(settings["bgp_next_hop_v6"])
-	cfg.BGP.Password = settings["bgp_password"]
-	if v := strings.TrimSpace(settings["bgp_local_asn"]); v != "" {
-		n, err := strconv.ParseUint(v, 10, 32)
-		if err != nil || n == 0 {
-			return nil, fmt.Errorf("invalid bgp_local_asn=%q", v)
-		}
-		cfg.BGP.LocalASN = uint32(n)
-	}
-	if v := strings.TrimSpace(settings["bgp_peer_asn"]); v != "" {
-		n, err := strconv.ParseUint(v, 10, 32)
-		if err != nil || n == 0 {
-			return nil, fmt.Errorf("invalid bgp_peer_asn=%q", v)
-		}
-		cfg.BGP.PeerASN = uint32(n)
-	}
-	if v := strings.TrimSpace(settings["bgp_multihop_ttl"]); v != "" {
-		n, err := strconv.ParseUint(v, 10, 8)
-		if err != nil || n == 0 {
-			return nil, fmt.Errorf("invalid bgp_multihop_ttl=%q", v)
-		}
-		cfg.BGP.MultihopTTL = uint32(n)
-	}
-	if v := strings.TrimSpace(settings["bgp_require_established"]); v != "" {
-		cfg.BGP.RequireEstablished = isTrueString(v)
-	}
-	if v := strings.TrimSpace(settings["route_table"]); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil {
-			return nil, fmt.Errorf("invalid route_table=%q: %w", v, err)
-		}
-		cfg.RouteTable = n
-	}
-	if v := strings.TrimSpace(settings["route_ipv4"]); v != "" {
-		cfg.RouteIPv4 = isTrueString(v)
-	}
-	if v := strings.TrimSpace(settings["route_ipv6"]); v != "" {
-		cfg.RouteIPv6 = isTrueString(v)
-	}
+	cfg.RouteMode = routing.Mode
+	cfg.RouteTable = routing.Table
+	cfg.RouteIPv4 = routing.IPv4
+	cfg.RouteIPv6 = routing.IPv6
+	cfg.BGP = routing.BGP
 	if v := strings.TrimSpace(settings["local_record_ttl"]); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil || n < 0 {
@@ -1171,11 +1173,6 @@ func loadConfigFromDB(db *sql.DB) (*Config, error) {
 	}
 	if v := strings.TrimSpace(settings["listener_freebind"]); v != "" {
 		cfg.ListenerFreeBind = isTrueString(v)
-	}
-	if cfg.RouteMode.UsesBGP() {
-		if err := cfg.BGP.Validate(cfg.RouteIPv4, cfg.RouteIPv6); err != nil {
-			return nil, fmt.Errorf("invalid BGP settings: %w", err)
-		}
 	}
 	if err := readListenAddrs(db, cfg); err != nil {
 		return nil, err
@@ -1564,7 +1561,46 @@ func buildListenerSpecs(addrs []string) []listenerSpec {
 	return specs
 }
 
-func (a *App) getConfig() *Config    { a.cfgMu.RLock(); defer a.cfgMu.RUnlock(); return a.cfg }
+func (a *App) getConfig() *Config { a.cfgMu.RLock(); defer a.cfgMu.RUnlock(); return a.cfg }
+func (a *App) bgpStatus(cfg *Config) bgpStatusView {
+	view := bgpStatusView{State: "disabled"}
+	if cfg == nil {
+		return view
+	}
+	view.Enabled = cfg.RouteMode.UsesBGP()
+	view.LocalASN = cfg.BGP.LocalASN
+	view.PeerASN = cfg.BGP.PeerASN
+	view.PeerAddress = cfg.BGP.PeerAddress
+	view.LocalAddress = cfg.BGP.LocalAddress
+	view.RouterID = cfg.BGP.RouterID
+	view.NextHopV4 = cfg.BGP.NextHopV4
+	view.NextHopV6 = cfg.BGP.NextHopV6
+	view.MultihopTTL = cfg.BGP.MultihopTTL
+	view.RequireEstablished = cfg.BGP.RequireEstablished
+	view.PasswordConfigured = cfg.BGP.Password != ""
+	if !view.Enabled {
+		return view
+	}
+
+	status := BGPBackendStatus{}
+	if a != nil && a.routeMgr != nil {
+		status = a.routeMgr.BGPStatus()
+	}
+	view.Configured = status.Configured
+	view.Established = status.Established
+	view.Ready = status.Ready
+	view.DesiredPrefixes = status.DesiredPrefixes
+	view.AnnouncedPrefixes = status.AnnouncedPrefixes
+	if !status.Configured {
+		view.State = "unavailable"
+	} else if status.Established {
+		view.State = "established"
+	} else {
+		view.State = "down"
+	}
+	return view
+}
+
 func (a *App) setConfig(cfg *Config) { a.cfgMu.Lock(); a.cfg = cfg; a.cfgMu.Unlock() }
 
 func (a *App) startCacheCleanup() {
@@ -1908,7 +1944,7 @@ func (a *App) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		renderError(w, 500, err)
 		return
 	}
-	data := pageData{Config: cfg, Settings: settings, ListenAddrs: listenAddrs, ListenerStates: a.listenerViews(), Upstreams: upstreams, ForwardZones: a.forwardZoneViews(cfg), SpecialDomains: specials, Records: records, Message: a.adminAddr}
+	data := pageData{Config: cfg, Settings: settings, ListenAddrs: listenAddrs, ListenerStates: a.listenerViews(), Upstreams: upstreams, ForwardZones: a.forwardZoneViews(cfg), SpecialDomains: specials, Records: records, BGP: a.bgpStatus(cfg), Message: a.adminAddr}
 	if err := templates.ExecuteTemplate(w, "admin.html.tmpl", data); err != nil {
 		renderError(w, 500, err)
 	}
@@ -1977,32 +2013,76 @@ func (a *App) handleSettingsSave(w http.ResponseWriter, r *http.Request) {
 		renderError(w, http.StatusBadRequest, fmt.Errorf("parse settings form: %w", err))
 		return
 	}
-	lookupCIDR := boolSetting(formBoolean(r, "lookup_cidr"))
-	replyBeforeRoute := boolSetting(formBoolean(r, "reply_before_route"))
-	listenerFreeBind := boolSetting(formBoolean(r, "listener_freebind"))
-	routeIPv4 := boolSetting(formBoolean(r, "route_ipv4"))
-	routeIPv6 := boolSetting(formBoolean(r, "route_ipv6"))
-	settings := map[string]string{
-		"wg_interface":       strings.TrimSpace(r.FormValue("wg_interface")),
-		"wg_gateway":         strings.TrimSpace(r.FormValue("wg_gateway")),
-		"wg_gateway_v4":      strings.TrimSpace(r.FormValue("wg_gateway_v4")),
-		"wg_gateway_v6":      strings.TrimSpace(r.FormValue("wg_gateway_v6")),
-		"route_table":        strings.TrimSpace(r.FormValue("route_table")),
-		"route_ipv4":         routeIPv4,
-		"route_ipv6":         routeIPv6,
-		"local_record_ttl":   strings.TrimSpace(r.FormValue("local_record_ttl")),
-		"lookup_cidr":        lookupCIDR,
-		"reply_before_route": replyBeforeRoute,
-		"listener_freebind":  listenerFreeBind,
+
+	stored, err := readSettings(a.db)
+	if err != nil {
+		renderError(w, http.StatusInternalServerError, err)
+		return
 	}
-	for k, v := range settings {
-		if _, err := a.db.Exec(`INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`, k, v); err != nil {
-			renderError(w, 500, err)
+	password := r.FormValue("bgp_password")
+	switch {
+	case formBoolean(r, "bgp_password_clear"):
+		password = ""
+	case password == "":
+		// Never render the configured secret into HTML. An empty password field
+		// therefore means "keep the current value" unless clear is selected.
+		password = stored["bgp_password"]
+	}
+
+	settings := map[string]string{
+		"wg_interface":            strings.TrimSpace(r.FormValue("wg_interface")),
+		"wg_gateway":              strings.TrimSpace(r.FormValue("wg_gateway")),
+		"wg_gateway_v4":           strings.TrimSpace(r.FormValue("wg_gateway_v4")),
+		"wg_gateway_v6":           strings.TrimSpace(r.FormValue("wg_gateway_v6")),
+		"route_mode":              strings.TrimSpace(r.FormValue("route_mode")),
+		"route_table":             strings.TrimSpace(r.FormValue("route_table")),
+		"route_ipv4":              boolSetting(formBoolean(r, "route_ipv4")),
+		"route_ipv6":              boolSetting(formBoolean(r, "route_ipv6")),
+		"bgp_local_asn":           strings.TrimSpace(r.FormValue("bgp_local_asn")),
+		"bgp_router_id":           strings.TrimSpace(r.FormValue("bgp_router_id")),
+		"bgp_peer_address":        strings.TrimSpace(r.FormValue("bgp_peer_address")),
+		"bgp_peer_asn":            strings.TrimSpace(r.FormValue("bgp_peer_asn")),
+		"bgp_local_address":       strings.TrimSpace(r.FormValue("bgp_local_address")),
+		"bgp_next_hop_v4":         strings.TrimSpace(r.FormValue("bgp_next_hop_v4")),
+		"bgp_next_hop_v6":         strings.TrimSpace(r.FormValue("bgp_next_hop_v6")),
+		"bgp_password":            password,
+		"bgp_multihop_ttl":        strings.TrimSpace(r.FormValue("bgp_multihop_ttl")),
+		"bgp_require_established": boolSetting(formBoolean(r, "bgp_require_established")),
+		"local_record_ttl":        strings.TrimSpace(r.FormValue("local_record_ttl")),
+		"lookup_cidr":             boolSetting(formBoolean(r, "lookup_cidr")),
+		"reply_before_route":      boolSetting(formBoolean(r, "reply_before_route")),
+		"listener_freebind":       boolSetting(formBoolean(r, "listener_freebind")),
+	}
+	if _, err := parseRoutingSettings(settings); err != nil {
+		renderError(w, http.StatusBadRequest, err)
+		return
+	}
+	if v := settings["local_record_ttl"]; v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			renderError(w, http.StatusBadRequest, fmt.Errorf("invalid local_record_ttl=%q", v))
 			return
 		}
 	}
+
+	tx, err := a.db.Begin()
+	if err != nil {
+		renderError(w, http.StatusInternalServerError, err)
+		return
+	}
+	for k, v := range settings {
+		if _, err := tx.Exec(`INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`, k, v); err != nil {
+			_ = tx.Rollback()
+			renderError(w, http.StatusInternalServerError, err)
+			return
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		renderError(w, http.StatusInternalServerError, err)
+		return
+	}
 	if err := a.reloadConfig(); err != nil {
-		renderError(w, 500, err)
+		renderError(w, http.StatusInternalServerError, err)
 		return
 	}
 	http.Redirect(w, r, "/", http.StatusSeeOther)
@@ -3569,6 +3649,7 @@ func (a *App) statsSnapshot() statsData {
 	pendingListeners := len(a.pendingListeners)
 	a.srvMu.Unlock()
 	listenerStates := a.listenerViews()
+	bgp := a.bgpStatus(cfg)
 	routeSnapshot := a.routeMgr.BackendSnapshotSize()
 	a.routeMgr.ipMu.RLock()
 	ipEntries := len(a.routeMgr.ipCache)
@@ -3584,7 +3665,7 @@ func (a *App) statsSnapshot() statsData {
 		PendingListeners: pendingListeners,
 		ListenAddrs:      len(cfg.ListenAddrs), Upstreams: len(cfg.Upstreams), ForwardZones: len(cfg.ForwardZones), ForwardUpstreams: forwardZoneUpstreamCount(cfg), SpecialDomains: len(cfg.SpecialDomains),
 		LocalADomains: len(cfg.LocalA), LocalAAAADomains: len(cfg.LocalAAAA), LookupCIDR: cfg.LookupCIDR,
-		ReplyBeforeRoute: cfg.ReplyBeforeRoute, ListenerFreeBind: cfg.ListenerFreeBind, RouteIPv4: cfg.RouteIPv4, RouteIPv6: cfg.RouteIPv6, RouteTable: cfg.RouteTable, WGInterface: cfg.WGInterface, WGGateway: cfg.WGGateway, WGGatewayV4: cfg.WGGatewayV4, WGGatewayV6: cfg.WGGatewayV6,
+		ReplyBeforeRoute: cfg.ReplyBeforeRoute, ListenerFreeBind: cfg.ListenerFreeBind, RouteMode: string(cfg.RouteMode), RouteIPv4: cfg.RouteIPv4, RouteIPv6: cfg.RouteIPv6, RouteTable: cfg.RouteTable, BGP: bgp, WGInterface: cfg.WGInterface, WGGateway: cfg.WGGateway, WGGatewayV4: cfg.WGGatewayV4, WGGatewayV6: cfg.WGGatewayV6,
 		RouteSnapshot: routeSnapshot, IPCacheEntries: ipEntries, CIDRCacheEntries: cidrEntries,
 		TotalQueries: atomic.LoadUint64(&a.totalQueries), CacheHits: atomic.LoadUint64(&a.cacheHits), CacheMisses: atomic.LoadUint64(&a.cacheMisses),
 		LocalAnswers: atomic.LoadUint64(&a.localAnswers), ForwardedOK: atomic.LoadUint64(&a.forwardedOK), ServfailCount: atomic.LoadUint64(&a.servfailCount),
@@ -3632,6 +3713,20 @@ func (a *App) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	gauge("dns_route_route_ipv4_enabled", boolToInt(s.RouteIPv4), "IPv4 route programming enabled")
 	gauge("dns_route_route_ipv6_enabled", boolToInt(s.RouteIPv6), "IPv6 route programming enabled")
 	gauge("dns_route_route_table", s.RouteTable, "configured route table")
+	fmt.Fprintln(w, "# HELP dns_route_route_mode_info Configured route mode as a one-hot gauge")
+	fmt.Fprintln(w, "# TYPE dns_route_route_mode_info gauge")
+	for _, mode := range []string{string(RouteModeKernel), string(RouteModeBGP), string(RouteModeKernelBGP)} {
+		value := 0
+		if s.RouteMode == mode {
+			value = 1
+		}
+		fmt.Fprintf(w, "dns_route_route_mode_info{mode=%q} %d\n", mode, value)
+	}
+	gauge("dns_route_bgp_enabled", boolToInt(s.BGP.Enabled), "embedded BGP backend enabled")
+	gauge("dns_route_bgp_session_established", boolToInt(s.BGP.Established), "BGP peer session is Established")
+	gauge("dns_route_bgp_backend_ready", boolToInt(s.BGP.Ready), "BGP backend readiness under the configured established-session policy")
+	gauge("dns_route_bgp_desired_prefixes", s.BGP.DesiredPrefixes, "prefixes in the ephemeral desired BGP set")
+	gauge("dns_route_bgp_loc_rib_prefixes", s.BGP.AnnouncedPrefixes, "prefixes accepted by the embedded GoBGP Loc-RIB")
 	gauge("dns_route_route_snapshot_entries", s.RouteSnapshot, "route snapshot entries")
 	gauge("dns_route_route_ip_cache_entries", s.IPCacheEntries, "route manager IP cache entries")
 	gauge("dns_route_route_cidr_cache_entries", s.CIDRCacheEntries, "route manager prefix cache entries; legacy metric name")

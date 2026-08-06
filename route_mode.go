@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"net/netip"
+	"strconv"
 	"strings"
 )
 
@@ -33,6 +34,87 @@ func (m RouteMode) UsesKernel() bool {
 
 func (m RouteMode) UsesBGP() bool {
 	return m == RouteModeBGP || m == RouteModeKernelBGP
+}
+
+// RoutingSettings is the validated routing subset of the database settings.
+// It is shared by startup loading and the admin form so invalid BGP settings
+// are rejected before they are persisted.
+type RoutingSettings struct {
+	Mode  RouteMode
+	Table int
+	IPv4  bool
+	IPv6  bool
+	BGP   BGPSettings
+}
+
+func parseRoutingSettings(settings map[string]string) (RoutingSettings, error) {
+	out := RoutingSettings{
+		Mode: RouteModeKernel,
+		IPv4: true,
+		IPv6: true,
+		BGP: BGPSettings{
+			MultihopTTL: 1,
+		},
+	}
+
+	mode, err := parseRouteMode(settings["route_mode"])
+	if err != nil {
+		return RoutingSettings{}, err
+	}
+	out.Mode = mode
+
+	if v := strings.TrimSpace(settings["route_table"]); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			return RoutingSettings{}, fmt.Errorf("invalid route_table=%q", v)
+		}
+		out.Table = n
+	}
+	if v := strings.TrimSpace(settings["route_ipv4"]); v != "" {
+		out.IPv4 = isTrueString(v)
+	}
+	if v := strings.TrimSpace(settings["route_ipv6"]); v != "" {
+		out.IPv6 = isTrueString(v)
+	}
+
+	out.BGP.RouterID = strings.TrimSpace(settings["bgp_router_id"])
+	out.BGP.PeerAddress = strings.TrimSpace(settings["bgp_peer_address"])
+	out.BGP.LocalAddress = strings.TrimSpace(settings["bgp_local_address"])
+	out.BGP.NextHopV4 = strings.TrimSpace(settings["bgp_next_hop_v4"])
+	out.BGP.NextHopV6 = strings.TrimSpace(settings["bgp_next_hop_v6"])
+	out.BGP.Password = settings["bgp_password"]
+
+	if v := strings.TrimSpace(settings["bgp_local_asn"]); v != "" {
+		n, err := strconv.ParseUint(v, 10, 32)
+		if err != nil || n == 0 {
+			return RoutingSettings{}, fmt.Errorf("invalid bgp_local_asn=%q", v)
+		}
+		out.BGP.LocalASN = uint32(n)
+	}
+	if v := strings.TrimSpace(settings["bgp_peer_asn"]); v != "" {
+		n, err := strconv.ParseUint(v, 10, 32)
+		if err != nil || n == 0 {
+			return RoutingSettings{}, fmt.Errorf("invalid bgp_peer_asn=%q", v)
+		}
+		out.BGP.PeerASN = uint32(n)
+	}
+	if v := strings.TrimSpace(settings["bgp_multihop_ttl"]); v != "" {
+		n, err := strconv.ParseUint(v, 10, 8)
+		if err != nil || n == 0 {
+			return RoutingSettings{}, fmt.Errorf("invalid bgp_multihop_ttl=%q", v)
+		}
+		out.BGP.MultihopTTL = uint32(n)
+	}
+	if v := strings.TrimSpace(settings["bgp_require_established"]); v != "" {
+		out.BGP.RequireEstablished = isTrueString(v)
+	}
+
+	if out.Mode.UsesBGP() {
+		if err := out.BGP.Validate(out.IPv4, out.IPv6); err != nil {
+			return RoutingSettings{}, fmt.Errorf("invalid BGP settings: %w", err)
+		}
+	}
+	return out, nil
 }
 
 type BGPSettings struct {

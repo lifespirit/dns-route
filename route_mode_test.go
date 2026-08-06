@@ -187,3 +187,63 @@ func TestReconfigureBGPOnlyTransfersDesiredRoutesInMemory(t *testing.T) {
 		t.Fatalf("new BGP desired=%d, want 1", bgp.DesiredSize())
 	}
 }
+
+func TestParseRoutingSettingsForKernelBGP(t *testing.T) {
+	settings := map[string]string{
+		"route_mode":              "kernel+bgp",
+		"route_table":             "101",
+		"route_ipv4":              "1",
+		"route_ipv6":              "1",
+		"bgp_local_asn":           "65001",
+		"bgp_router_id":           "192.0.2.1",
+		"bgp_peer_address":        "192.0.2.2",
+		"bgp_peer_asn":            "65002",
+		"bgp_local_address":       "192.0.2.1",
+		"bgp_next_hop_v4":         "192.0.2.1",
+		"bgp_next_hop_v6":         "2001:db8::1",
+		"bgp_multihop_ttl":        "2",
+		"bgp_require_established": "1",
+		"bgp_password":            "secret",
+	}
+	got, err := parseRoutingSettings(settings)
+	if err != nil {
+		t.Fatalf("parse settings: %v", err)
+	}
+	if got.Mode != RouteModeKernelBGP || got.Table != 101 || !got.IPv4 || !got.IPv6 {
+		t.Fatalf("routing settings = %+v", got)
+	}
+	if got.BGP.LocalASN != 65001 || got.BGP.PeerASN != 65002 || got.BGP.MultihopTTL != 2 || !got.BGP.RequireEstablished {
+		t.Fatalf("BGP settings = %+v", got.BGP)
+	}
+}
+
+func TestParseRoutingSettingsKeepsKernelDefaults(t *testing.T) {
+	got, err := parseRoutingSettings(map[string]string{})
+	if err != nil {
+		t.Fatalf("parse defaults: %v", err)
+	}
+	if got.Mode != RouteModeKernel || got.Table != 0 || !got.IPv4 || !got.IPv6 || got.BGP.MultihopTTL != 1 {
+		t.Fatalf("defaults = %+v", got)
+	}
+}
+
+func TestParseRoutingSettingsRejectsInvalidBeforePersistence(t *testing.T) {
+	settings := map[string]string{
+		"route_mode":       "bgp",
+		"route_ipv4":       "1",
+		"route_ipv6":       "0",
+		"bgp_local_asn":    "65001",
+		"bgp_router_id":    "192.0.2.1",
+		"bgp_peer_address": "192.0.2.2",
+		"bgp_peer_asn":     "65002",
+		"bgp_next_hop_v4":  "2001:db8::1",
+	}
+	if _, err := parseRoutingSettings(settings); err == nil {
+		t.Fatal("invalid IPv4 next hop accepted")
+	}
+	settings["bgp_next_hop_v4"] = "192.0.2.1"
+	settings["route_table"] = "-1"
+	if _, err := parseRoutingSettings(settings); err == nil {
+		t.Fatal("negative route table accepted")
+	}
+}

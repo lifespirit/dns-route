@@ -11,6 +11,18 @@ import (
 
 const BGPRouteBackendName = "bgp"
 
+// BGPBackendStatus is a lock-safe runtime snapshot for the admin UI and
+// Prometheus metrics. Desired prefixes are the in-memory target set; announced
+// prefixes are paths currently accepted by the embedded speaker Loc-RIB.
+type BGPBackendStatus struct {
+	Configured         bool
+	Established        bool
+	Ready              bool
+	RequireEstablished bool
+	DesiredPrefixes    int
+	AnnouncedPrefixes  int
+}
+
 // BGPSpeaker is the narrow boundary between route management and an embedded
 // BGP implementation, such as an embedded GoBGP server.
 type BGPSpeaker interface {
@@ -91,6 +103,24 @@ func (b *BGPRouteBackend) SnapshotSize() int {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	return len(b.announced)
+}
+
+func (b *BGPRouteBackend) Status() BGPBackendStatus {
+	if b == nil || b.speaker == nil {
+		return BGPBackendStatus{}
+	}
+	established := b.speaker.Established()
+	b.mu.RLock()
+	status := BGPBackendStatus{
+		Configured:         true,
+		Established:        established,
+		Ready:              !b.requireEstablished || established,
+		RequireEstablished: b.requireEstablished,
+		DesiredPrefixes:    len(b.desired),
+		AnnouncedPrefixes:  len(b.announced),
+	}
+	b.mu.RUnlock()
+	return status
 }
 
 func (b *BGPRouteBackend) DesiredSize() int {

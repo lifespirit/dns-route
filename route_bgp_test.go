@@ -179,3 +179,22 @@ func TestNewBGPRouteBackendValidatesDependencies(t *testing.T) {
 		t.Fatal("backend without address families accepted")
 	}
 }
+
+func TestBGPBackendStatusReportsRuntimeState(t *testing.T) {
+	speaker := &fakeBGPSpeaker{established: true}
+	backend, err := NewBGPRouteBackend(speaker, true, true, false)
+	if err != nil {
+		t.Fatalf("new backend: %v", err)
+	}
+	route := bgpTestRoute("192.0.2.0/24", "192.0.2.10")
+	if _, err := backend.Ensure(context.Background(), route); err != nil {
+		t.Fatalf("ensure: %v", err)
+	}
+	status := backend.Status()
+	if !status.Configured || !status.Established || !status.Ready || !status.RequireEstablished {
+		t.Fatalf("status = %+v", status)
+	}
+	if status.DesiredPrefixes != 1 || status.AnnouncedPrefixes != 1 {
+		t.Fatalf("prefix counts = %+v", status)
+	}
+}

@@ -18,7 +18,9 @@ button { padding: 7px 11px; cursor: pointer; }
 .badge.open { background: #c6282830; }
 .badge.half_open { background: #ef6c0030; }
 .badge.active { background: #2e7d3230; }
-.badge.pending { background: #ef6c0030; }
+.badge.pending, .badge.down, .badge.unavailable { background: #ef6c0030; }
+.badge.established { background: #2e7d3230; }
+.badge.disabled { background: #8883; }
 .muted { opacity: .72; }
 .error-text { max-width: 520px; overflow-wrap: anywhere; }
 .nowrap { white-space: nowrap; }
@@ -59,6 +61,7 @@ button { padding: 7px 11px; cursor: pointer; }
     <tr><td>Team Cymru prefix lookup</td><td>{{.LookupCIDR}}</td></tr>
     <tr><td>Reply before route</td><td>{{.ReplyBeforeRoute}}</td></tr>
     <tr><td>Listener freebind</td><td>{{.ListenerFreeBind}}</td></tr>
+    <tr><td>Route mode</td><td>{{.RouteMode}}</td></tr>
     <tr><td>Route IPv4</td><td>{{.RouteIPv4}}</td></tr>
     <tr><td>Route IPv6</td><td>{{.RouteIPv6}}</td></tr>
     <tr><td>Route table</td><td>{{.RouteTable}}</td></tr>
@@ -66,6 +69,22 @@ button { padding: 7px 11px; cursor: pointer; }
     <tr><td>WG gateway</td><td>{{.WGGateway}}</td></tr>
     <tr><td>WG gateway v4</td><td>{{.WGGatewayV4}}</td></tr>
     <tr><td>WG gateway v6</td><td>{{.WGGatewayV6}}</td></tr>
+  </table>
+</div>
+
+<div class="card">
+  <h2>BGP</h2>
+  <table>
+    <tr><td>Status</td><td>{{if .BGP.Enabled}}<span class="badge {{.BGP.State}}">{{.BGP.State}}</span>{{else}}<span class="badge disabled">disabled</span>{{end}}</td></tr>
+    <tr><td>Backend ready</td><td>{{.BGP.Ready}}{{if .BGP.RequireEstablished}} <small>(requires Established)</small>{{end}}</td></tr>
+    <tr><td>Local</td><td>AS{{.BGP.LocalASN}} / router-id {{.BGP.RouterID}}{{if .BGP.LocalAddress}} / source {{.BGP.LocalAddress}}{{end}}</td></tr>
+    <tr><td>Peer</td><td>{{.BGP.PeerAddress}} AS{{.BGP.PeerASN}}</td></tr>
+    <tr><td>Next hop IPv4</td><td>{{.BGP.NextHopV4}}</td></tr>
+    <tr><td>Next hop IPv6</td><td>{{.BGP.NextHopV6}}</td></tr>
+    <tr><td>eBGP multihop TTL</td><td>{{.BGP.MultihopTTL}}</td></tr>
+    <tr><td>TCP MD5 password</td><td>{{if .BGP.PasswordConfigured}}configured{{else}}not configured{{end}}</td></tr>
+    <tr><td>Desired prefixes</td><td>{{.BGP.DesiredPrefixes}}</td></tr>
+    <tr><td>Loc-RIB prefixes</td><td>{{.BGP.AnnouncedPrefixes}}</td></tr>
   </table>
 </div>
 
