@@ -213,7 +213,7 @@ func TestGoBGPSpeakerAnnounceAndWithdrawIPv4(t *testing.T) {
 		t.Fatalf("decode NLRI: %v", err)
 	}
 	if nlri.Prefix != "198.51.100.0" || nlri.PrefixLen != 24 {
-		t.Fatalf("NLRI=%+v", nlri)
+		t.Fatalf("NLRI prefix=%q prefix_len=%d", nlri.Prefix, nlri.PrefixLen)
 	}
 	foundNextHop := false
 	for _, attr := range path.Pattrs {
