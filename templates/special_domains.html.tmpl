@@ -1,0 +1,16 @@
+{{define "special_domains.html.tmpl"}}
+{{template "admin_header" .}}
+<div class="card">
+  <h2>Special domains</h2>
+  <form method="post" action="/special/add">
+    <input type="hidden" name="return" value="/special-domains">
+    <input type="text" name="domain" placeholder="example.com" required>
+    <p><button type="submit">Add special domain</button></p>
+  </form>
+  <table>
+    <tr><th>Domain</th><th>Action</th></tr>
+    {{range .SpecialDomains}}<tr><td>{{.}}</td><td><form class="inline" method="post" action="/special/delete"><input type="hidden" name="return" value="/special-domains"><input type="hidden" name="domain" value="{{.}}"><button type="submit">Delete</button></form></td></tr>{{else}}<tr><td colspan="2" class="muted">No special domains configured.</td></tr>{{end}}
+  </table>
+</div>
+{{template "admin_footer" .}}
+{{end}}

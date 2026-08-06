@@ -1,10 +1,9 @@
-![Admin panel](docs/admin_panel.png "Admin panel")
-
 # dns-route
 
 DNS proxy with:
 - SQLite-backed config
 - Web admin panel
+- Separate web pages for Runtime, Settings, Upstreams, Special domains and DNS records
 - local A/AAAA records with wildcard support
 - empty local A/AAAA values act as NODATA rules: the daemon replies NOERROR with no addresses and does not forward the query upstream
 - special domains route programming via netlink
@@ -42,7 +41,7 @@ The default `route_mode` is `kernel`, so upgrading does not enable BGP automatic
 - `bgp` — announce routes only through the embedded GoBGP speaker. The in-memory table is rebuilt from DNS answers after a full process restart.
 - `kernel+bgp` — install the exact prefix in the configured Linux route table first, then announce the same prefix through BGP. Startup and the manual route reload mirror the configured kernel table into BGP.
 
-BGP settings are available in the web admin form. The form validates the route mode, table number, ASNs, router ID, peer/source addresses, next hops and multihop TTL before saving. The configured TCP MD5 password is never rendered back into HTML: leave the password field empty to keep it, or use the clear checkbox to remove it.
+BGP settings are available on the web admin Settings page. The form validates the route mode, table number, ASNs, router ID, peer/source addresses, next hops and multihop TTL before saving. The configured TCP MD5 password is never rendered back into HTML: leave the password field empty to keep it, or use the clear checkbox to remove it.
 
 The same values can still be written directly to the existing `settings` table. Example for IPv4 `kernel+bgp`:
 

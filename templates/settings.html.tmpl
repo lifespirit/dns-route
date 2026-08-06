@@ -1,0 +1,71 @@
+{{define "settings.html.tmpl"}}
+{{template "admin_header" .}}
+<div class="grid">
+  <div class="card">
+    <h2>Global settings</h2>
+    <form method="post" action="/settings/save">
+      <input type="hidden" name="return" value="/settings">
+      <table>
+        <tr><th>Key</th><th>Value</th></tr>
+        <tr><td>wg_interface</td><td><input type="text" name="wg_interface" value="{{index .Settings "wg_interface"}}"></td></tr>
+        <tr><td>wg_gateway</td><td><input type="text" name="wg_gateway" value="{{index .Settings "wg_gateway"}}"><br><small>Legacy fallback, mainly for IPv4.</small></td></tr>
+        <tr><td>wg_gateway_v4</td><td><input type="text" name="wg_gateway_v4" value="{{index .Settings "wg_gateway_v4"}}"><br><small>Overrides wg_gateway for A routes.</small></td></tr>
+        <tr><td>wg_gateway_v6</td><td><input type="text" name="wg_gateway_v6" value="{{index .Settings "wg_gateway_v6"}}"><br><small>AAAA routes are device-only when empty.</small></td></tr>
+        <tr>
+          <td>route_mode</td>
+          <td>
+            <select name="route_mode">
+              <option value="kernel" {{if eq .Config.RouteMode "kernel"}}selected{{end}}>kernel</option>
+              <option value="bgp" {{if eq .Config.RouteMode "bgp"}}selected{{end}}>bgp</option>
+              <option value="kernel+bgp" {{if eq .Config.RouteMode "kernel+bgp"}}selected{{end}}>kernel+bgp</option>
+            </select><br>
+            <small>kernel+bgp installs the exact prefix in the configured kernel table before announcing it.</small>
+          </td>
+        </tr>
+        <tr><td>route_table</td><td><input type="number" min="0" name="route_table" value="{{.Config.RouteTable}}"><br><small>0 means the main table (254). In kernel+bgp this table is mirrored into BGP on startup and manual route reload.</small></td></tr>
+        <tr><td>route_ipv4</td><td><input type="hidden" name="route_ipv4" value="0"><label><input type="checkbox" name="route_ipv4" value="1" {{if .Config.RouteIPv4}}checked{{end}}> Program routes from A records</label></td></tr>
+        <tr><td>route_ipv6</td><td><input type="hidden" name="route_ipv6" value="0"><label><input type="checkbox" name="route_ipv6" value="1" {{if .Config.RouteIPv6}}checked{{end}}> Program routes from AAAA records</label></td></tr>
+        <tr><td>bgp_local_asn</td><td><input type="number" min="1" max="4294967295" name="bgp_local_asn" value="{{if .Config.BGP.LocalASN}}{{.Config.BGP.LocalASN}}{{end}}"></td></tr>
+        <tr><td>bgp_router_id</td><td><input type="text" name="bgp_router_id" value="{{.Config.BGP.RouterID}}" placeholder="192.0.2.1"><br><small>Must be a non-zero IPv4 address.</small></td></tr>
+        <tr><td>bgp_peer_address</td><td><input type="text" name="bgp_peer_address" value="{{.Config.BGP.PeerAddress}}" placeholder="192.0.2.2 or 2001:db8::2"></td></tr>
+        <tr><td>bgp_peer_asn</td><td><input type="number" min="1" max="4294967295" name="bgp_peer_asn" value="{{if .Config.BGP.PeerASN}}{{.Config.BGP.PeerASN}}{{end}}"></td></tr>
+        <tr><td>bgp_local_address</td><td><input type="text" name="bgp_local_address" value="{{.Config.BGP.LocalAddress}}"><br><small>Optional source address for the BGP TCP connection.</small></td></tr>
+        <tr><td>bgp_next_hop_v4</td><td><input type="text" name="bgp_next_hop_v4" value="{{.Config.BGP.NextHopV4}}" placeholder="192.0.2.1"></td></tr>
+        <tr><td>bgp_next_hop_v6</td><td><input type="text" name="bgp_next_hop_v6" value="{{.Config.BGP.NextHopV6}}" placeholder="2001:db8::1"></td></tr>
+        <tr><td>bgp_multihop_ttl</td><td><input type="number" min="1" max="255" name="bgp_multihop_ttl" value="{{.Config.BGP.MultihopTTL}}"><br><small>1 for a directly connected eBGP peer.</small></td></tr>
+        <tr>
+          <td>bgp_password</td>
+          <td><input type="password" name="bgp_password" value="" autocomplete="new-password" placeholder="{{if .BGP.PasswordConfigured}}configured — blank keeps current{{else}}not configured{{end}}"><br><label><input type="checkbox" name="bgp_password_clear" value="1"> Clear configured password</label></td>
+        </tr>
+        <tr><td>bgp_require_established</td><td><input type="hidden" name="bgp_require_established" value="0"><label><input type="checkbox" name="bgp_require_established" value="1" {{if .Config.BGP.RequireEstablished}}checked{{end}}> Treat prefixes as ready only while the peer is Established</label></td></tr>
+        <tr><td>local_record_ttl</td><td><input type="number" min="0" name="local_record_ttl" value="{{index .Settings "local_record_ttl"}}"></td></tr>
+        <tr><td>lookup_cidr</td><td><input type="hidden" name="lookup_cidr" value="0"><label><input type="checkbox" name="lookup_cidr" value="1" {{if .Config.LookupCIDR}}checked{{end}}> Team Cymru BGP prefix lookup</label></td></tr>
+        <tr><td>reply_before_route</td><td><input type="hidden" name="reply_before_route" value="0"><label><input type="checkbox" name="reply_before_route" value="1" {{if .Config.ReplyBeforeRoute}}checked{{end}}> Reply before route installation</label><br><small>Enabled: answer immediately, install route asynchronously, then reset conntrack only if a route was actually installed. Disabled: wait for route installation; return SERVFAIL on route failure.</small></td></tr>
+        <tr><td>listener_freebind</td><td><input type="hidden" name="listener_freebind" value="0"><label><input type="checkbox" name="listener_freebind" value="1" {{if .Config.ListenerFreeBind}}checked{{end}}> Bind addresses before they exist</label><br><small>Uses Linux IP_FREEBIND/IPV6_FREEBIND. When disabled, unavailable addresses remain pending and are retried every 3 seconds.</small></td></tr>
+      </table>
+      <p><button type="submit">Save settings</button></p>
+    </form>
+  </div>
+
+  <div class="card">
+    <h2>Listen addresses</h2>
+    <form method="post" action="/listen/add">
+      <input type="hidden" name="return" value="/settings">
+      <input type="text" name="addr" placeholder="0.0.0.0:53 or [::]:53" required>
+      <p><button type="submit">Add listen address</button></p>
+    </form>
+    <table>
+      <tr><th>Configured address</th><th>Action</th></tr>
+      {{range .ListenAddrs}}<tr><td>{{.}}</td><td><form class="inline" method="post" action="/listen/delete"><input type="hidden" name="return" value="/settings"><input type="hidden" name="addr" value="{{.}}"><button type="submit">Delete</button></form></td></tr>{{else}}<tr><td colspan="2" class="muted">No listen addresses configured.</td></tr>{{end}}
+    </table>
+    <h3>Runtime listener state</h3>
+    <table>
+      <tr><th>Network</th><th>Address</th><th>State</th><th>FreeBind</th><th>Attempts / time</th><th>Last error</th></tr>
+      {{range .ListenerStates}}
+      <tr><td>{{.Net}}</td><td>{{.Addr}}</td><td><span class="badge {{.State}}">{{.State}}</span></td><td>{{.FreeBind}}</td><td>{{if eq .State "active"}}started: {{.StartedAt}}{{else}}attempts: {{.Attempts}}<br>last: {{.LastAttempt}}{{end}}</td><td class="error-text">{{if .LastError}}{{.LastError}}{{else}}<span class="muted">—</span>{{end}}</td></tr>
+      {{else}}<tr><td colspan="6" class="muted">No listener sockets configured.</td></tr>{{end}}
+    </table>
+  </div>
+</div>
+{{template "admin_footer" .}}
+{{end}}

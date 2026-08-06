@@ -1,0 +1,17 @@
+{{define "dns_records.html.tmpl"}}
+{{template "admin_header" .}}
+<div class="card">
+  <h2>DNS records</h2>
+  <form method="post" action="/record/add">
+    <input type="hidden" name="return" value="/dns-records">
+    <table>
+      <tr><td><input type="text" name="name" placeholder="example.com or *.example.com" required></td><td><select name="type"><option value="A">A</option><option value="AAAA">AAAA</option></select></td><td><input type="text" name="value" placeholder="10.0.0.1, 2001:db8::1, or empty=NODATA"></td><td><input type="number" min="0" name="ttl" placeholder="0"></td><td><button type="submit">Add record</button></td></tr>
+    </table>
+  </form>
+  <table>
+    <tr><th>ID</th><th>Name</th><th>Type</th><th>Value</th><th>TTL</th><th>Action</th></tr>
+    {{range .Records}}<tr><td>{{.ID}}</td><td>{{.Name}}</td><td>{{.Type}}</td><td>{{.Value}}</td><td>{{.TTL}}</td><td><form class="inline" method="post" action="/record/delete"><input type="hidden" name="return" value="/dns-records"><input type="hidden" name="id" value="{{.ID}}"><button type="submit">Delete</button></form></td></tr>{{else}}<tr><td colspan="6" class="muted">No local DNS records configured.</td></tr>{{end}}
+  </table>
+</div>
+{{template "admin_footer" .}}
+{{end}}

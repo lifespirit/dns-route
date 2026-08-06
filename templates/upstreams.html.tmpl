@@ -1,0 +1,42 @@
+{{define "upstreams.html.tmpl"}}
+{{template "admin_header" .}}
+<div class="card">
+  <h2>Default upstreams</h2>
+  <form method="post" action="/upstream/add" class="form-grid">
+    <input type="hidden" name="return" value="/upstreams">
+    <label>Address<input type="text" name="addr" placeholder="10.0.0.2:53 or https://dns.google/dns-query" required></label>
+    <label>Protocol<select name="proto"><option value="auto">auto</option><option value="udp">udp</option><option value="tcp">tcp</option><option value="tls">tls / DoT</option><option value="https">https / DoH</option></select></label>
+    <button type="submit">Add / update</button>
+  </form>
+  <p><small>Used only when no conditional forwarding zone matches. With auto: https URL → DoH; port 853 → DoT; other addresses → UDP DNS. UDP automatically retries truncated replies over TCP.</small></p>
+  <table>
+    <tr><th>Upstream</th><th>Configured</th><th>Effective</th><th>Circuit</th><th>Failures</th><th>Action</th></tr>
+    {{range .Upstreams}}
+    <tr><td><strong>{{.Addr}}</strong><br><small>{{.Endpoint}}</small></td><td>{{.ConfiguredProto}}</td><td>{{.Proto}}</td><td class="nowrap"><span class="badge {{.State}}">{{.State}}</span>{{if ne .OpenRemaining "—"}}<br><small>{{.OpenRemaining}} remaining</small>{{end}}</td><td>{{.ConsecutiveFailures}}{{if .LastError}}<br><small class="error-text" title="{{.LastError}}">{{.LastError}}</small>{{end}}</td><td><form class="inline" method="post" action="/upstream/delete"><input type="hidden" name="return" value="/upstreams"><input type="hidden" name="addr" value="{{.Addr}}"><button type="submit">Delete</button></form></td></tr>
+    {{else}}<tr><td colspan="6" class="muted">No upstreams configured.</td></tr>{{end}}
+  </table>
+</div>
+
+<div class="card section-gap">
+  <h2>Conditional forwarding</h2>
+  <form method="post" action="/forward-zone/add" class="form-grid forward-grid">
+    <input type="hidden" name="return" value="/upstreams">
+    <label>Domain suffix<input type="text" name="domain" placeholder="*.ru or *.lan" required></label>
+    <label>Upstream<input type="text" name="addr" placeholder="77.88.8.8:53 or 127.0.0.1:5353" required></label>
+    <label>Protocol<select name="proto"><option value="auto">auto</option><option value="udp">udp</option><option value="tcp">tcp</option><option value="tls">tls / DoT</option><option value="https">https / DoH</option></select></label>
+    <button type="submit">Add / update</button>
+  </form>
+  <p><small>Rules match the queried name by suffix; the longest suffix wins. <code>*.ru</code>, <code>.ru</code>, and <code>ru</code> are normalized to the same zone. A matched zone never falls back to the default upstream set. Add the same zone again with another address to create a load-balanced pool.</small></p>
+  {{range .ForwardZones}}
+  <h3>{{.Pattern}}</h3>
+  <table>
+    <tr><th>Upstream</th><th>Configured</th><th>Effective</th><th>Circuit</th><th>Failures</th><th>Action</th></tr>
+    {{range .Upstreams}}
+    <tr><td><strong>{{.View.Addr}}</strong><br><small>{{.View.Endpoint}}</small></td><td>{{.View.ConfiguredProto}}</td><td>{{.View.Proto}}</td><td class="nowrap"><span class="badge {{.View.State}}">{{.View.State}}</span>{{if ne .View.OpenRemaining "—"}}<br><small>{{.View.OpenRemaining}} remaining</small>{{end}}</td><td>{{.View.ConsecutiveFailures}}{{if .View.LastError}}<br><small class="error-text" title="{{.View.LastError}}">{{.View.LastError}}</small>{{end}}</td><td><form class="inline" method="post" action="/forward-zone/upstream/delete"><input type="hidden" name="return" value="/upstreams"><input type="hidden" name="id" value="{{.ID}}"><button type="submit">Delete upstream</button></form></td></tr>
+    {{else}}<tr><td colspan="6" class="muted">No upstreams. This empty zone is ignored until an upstream is added.</td></tr>{{end}}
+  </table>
+  <div class="actions"><form class="inline" method="post" action="/forward-zone/delete"><input type="hidden" name="return" value="/upstreams"><input type="hidden" name="id" value="{{.ID}}"><button type="submit">Delete zone {{.Pattern}}</button></form></div>
+  {{else}}<p class="muted">No conditional forwarding zones configured.</p>{{end}}
+</div>
+{{template "admin_footer" .}}
+{{end}}

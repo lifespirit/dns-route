@@ -48,9 +48,7 @@ var templateFS embed.FS
 
 var templates = template.Must(template.ParseFS(
 	templateFS,
-	"templates/admin.html.tmpl",
-	"templates/error.html.tmpl",
-	"templates/stats.html.tmpl",
+	"templates/*.tmpl",
 ))
 
 type cacheEntry struct {
@@ -408,6 +406,8 @@ type bgpStatusView struct {
 }
 
 type pageData struct {
+	Title          string
+	Path           string
 	Config         *Config
 	Settings       map[string]string
 	ListenAddrs    []string
@@ -1100,6 +1100,8 @@ func renderError(w http.ResponseWriter, status int, err error) {
 func (a *App) validateTemplates() error {
 	cfg := a.getConfig()
 	adminData := pageData{
+		Title:          "Runtime",
+		Path:           "/",
 		Config:         cfg,
 		Settings:       map[string]string{},
 		ListenAddrs:    append([]string(nil), cfg.ListenAddrs...),
@@ -1111,8 +1113,23 @@ func (a *App) validateTemplates() error {
 		BGP:            a.bgpStatus(cfg),
 		Message:        a.adminAddr,
 	}
-	if err := templates.ExecuteTemplate(io.Discard, "admin.html.tmpl", adminData); err != nil {
-		return fmt.Errorf("admin.html.tmpl: %w", err)
+	adminTemplates := []struct {
+		name  string
+		title string
+		path  string
+	}{
+		{name: "admin.html.tmpl", title: "Runtime", path: "/"},
+		{name: "settings.html.tmpl", title: "Settings", path: "/settings"},
+		{name: "upstreams.html.tmpl", title: "Upstreams", path: "/upstreams"},
+		{name: "special_domains.html.tmpl", title: "Special domains", path: "/special-domains"},
+		{name: "dns_records.html.tmpl", title: "DNS records", path: "/dns-records"},
+	}
+	for _, item := range adminTemplates {
+		adminData.Title = item.title
+		adminData.Path = item.path
+		if err := templates.ExecuteTemplate(io.Discard, item.name, adminData); err != nil {
+			return fmt.Errorf("%s: %w", item.name, err)
+		}
 	}
 	if err := templates.ExecuteTemplate(io.Discard, "stats.html.tmpl", a.statsSnapshot()); err != nil {
 		return fmt.Errorf("stats.html.tmpl: %w", err)
@@ -1892,6 +1909,10 @@ func (a *App) listenerViews() []listenerView {
 func (a *App) startHTTP() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", a.handleAdmin)
+	mux.HandleFunc("/settings", a.handleSettingsPage)
+	mux.HandleFunc("/upstreams", a.handleUpstreamsPage)
+	mux.HandleFunc("/special-domains", a.handleSpecialDomainsPage)
+	mux.HandleFunc("/dns-records", a.handleDNSRecordsPage)
 	mux.HandleFunc("/reload", a.handleReload)
 	mux.HandleFunc("/routes/reload", a.handleRoutesReload)
 	mux.HandleFunc("/routes/errors", a.handleRouteErrors)
@@ -1917,38 +1938,79 @@ func (a *App) startHTTP() {
 	}()
 }
 
-func (a *App) handleAdmin(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/" {
-		http.NotFound(w, r)
-		return
-	}
+func (a *App) adminPageData(title, path string) (pageData, error) {
 	settings, err := readSettings(a.db)
 	if err != nil {
-		renderError(w, 500, err)
-		return
+		return pageData{}, err
 	}
 	listenAddrs, err := a.listSimple(`SELECT addr FROM listen_addrs WHERE enabled = 1 ORDER BY id`)
 	if err != nil {
-		renderError(w, 500, err)
-		return
+		return pageData{}, err
 	}
-	cfg := a.getConfig()
-	upstreams := a.defaultUpstreamViews(cfg)
 	specials, err := a.listSimple(`SELECT domain FROM special_domains WHERE enabled = 1 ORDER BY domain`)
 	if err != nil {
-		renderError(w, 500, err)
-		return
+		return pageData{}, err
 	}
 	records, err := a.listRecords()
 	if err != nil {
-		renderError(w, 500, err)
+		return pageData{}, err
+	}
+	cfg := a.getConfig()
+	return pageData{
+		Title:          title,
+		Path:           path,
+		Config:         cfg,
+		Settings:       settings,
+		ListenAddrs:    listenAddrs,
+		ListenerStates: a.listenerViews(),
+		Upstreams:      a.defaultUpstreamViews(cfg),
+		ForwardZones:   a.forwardZoneViews(cfg),
+		SpecialDomains: specials,
+		Records:        records,
+		BGP:            a.bgpStatus(cfg),
+		Message:        a.adminAddr,
+	}, nil
+}
+
+func (a *App) renderAdminPage(w http.ResponseWriter, r *http.Request, path, title, templateName string) {
+	if r.URL.Path != path {
+		http.NotFound(w, r)
 		return
 	}
-	data := pageData{Config: cfg, Settings: settings, ListenAddrs: listenAddrs, ListenerStates: a.listenerViews(), Upstreams: upstreams, ForwardZones: a.forwardZoneViews(cfg), SpecialDomains: specials, Records: records, BGP: a.bgpStatus(cfg), Message: a.adminAddr}
-	if err := templates.ExecuteTemplate(w, "admin.html.tmpl", data); err != nil {
-		renderError(w, 500, err)
+	if r.Method != http.MethodGet {
+		renderError(w, http.StatusMethodNotAllowed, fmt.Errorf("method not allowed"))
+		return
+	}
+	data, err := a.adminPageData(title, path)
+	if err != nil {
+		renderError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if err := templates.ExecuteTemplate(w, templateName, data); err != nil {
+		renderError(w, http.StatusInternalServerError, err)
 	}
 }
+
+func (a *App) handleAdmin(w http.ResponseWriter, r *http.Request) {
+	a.renderAdminPage(w, r, "/", "Runtime", "admin.html.tmpl")
+}
+
+func (a *App) handleSettingsPage(w http.ResponseWriter, r *http.Request) {
+	a.renderAdminPage(w, r, "/settings", "Settings", "settings.html.tmpl")
+}
+
+func (a *App) handleUpstreamsPage(w http.ResponseWriter, r *http.Request) {
+	a.renderAdminPage(w, r, "/upstreams", "Upstreams", "upstreams.html.tmpl")
+}
+
+func (a *App) handleSpecialDomainsPage(w http.ResponseWriter, r *http.Request) {
+	a.renderAdminPage(w, r, "/special-domains", "Special domains", "special_domains.html.tmpl")
+}
+
+func (a *App) handleDNSRecordsPage(w http.ResponseWriter, r *http.Request) {
+	a.renderAdminPage(w, r, "/dns-records", "DNS records", "dns_records.html.tmpl")
+}
+
 func (a *App) handleStats(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/stats" {
 		http.NotFound(w, r)
@@ -1958,6 +2020,20 @@ func (a *App) handleStats(w http.ResponseWriter, r *http.Request) {
 		renderError(w, 500, err)
 	}
 }
+func adminReturnPath(r *http.Request, fallback string) string {
+	path := strings.TrimSpace(r.FormValue("return"))
+	switch path {
+	case "/", "/settings", "/upstreams", "/special-domains", "/dns-records":
+		return path
+	default:
+		return fallback
+	}
+}
+
+func redirectAdmin(w http.ResponseWriter, r *http.Request, fallback string) {
+	http.Redirect(w, r, adminReturnPath(r, fallback), http.StatusSeeOther)
+}
+
 func (a *App) handleReload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		renderError(w, 405, fmt.Errorf("method not allowed"))
@@ -1967,7 +2043,7 @@ func (a *App) handleReload(w http.ResponseWriter, r *http.Request) {
 		renderError(w, 500, err)
 		return
 	}
-	http.Redirect(w, r, "/", http.StatusSeeOther)
+	redirectAdmin(w, r, "/")
 }
 func (a *App) handleRoutesReload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -1978,7 +2054,7 @@ func (a *App) handleRoutesReload(w http.ResponseWriter, r *http.Request) {
 		renderError(w, 500, err)
 		return
 	}
-	http.Redirect(w, r, "/", http.StatusSeeOther)
+	redirectAdmin(w, r, "/")
 }
 
 func (a *App) handleRouteErrors(w http.ResponseWriter, r *http.Request) {
@@ -2085,7 +2161,7 @@ func (a *App) handleSettingsSave(w http.ResponseWriter, r *http.Request) {
 		renderError(w, http.StatusInternalServerError, err)
 		return
 	}
-	http.Redirect(w, r, "/", http.StatusSeeOther)
+	redirectAdmin(w, r, "/settings")
 }
 
 func (a *App) handleListenAdd(w http.ResponseWriter, r *http.Request) {
@@ -2095,7 +2171,7 @@ func (a *App) handleListenAdd(w http.ResponseWriter, r *http.Request) {
 	}
 	addr := strings.TrimSpace(r.FormValue("addr"))
 	if addr == "" {
-		http.Redirect(w, r, "/", http.StatusSeeOther)
+		redirectAdmin(w, r, "/settings")
 		return
 	}
 	if _, err := a.db.Exec(`INSERT OR IGNORE INTO listen_addrs(addr, enabled) VALUES(?, 1)`, addr); err != nil {
@@ -2107,10 +2183,10 @@ func (a *App) handleListenAdd(w http.ResponseWriter, r *http.Request) {
 		renderError(w, 500, err)
 		return
 	}
-	http.Redirect(w, r, "/", http.StatusSeeOther)
+	redirectAdmin(w, r, "/settings")
 }
 func (a *App) handleListenDelete(w http.ResponseWriter, r *http.Request) {
-	a.handleSimpleDelete(w, r, `DELETE FROM listen_addrs WHERE addr = ?`, strings.TrimSpace(r.FormValue("addr")))
+	a.handleSimpleDelete(w, r, "/settings", `DELETE FROM listen_addrs WHERE addr = ?`, strings.TrimSpace(r.FormValue("addr")))
 }
 func (a *App) handleUpstreamAdd(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -2119,7 +2195,7 @@ func (a *App) handleUpstreamAdd(w http.ResponseWriter, r *http.Request) {
 	}
 	addr := strings.TrimSpace(r.FormValue("addr"))
 	if addr == "" {
-		http.Redirect(w, r, "/", http.StatusSeeOther)
+		redirectAdmin(w, r, "/upstreams")
 		return
 	}
 	proto := strings.ToLower(strings.TrimSpace(r.FormValue("proto")))
@@ -2143,10 +2219,10 @@ func (a *App) handleUpstreamAdd(w http.ResponseWriter, r *http.Request) {
 		renderError(w, 500, err)
 		return
 	}
-	http.Redirect(w, r, "/", http.StatusSeeOther)
+	redirectAdmin(w, r, "/upstreams")
 }
 func (a *App) handleUpstreamDelete(w http.ResponseWriter, r *http.Request) {
-	a.handleSimpleDelete(w, r, `DELETE FROM upstreams WHERE addr = ?`, strings.TrimSpace(r.FormValue("addr")))
+	a.handleSimpleDelete(w, r, "/upstreams", `DELETE FROM upstreams WHERE addr = ?`, strings.TrimSpace(r.FormValue("addr")))
 }
 func (a *App) handleForwardZoneAdd(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -2200,7 +2276,7 @@ func (a *App) handleForwardZoneAdd(w http.ResponseWriter, r *http.Request) {
 		renderError(w, http.StatusInternalServerError, err)
 		return
 	}
-	http.Redirect(w, r, "/", http.StatusSeeOther)
+	redirectAdmin(w, r, "/upstreams")
 }
 
 func (a *App) handleForwardZoneUpstreamDelete(w http.ResponseWriter, r *http.Request) {
@@ -2221,7 +2297,7 @@ func (a *App) handleForwardZoneUpstreamDelete(w http.ResponseWriter, r *http.Req
 		renderError(w, http.StatusInternalServerError, err)
 		return
 	}
-	http.Redirect(w, r, "/", http.StatusSeeOther)
+	redirectAdmin(w, r, "/upstreams")
 }
 
 func (a *App) handleForwardZoneDelete(w http.ResponseWriter, r *http.Request) {
@@ -2256,14 +2332,14 @@ func (a *App) handleForwardZoneDelete(w http.ResponseWriter, r *http.Request) {
 		renderError(w, http.StatusInternalServerError, err)
 		return
 	}
-	http.Redirect(w, r, "/", http.StatusSeeOther)
+	redirectAdmin(w, r, "/upstreams")
 }
 
 func (a *App) handleSpecialAdd(w http.ResponseWriter, r *http.Request) {
-	a.handleSimpleInsert(w, r, `INSERT OR IGNORE INTO special_domains(domain, enabled) VALUES(?, 1)`, normalizeName(r.FormValue("domain")))
+	a.handleSimpleInsert(w, r, "/special-domains", `INSERT OR IGNORE INTO special_domains(domain, enabled) VALUES(?, 1)`, normalizeName(r.FormValue("domain")))
 }
 func (a *App) handleSpecialDelete(w http.ResponseWriter, r *http.Request) {
-	a.handleSimpleDelete(w, r, `DELETE FROM special_domains WHERE domain = ?`, normalizeName(r.FormValue("domain")))
+	a.handleSimpleDelete(w, r, "/special-domains", `DELETE FROM special_domains WHERE domain = ?`, normalizeName(r.FormValue("domain")))
 }
 
 func (a *App) handleRecordAdd(w http.ResponseWriter, r *http.Request) {
@@ -2276,7 +2352,7 @@ func (a *App) handleRecordAdd(w http.ResponseWriter, r *http.Request) {
 	value := strings.TrimSpace(r.FormValue("value"))
 	ttlStr := strings.TrimSpace(r.FormValue("ttl"))
 	if name == "" || (rtype != "A" && rtype != "AAAA") {
-		http.Redirect(w, r, "/", http.StatusSeeOther)
+		redirectAdmin(w, r, "/dns-records")
 		return
 	}
 	if value != "" {
@@ -2311,7 +2387,7 @@ func (a *App) handleRecordAdd(w http.ResponseWriter, r *http.Request) {
 		renderError(w, 500, err)
 		return
 	}
-	http.Redirect(w, r, "/", http.StatusSeeOther)
+	redirectAdmin(w, r, "/dns-records")
 }
 func (a *App) handleRecordDelete(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -2331,15 +2407,15 @@ func (a *App) handleRecordDelete(w http.ResponseWriter, r *http.Request) {
 		renderError(w, 500, err)
 		return
 	}
-	http.Redirect(w, r, "/", http.StatusSeeOther)
+	redirectAdmin(w, r, "/dns-records")
 }
-func (a *App) handleSimpleInsert(w http.ResponseWriter, r *http.Request, query, value string) {
+func (a *App) handleSimpleInsert(w http.ResponseWriter, r *http.Request, fallback, query, value string) {
 	if r.Method != http.MethodPost {
 		renderError(w, 405, fmt.Errorf("method not allowed"))
 		return
 	}
 	if value == "" {
-		http.Redirect(w, r, "/", http.StatusSeeOther)
+		redirectAdmin(w, r, fallback)
 		return
 	}
 	if _, err := a.db.Exec(query, value); err != nil {
@@ -2350,15 +2426,15 @@ func (a *App) handleSimpleInsert(w http.ResponseWriter, r *http.Request, query, 
 		renderError(w, 500, err)
 		return
 	}
-	http.Redirect(w, r, "/", http.StatusSeeOther)
+	redirectAdmin(w, r, fallback)
 }
-func (a *App) handleSimpleDelete(w http.ResponseWriter, r *http.Request, query, value string) {
+func (a *App) handleSimpleDelete(w http.ResponseWriter, r *http.Request, fallback, query, value string) {
 	if r.Method != http.MethodPost {
 		renderError(w, 405, fmt.Errorf("method not allowed"))
 		return
 	}
 	if value == "" {
-		http.Redirect(w, r, "/", http.StatusSeeOther)
+		redirectAdmin(w, r, fallback)
 		return
 	}
 	if _, err := a.db.Exec(query, value); err != nil {
@@ -2369,7 +2445,7 @@ func (a *App) handleSimpleDelete(w http.ResponseWriter, r *http.Request, query, 
 		renderError(w, 500, err)
 		return
 	}
-	http.Redirect(w, r, "/", http.StatusSeeOther)
+	redirectAdmin(w, r, fallback)
 }
 
 func (a *App) listSimple(query string) ([]string, error) {

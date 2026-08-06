@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-func TestAdminTemplateRendersBGPSettingsWithoutSecret(t *testing.T) {
+func TestSettingsTemplateRendersBGPSettingsWithoutSecret(t *testing.T) {
 	cfg := &Config{
 		RouteMode:  RouteModeKernelBGP,
 		RouteTable: 101,
@@ -26,6 +26,8 @@ func TestAdminTemplateRendersBGPSettingsWithoutSecret(t *testing.T) {
 		},
 	}
 	data := pageData{
+		Title:    "Settings",
+		Path:     "/settings",
 		Config:   cfg,
 		Settings: map[string]string{},
 		BGP: bgpStatusView{
@@ -40,8 +42,8 @@ func TestAdminTemplateRendersBGPSettingsWithoutSecret(t *testing.T) {
 		},
 	}
 	var out bytes.Buffer
-	if err := templates.ExecuteTemplate(&out, "admin.html.tmpl", data); err != nil {
-		t.Fatalf("render admin: %v", err)
+	if err := templates.ExecuteTemplate(&out, "settings.html.tmpl", data); err != nil {
+		t.Fatalf("render settings: %v", err)
 	}
 	html := out.String()
 	for _, want := range []string{
@@ -49,14 +51,88 @@ func TestAdminTemplateRendersBGPSettingsWithoutSecret(t *testing.T) {
 		`name="bgp_local_asn" value="65001"`,
 		`name="bgp_peer_address" value="192.0.2.2"`,
 		`configured — blank keeps current`,
-		`Loc-RIB: 2`,
+		`href="/settings" class="active"`,
+		`name="return" value="/settings"`,
 	} {
 		if !strings.Contains(html, want) {
-			t.Fatalf("admin HTML missing %q", want)
+			t.Fatalf("settings HTML missing %q", want)
 		}
 	}
 	if strings.Contains(html, cfg.BGP.Password) {
-		t.Fatal("BGP password leaked into admin HTML")
+		t.Fatal("BGP password leaked into settings HTML")
+	}
+}
+
+func TestRuntimeTemplateContainsOnlyRuntimeContent(t *testing.T) {
+	data := pageData{
+		Title:  "Runtime",
+		Path:   "/",
+		Config: &Config{RouteMode: RouteModeKernelBGP},
+		BGP: bgpStatusView{
+			Enabled:           true,
+			State:             "established",
+			PeerAddress:       "192.0.2.2",
+			PeerASN:           65002,
+			DesiredPrefixes:   2,
+			AnnouncedPrefixes: 2,
+		},
+	}
+	var out bytes.Buffer
+	if err := templates.ExecuteTemplate(&out, "admin.html.tmpl", data); err != nil {
+		t.Fatalf("render runtime: %v", err)
+	}
+	html := out.String()
+	for _, want := range []string{
+		`<h2>Runtime</h2>`,
+		`Loc-RIB: 2`,
+		`href="/" class="active"`,
+		`action="/reload"`,
+		`action="/routes/reload"`,
+	} {
+		if !strings.Contains(html, want) {
+			t.Fatalf("runtime HTML missing %q", want)
+		}
+	}
+	for _, unwanted := range []string{
+		`<h2>Global settings</h2>`,
+		`action="/settings/save"`,
+		`<h2>Conditional forwarding</h2>`,
+		`action="/record/add"`,
+	} {
+		if strings.Contains(html, unwanted) {
+			t.Fatalf("runtime HTML unexpectedly contains %q", unwanted)
+		}
+	}
+}
+
+func TestAdminSectionTemplatesRender(t *testing.T) {
+	data := pageData{
+		Config:   &Config{},
+		Settings: map[string]string{},
+	}
+	cases := []struct {
+		template string
+		title    string
+		path     string
+		want     string
+	}{
+		{template: "settings.html.tmpl", title: "Settings", path: "/settings", want: "Global settings"},
+		{template: "upstreams.html.tmpl", title: "Upstreams", path: "/upstreams", want: "Conditional forwarding"},
+		{template: "special_domains.html.tmpl", title: "Special domains", path: "/special-domains", want: "Add special domain"},
+		{template: "dns_records.html.tmpl", title: "DNS records", path: "/dns-records", want: "Add record"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.path, func(t *testing.T) {
+			data.Title = tc.title
+			data.Path = tc.path
+			var out bytes.Buffer
+			if err := templates.ExecuteTemplate(&out, tc.template, data); err != nil {
+				t.Fatalf("render %s: %v", tc.template, err)
+			}
+			if !strings.Contains(out.String(), tc.want) {
+				t.Fatalf("%s missing %q", tc.template, tc.want)
+			}
+		})
 	}
 }
 
