@@ -422,6 +422,14 @@ type pageData struct {
 	ForwardZones         []forwardZoneView
 	SpecialDomains       []string
 	SpecialDomainSources []SpecialDomainSourceState
+	SpecialPage          int
+	SpecialTotalPages    int
+	SpecialTotalDomains  int
+	SpecialHasPrev       bool
+	SpecialHasNext       bool
+	SpecialPrevURL       string
+	SpecialNextURL       string
+	SpecialReturnURL     string
 	DNSRecordSources     []DNSRecordSourceState
 	RecordDomains        []DNSRecordDomainView
 	RecordQuery          string
@@ -1121,6 +1129,9 @@ func (a *App) validateTemplates() error {
 		ForwardZones:         a.forwardZoneViews(cfg),
 		SpecialDomains:       []string{},
 		SpecialDomainSources: []SpecialDomainSourceState{},
+		SpecialPage:          1,
+		SpecialTotalPages:    1,
+		SpecialReturnURL:     "/special-domains",
 		DNSRecordSources:     []DNSRecordSourceState{},
 		RecordPage:           1,
 		RecordTotalPages:     1,
@@ -2151,13 +2162,6 @@ func (a *App) adminPageData(title, path string) (pageData, error) {
 	if err != nil {
 		return pageData{}, err
 	}
-	var specials []string
-	if path == "/special-domains" {
-		specials, err = a.listSimple(`SELECT domain FROM special_domains WHERE enabled = 1 ORDER BY domain`)
-		if err != nil {
-			return pageData{}, err
-		}
-	}
 	cfg := a.getConfig()
 	return pageData{
 		Title:                title,
@@ -2168,7 +2172,6 @@ func (a *App) adminPageData(title, path string) (pageData, error) {
 		ListenerStates:       a.listenerViews(),
 		Upstreams:            a.defaultUpstreamViews(cfg),
 		ForwardZones:         a.forwardZoneViews(cfg),
-		SpecialDomains:       specials,
 		SpecialDomainSources: append([]SpecialDomainSourceState(nil), cfg.SpecialDomainSources...),
 		DNSRecordSources:     append([]DNSRecordSourceState(nil), cfg.DNSRecordSources...),
 		BGP:                  a.bgpStatus(cfg),
@@ -2208,7 +2211,42 @@ func (a *App) handleUpstreamsPage(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) handleSpecialDomainsPage(w http.ResponseWriter, r *http.Request) {
-	a.renderAdminPage(w, r, "/special-domains", "Special domains", "special_domains.html.tmpl")
+	if r.URL.Path != "/special-domains" {
+		http.NotFound(w, r)
+		return
+	}
+	if r.Method != http.MethodGet {
+		renderError(w, http.StatusMethodNotAllowed, fmt.Errorf("method not allowed"))
+		return
+	}
+	data, err := a.adminPageData("Special domains", "/special-domains")
+	if err != nil {
+		renderError(w, http.StatusInternalServerError, err)
+		return
+	}
+	page := 1
+	if rawPage := strings.TrimSpace(r.URL.Query().Get("page")); rawPage != "" {
+		if parsed, parseErr := strconv.Atoi(rawPage); parseErr == nil && parsed > 0 {
+			page = parsed
+		}
+	}
+	view, err := loadSpecialDomainPage(a.db, page)
+	if err != nil {
+		renderError(w, http.StatusInternalServerError, err)
+		return
+	}
+	data.SpecialDomains = view.Patterns
+	data.SpecialPage = view.Page
+	data.SpecialTotalPages = view.TotalPages
+	data.SpecialTotalDomains = view.TotalDomains
+	data.SpecialHasPrev = view.HasPrev
+	data.SpecialHasNext = view.HasNext
+	data.SpecialPrevURL = view.PrevURL
+	data.SpecialNextURL = view.NextURL
+	data.SpecialReturnURL = view.ReturnURL
+	if err := templates.ExecuteTemplate(w, "special_domains.html.tmpl", data); err != nil {
+		renderError(w, http.StatusInternalServerError, err)
+	}
 }
 
 func (a *App) handleDNSRecordsPage(w http.ResponseWriter, r *http.Request) {
