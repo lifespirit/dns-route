@@ -39,6 +39,13 @@ type DesiredRouteSetBackend interface {
 	ReplaceDesired(ctx context.Context, routes []RouteIntent) error
 }
 
+// DesiredRouteSnapshotProvider exposes a process-local desired route set so a
+// bgp-only backend can survive an in-process speaker reconfiguration without
+// persisting dynamic prefixes to disk.
+type DesiredRouteSnapshotProvider interface {
+	DesiredRoutes() []RouteIntent
+}
+
 // ExactRouteBackend can require the precise prefix to exist instead of merely
 // accepting coverage by a broader route. RouteManager uses this for the kernel
 // side of kernel+bgp before allowing the matching BGP announcement.

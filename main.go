@@ -160,9 +160,11 @@ type Config struct {
 	WGGatewayV4      string
 	WGGatewayV6      string
 	WGInterface      string
+	RouteMode        RouteMode
 	RouteTable       int
 	RouteIPv4        bool
 	RouteIPv6        bool
+	BGP              BGPSettings
 	DefaultTTL       uint32
 	LookupCIDR       bool
 	ReplyBeforeRoute bool
@@ -491,7 +493,10 @@ func main() {
 		startedAt:          time.Now(),
 	}
 	app.syncUpstreamCircuits(cfg)
-	app.routeMgr = NewRouteManager(app, 8)
+	app.routeMgr, err = NewRouteManager(app, 8)
+	if err != nil {
+		log.Fatalf("create route manager: %v", err)
+	}
 	if err := app.routeMgr.ReloadBackends(context.Background()); err != nil {
 		log.Printf("initial route backend reload failed: %v", err)
 	}
@@ -508,12 +513,15 @@ func main() {
 	select {}
 }
 
-func NewRouteManager(app *App, workers int) *RouteManager {
-	kernelBackend := NewKernelRouteBackend(app)
+func NewRouteManager(app *App, workers int) (*RouteManager, error) {
+	backends, err := buildRouteBackends(context.Background(), app, app.getConfig())
+	if err != nil {
+		return nil, err
+	}
 	rm := &RouteManager{
 		app:             app,
 		prefixResolver:  NewCymruPrefixResolver(app.lookupCymruTXT),
-		backends:        []RouteBackend{kernelBackend},
+		backends:        backends,
 		ipCache:         make(map[string]routeCacheEntry),
 		cidrCache:       make(map[string]routeCacheEntry),
 		resetAfterApply: make(map[string]bool),
@@ -523,7 +531,7 @@ func NewRouteManager(app *App, workers int) *RouteManager {
 		rm.wg.Add(1)
 		go rm.worker()
 	}
-	return rm
+	return rm, nil
 }
 
 func (rm *RouteManager) worker() {
@@ -720,13 +728,17 @@ func (rm *RouteManager) processIPOnce(ip string) error {
 	return nil
 }
 
-func (rm *RouteManager) backendByName(name string) RouteBackend {
-	for _, backend := range rm.backends {
+func backendByName(backends []RouteBackend, name string) RouteBackend {
+	for _, backend := range backends {
 		if backend != nil && backend.Name() == name {
 			return backend
 		}
 	}
 	return nil
+}
+
+func (rm *RouteManager) backendByName(name string) RouteBackend {
+	return backendByName(rm.backends, name)
 }
 
 func ensureRouteBackend(ctx context.Context, backend RouteBackend, route RouteIntent) (ApplyResult, error) {
@@ -858,6 +870,9 @@ func (rm *RouteManager) backendsCoverIP(ip net.IP) bool {
 }
 
 func (rm *RouteManager) backendsCoverAddress(addr netip.Addr) bool {
+	rm.backendMu.RLock()
+	defer rm.backendMu.RUnlock()
+
 	addr = addr.Unmap()
 	if !addr.IsValid() || len(rm.backends) == 0 {
 		return false
@@ -873,7 +888,10 @@ func (rm *RouteManager) backendsCoverAddress(addr netip.Addr) bool {
 func (rm *RouteManager) ReloadBackends(ctx context.Context) error {
 	rm.backendMu.Lock()
 	defer rm.backendMu.Unlock()
+	return rm.reloadBackendsLocked(ctx)
+}
 
+func (rm *RouteManager) reloadBackendsLocked(ctx context.Context) error {
 	kernel := rm.backendByName(KernelRouteBackendName)
 	bgp := rm.backendByName(BGPRouteBackendName)
 	processed := make(map[string]struct{}, 2)
@@ -917,7 +935,58 @@ func (rm *RouteManager) ReloadBackends(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
+func (rm *RouteManager) ReconfigureBackends(ctx context.Context, cfg *Config) error {
+	newBackends, err := buildRouteBackends(ctx, rm.app, cfg)
+	if err != nil {
+		return err
+	}
+
+	rm.backendMu.Lock()
+	oldBackends := rm.backends
+	transferredBGP := false
+
+	// A bgp-only deployment has no kernel table from which to rebuild after an
+	// in-process speaker reconfiguration. Transfer its ephemeral desired set
+	// directly from the old backend. This is intentionally memory-to-memory;
+	// a full dns-route restart still starts with an empty BGP table.
+	if cfg != nil && cfg.RouteMode == RouteModeBGP {
+		oldBGP := backendByName(oldBackends, BGPRouteBackendName)
+		newBGP := backendByName(newBackends, BGPRouteBackendName)
+		if source, ok := oldBGP.(DesiredRouteSnapshotProvider); ok {
+			if target, ok := newBGP.(DesiredRouteSetBackend); ok {
+				if err := target.ReplaceDesired(ctx, source.DesiredRoutes()); err != nil {
+					rm.backendMu.Unlock()
+					_ = closeRouteBackends(newBackends)
+					return fmt.Errorf("transfer BGP desired routes during reconfiguration: %w", err)
+				}
+				transferredBGP = true
+			}
+		}
+	}
+
+	rm.backends = newBackends
+	if !transferredBGP {
+		if err := rm.reloadBackendsLocked(ctx); err != nil {
+			rm.backends = oldBackends
+			rm.backendMu.Unlock()
+			_ = closeRouteBackends(newBackends)
+			return err
+		}
+	}
+	rm.backendMu.Unlock()
+
+	if err := closeRouteBackends(oldBackends); err != nil {
+		// The new backend set is already active and cannot be rolled back safely
+		// after the old speaker has begun shutting down.
+		log.Printf("ROUTE_BACKEND_CLOSE_OLD_ERROR error=%v", err)
+	}
+	return nil
+}
+
 func (rm *RouteManager) BackendSnapshotSize() int {
+	rm.backendMu.RLock()
+	defer rm.backendMu.RUnlock()
+
 	total := 0
 	for _, backend := range rm.backends {
 		if backend != nil {
@@ -928,16 +997,11 @@ func (rm *RouteManager) BackendSnapshotSize() int {
 }
 
 func (rm *RouteManager) CloseBackends() error {
-	var errs []error
-	for _, backend := range rm.backends {
-		if backend == nil {
-			continue
-		}
-		if err := backend.Close(); err != nil {
-			errs = append(errs, fmt.Errorf("close %s backend: %w", backend.Name(), err))
-		}
-	}
-	return errors.Join(errs...)
+	rm.backendMu.Lock()
+	backends := rm.backends
+	rm.backends = nil
+	rm.backendMu.Unlock()
+	return closeRouteBackends(backends)
 }
 
 func (rm *RouteManager) ResetCaches() {
@@ -979,9 +1043,9 @@ func effectiveRouteTable(table int) int {
 
 func logConfig(prefix string, cfg *Config) {
 	log.Printf(
-		"%s: LISTEN=%v LISTENER_FREEBIND=%t UPSTREAMS=%v FORWARD_ZONES=%d FORWARD_ZONE_UPSTREAMS=%d WG_INTERFACE=%s WG_GATEWAY=%s WG_GATEWAY_V4=%s WG_GATEWAY_V6=%s ROUTE_TABLE=%d ROUTE_IPV4=%t ROUTE_IPV6=%t LOOKUP_CYMRU_PREFIX=%t REPLY_BEFORE_ROUTE=%t SPECIAL_DOMAINS=%d LOCAL_A=%d LOCAL_AAAA=%d",
-		prefix, cfg.ListenAddrs, cfg.ListenerFreeBind, cfg.Upstreams, len(cfg.ForwardZones), forwardZoneUpstreamCount(cfg), cfg.WGInterface, cfg.WGGateway, cfg.WGGatewayV4, cfg.WGGatewayV6, cfg.RouteTable,
-		cfg.RouteIPv4, cfg.RouteIPv6, cfg.LookupCIDR, cfg.ReplyBeforeRoute, len(cfg.SpecialDomains), len(cfg.LocalA), len(cfg.LocalAAAA),
+		"%s: LISTEN=%v LISTENER_FREEBIND=%t UPSTREAMS=%v FORWARD_ZONES=%d FORWARD_ZONE_UPSTREAMS=%d WG_INTERFACE=%s WG_GATEWAY=%s WG_GATEWAY_V4=%s WG_GATEWAY_V6=%s ROUTE_MODE=%s ROUTE_TABLE=%d ROUTE_IPV4=%t ROUTE_IPV6=%t BGP_LOCAL_ASN=%d BGP_ROUTER_ID=%s BGP_PEER=%s BGP_PEER_ASN=%d BGP_REQUIRE_ESTABLISHED=%t LOOKUP_CYMRU_PREFIX=%t REPLY_BEFORE_ROUTE=%t SPECIAL_DOMAINS=%d LOCAL_A=%d LOCAL_AAAA=%d",
+		prefix, cfg.ListenAddrs, cfg.ListenerFreeBind, cfg.Upstreams, len(cfg.ForwardZones), forwardZoneUpstreamCount(cfg), cfg.WGInterface, cfg.WGGateway, cfg.WGGatewayV4, cfg.WGGatewayV6, cfg.RouteMode, cfg.RouteTable,
+		cfg.RouteIPv4, cfg.RouteIPv6, cfg.BGP.LocalASN, cfg.BGP.RouterID, cfg.BGP.PeerAddress, cfg.BGP.PeerASN, cfg.BGP.RequireEstablished, cfg.LookupCIDR, cfg.ReplyBeforeRoute, len(cfg.SpecialDomains), len(cfg.LocalA), len(cfg.LocalAAAA),
 	)
 }
 
@@ -1025,12 +1089,16 @@ func loadConfigFromDB(db *sql.DB) (*Config, error) {
 		LocalA:           make(map[string][]LocalRecord),
 		LocalAAAA:        make(map[string][]LocalRecord),
 		DefaultTTL:       60,
+		RouteMode:        RouteModeKernel,
 		RouteTable:       0,
 		RouteIPv4:        true,
 		RouteIPv6:        true,
 		LookupCIDR:       true,
 		ReplyBeforeRoute: false,
 		ListenerFreeBind: false,
+		BGP: BGPSettings{
+			MultihopTTL: 1,
+		},
 	}
 	settings, err := readSettings(db)
 	if err != nil {
@@ -1040,6 +1108,41 @@ func loadConfigFromDB(db *sql.DB) (*Config, error) {
 	cfg.WGGatewayV4 = settings["wg_gateway_v4"]
 	cfg.WGGatewayV6 = settings["wg_gateway_v6"]
 	cfg.WGInterface = settings["wg_interface"]
+	mode, err := parseRouteMode(settings["route_mode"])
+	if err != nil {
+		return nil, err
+	}
+	cfg.RouteMode = mode
+	cfg.BGP.RouterID = strings.TrimSpace(settings["bgp_router_id"])
+	cfg.BGP.PeerAddress = strings.TrimSpace(settings["bgp_peer_address"])
+	cfg.BGP.LocalAddress = strings.TrimSpace(settings["bgp_local_address"])
+	cfg.BGP.NextHopV4 = strings.TrimSpace(settings["bgp_next_hop_v4"])
+	cfg.BGP.NextHopV6 = strings.TrimSpace(settings["bgp_next_hop_v6"])
+	cfg.BGP.Password = settings["bgp_password"]
+	if v := strings.TrimSpace(settings["bgp_local_asn"]); v != "" {
+		n, err := strconv.ParseUint(v, 10, 32)
+		if err != nil || n == 0 {
+			return nil, fmt.Errorf("invalid bgp_local_asn=%q", v)
+		}
+		cfg.BGP.LocalASN = uint32(n)
+	}
+	if v := strings.TrimSpace(settings["bgp_peer_asn"]); v != "" {
+		n, err := strconv.ParseUint(v, 10, 32)
+		if err != nil || n == 0 {
+			return nil, fmt.Errorf("invalid bgp_peer_asn=%q", v)
+		}
+		cfg.BGP.PeerASN = uint32(n)
+	}
+	if v := strings.TrimSpace(settings["bgp_multihop_ttl"]); v != "" {
+		n, err := strconv.ParseUint(v, 10, 8)
+		if err != nil || n == 0 {
+			return nil, fmt.Errorf("invalid bgp_multihop_ttl=%q", v)
+		}
+		cfg.BGP.MultihopTTL = uint32(n)
+	}
+	if v := strings.TrimSpace(settings["bgp_require_established"]); v != "" {
+		cfg.BGP.RequireEstablished = isTrueString(v)
+	}
 	if v := strings.TrimSpace(settings["route_table"]); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
@@ -1068,6 +1171,11 @@ func loadConfigFromDB(db *sql.DB) (*Config, error) {
 	}
 	if v := strings.TrimSpace(settings["listener_freebind"]); v != "" {
 		cfg.ListenerFreeBind = isTrueString(v)
+	}
+	if cfg.RouteMode.UsesBGP() {
+		if err := cfg.BGP.Validate(cfg.RouteIPv4, cfg.RouteIPv6); err != nil {
+			return nil, fmt.Errorf("invalid BGP settings: %w", err)
+		}
 	}
 	if err := readListenAddrs(db, cfg); err != nil {
 		return nil, err
@@ -1481,13 +1589,20 @@ func (a *App) reloadConfig() error {
 	if err != nil {
 		return err
 	}
-	a.syncUpstreamCircuits(cfg)
+	oldCfg := a.getConfig()
 	a.setConfig(cfg)
+	if sameRouteBackendConfig(oldCfg, cfg) {
+		if err := a.routeMgr.ReloadBackends(context.Background()); err != nil {
+			a.setConfig(oldCfg)
+			return fmt.Errorf("reload route backends after config change: %w", err)
+		}
+	} else if err := a.routeMgr.ReconfigureBackends(context.Background(), cfg); err != nil {
+		a.setConfig(oldCfg)
+		return fmt.Errorf("reconfigure route backends: %w", err)
+	}
+	a.syncUpstreamCircuits(cfg)
 	a.reconcileListeners(cfg)
 	a.routeMgr.ResetCaches()
-	if err := a.routeMgr.ReloadBackends(context.Background()); err != nil {
-		return fmt.Errorf("reload route backends after config change: %w", err)
-	}
 	logConfig("CONFIG reloaded", cfg)
 	return nil
 }

@@ -99,6 +99,20 @@ func (b *BGPRouteBackend) DesiredSize() int {
 	return len(b.desired)
 }
 
+func (b *BGPRouteBackend) DesiredRoutes() []RouteIntent {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	routes := make([]RouteIntent, 0, len(b.desired))
+	for _, route := range b.desired {
+		routes = append(routes, route)
+	}
+	sort.Slice(routes, func(i, j int) bool {
+		return routes[i].Prefix.String() < routes[j].Prefix.String()
+	})
+	return routes
+}
+
 func (b *BGPRouteBackend) rememberDesired(route RouteIntent) {
 	b.mu.Lock()
 	b.desired[route.Prefix] = route

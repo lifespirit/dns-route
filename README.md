@@ -33,3 +33,31 @@ Run:
 ```bash
 ./dns-route -http 127.0.0.1:9010 -db ./config.db
 ```
+
+## Embedded BGP (experimental)
+
+The default `route_mode` is `kernel`, so upgrading does not enable BGP automatically. The supported modes are:
+
+- `kernel` — install routes only in the configured Linux route table.
+- `bgp` — announce routes only through the embedded GoBGP speaker. The in-memory table is rebuilt from DNS answers after a full process restart.
+- `kernel+bgp` — install the exact prefix in the configured Linux route table first, then announce the same prefix through BGP. Startup and the manual route reload mirror the configured kernel table into BGP.
+
+BGP settings are not yet exposed in the web form. They can be written to the existing `settings` table. Prefer doing this while the service is stopped. Example for IPv4 `kernel+bgp`:
+
+```sql
+INSERT INTO settings(key, value) VALUES
+  ('route_mode', 'kernel+bgp'),
+  ('bgp_local_asn', '65001'),
+  ('bgp_router_id', '192.0.2.10'),
+  ('bgp_peer_address', '192.0.2.1'),
+  ('bgp_peer_asn', '65000'),
+  ('bgp_local_address', '192.0.2.10'),
+  ('bgp_next_hop_v4', '192.0.2.10'),
+  ('bgp_multihop_ttl', '1'),
+  ('bgp_require_established', 'false')
+ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+```
+
+For IPv6 routing, set `bgp_next_hop_v6` to the address that the peer must use as next hop. `bgp_next_hop_v4` and `bgp_next_hop_v6` are required only for enabled route families. `bgp_local_address` is optional. A multihop TTL greater than `1` enables eBGP multihop.
+
+After an offline database change, start or restart the service. If the database was edited while dns-route was running, send `POST /reload`. `POST /routes/reload` rereads the configured kernel table and mirrors it into BGP in `kernel+bgp` mode without reloading unrelated configuration.
