@@ -35,14 +35,15 @@ type DNSRecordRuleSet struct {
 	AAAA    []LocalRecord
 }
 
-// DNSRecordSourceState describes one successfully loaded external CSV source.
-// Source contents live only in the active Config and are never copied into
-// SQLite.
+// DNSRecordSourceState describes one configured external CSV source. Loaded
+// reports whether the active in-memory snapshot contains matching parsed data.
+// Source contents are never copied into SQLite.
 type DNSRecordSourceState struct {
 	ID         int64
 	Location   string
 	Kind       string
 	NoDataOnly bool
+	Loaded     bool
 	Domains    int
 	Records    int
 }
@@ -391,6 +392,63 @@ func newDNSRecordSourceClient() *http.Client {
 }
 
 func loadDNSRecordSources(ctx context.Context, db *sql.DB, cfg *Config, client *http.Client) error {
+	snapshots, err := fetchDNSRecordSources(ctx, db, client)
+	if err != nil {
+		return err
+	}
+	return applyDNSRecordSources(db, cfg, snapshots)
+}
+
+func fetchDNSRecordSources(ctx context.Context, db *sql.DB, client *http.Client) ([]DNSRecordWebSource, error) {
+	// Do not keep a SQLite cursor open while downloading or parsing external
+	// content. The configured rows are copied first, then all network and file
+	// I/O happens without an active database cursor or transaction.
+	sources, err := readEnabledDNSRecordSources(db)
+	if err != nil {
+		return nil, err
+	}
+
+	snapshots := make([]DNSRecordWebSource, 0, len(sources))
+	for _, source := range sources {
+		location := strings.TrimSpace(source.Location)
+		body, kind, err := openDNSRecordSource(ctx, location, client)
+		if err != nil {
+			return nil, fmt.Errorf("load DNS-record source %q: %w", location, err)
+		}
+		parsed, parseErr := parseDNSRecordsCSV(body, source.NoDataOnly != 0)
+		closeErr := body.Close()
+		if parseErr != nil {
+			return nil, fmt.Errorf("parse DNS-record source %q: %w", location, parseErr)
+		}
+		if closeErr != nil {
+			return nil, fmt.Errorf("close DNS-record source %q: %w", location, closeErr)
+		}
+
+		recordCount := 0
+		rules := make([]DNSRecordWebRule, 0, len(parsed.Domains))
+		for name, set := range parsed.Domains {
+			rules = append(rules, DNSRecordWebRule{Name: name, Set: set})
+			recordCount += dnsRecordRuleCount(set)
+		}
+		sort.Slice(rules, func(i, j int) bool { return rules[i].Name < rules[j].Name })
+		state := DNSRecordSourceState{
+			ID:         source.ID,
+			Location:   location,
+			Kind:       kind,
+			NoDataOnly: source.NoDataOnly != 0,
+			Loaded:     true,
+			Domains:    len(parsed.Domains),
+			Records:    recordCount,
+		}
+		snapshots = append(snapshots, DNSRecordWebSource{
+			State: state,
+			Rules: rules,
+		})
+	}
+	return snapshots, nil
+}
+
+func applyDNSRecordSources(db *sql.DB, cfg *Config, snapshots []DNSRecordWebSource) error {
 	if cfg == nil {
 		return fmt.Errorf("nil config")
 	}
@@ -406,62 +464,67 @@ func loadDNSRecordSources(ctx context.Context, db *sql.DB, cfg *Config, client *
 	cfg.DNSRecordSources = nil
 	cfg.DNSRecordIndex.Sources = nil
 
-	// Do not keep a SQLite cursor open while downloading or parsing external
-	// content. In rollback-journal mode that cursor holds a read lock for the
-	// entire network operation and can make an unrelated import fail at COMMIT.
-	sources, err := readEnabledDNSRecordSources(db)
+	configured, err := readEnabledDNSRecordSources(db)
 	if err != nil {
 		return err
 	}
+	byID := make(map[int64]DNSRecordWebSource, len(snapshots))
+	for _, snapshot := range snapshots {
+		byID[snapshot.State.ID] = snapshot
+	}
 
-	for _, source := range sources {
-		id := source.ID
-		location := source.Location
-		noDataOnly := source.NoDataOnly
-		body, kind, err := openDNSRecordSource(ctx, strings.TrimSpace(location), client)
-		if err != nil {
-			return fmt.Errorf("load DNS-record source %q: %w", location, err)
+	for _, source := range configured {
+		location := strings.TrimSpace(source.Location)
+		state := DNSRecordSourceState{
+			ID:         source.ID,
+			Location:   location,
+			Kind:       dnsRecordSourceKind(location),
+			NoDataOnly: source.NoDataOnly != 0,
 		}
-		parsed, parseErr := parseDNSRecordsCSV(body, noDataOnly != 0)
-		closeErr := body.Close()
-		if parseErr != nil {
-			return fmt.Errorf("parse DNS-record source %q: %w", location, parseErr)
+		snapshot, loaded := byID[source.ID]
+		if loaded && (snapshot.State.Location != location || snapshot.State.NoDataOnly != state.NoDataOnly) {
+			loaded = false
 		}
-		if closeErr != nil {
-			return fmt.Errorf("close DNS-record source %q: %w", location, closeErr)
+		if !loaded {
+			cfg.DNSRecordSources = append(cfg.DNSRecordSources, state)
+			continue
 		}
 
-		recordCount := 0
-		rules := make([]DNSRecordWebRule, 0, len(parsed.Domains))
-		for name, set := range parsed.Domains {
+		state = snapshot.State
+		state.Loaded = true
+		snapshot.State = state
+		for _, rule := range snapshot.Rules {
+			set := rule.Set
 			if set.ASet {
-				set.A = prepareCSVRecords(set.A, cfg.DefaultTTL)
-				cfg.LocalA[name] = set.A
+				set.A = preparedCSVRecords(set.A, cfg.DefaultTTL)
+				cfg.LocalA[rule.Name] = set.A
 			}
 			if set.AAAASet {
-				set.AAAA = prepareCSVRecords(set.AAAA, cfg.DefaultTTL)
-				cfg.LocalAAAA[name] = set.AAAA
+				set.AAAA = preparedCSVRecords(set.AAAA, cfg.DefaultTTL)
+				cfg.LocalAAAA[rule.Name] = set.AAAA
 			}
-			cfg.DNSRecordIndex.addDomain(name)
-			rules = append(rules, DNSRecordWebRule{Name: name, Set: set})
-			recordCount += dnsRecordRuleCount(set)
-		}
-		sort.Slice(rules, func(i, j int) bool { return rules[i].Name < rules[j].Name })
-		state := DNSRecordSourceState{
-			ID:         id,
-			Location:   location,
-			Kind:       kind,
-			NoDataOnly: noDataOnly != 0,
-			Domains:    len(parsed.Domains),
-			Records:    recordCount,
+			cfg.DNSRecordIndex.addDomain(rule.Name)
 		}
 		cfg.DNSRecordSources = append(cfg.DNSRecordSources, state)
-		cfg.DNSRecordIndex.Sources = append(cfg.DNSRecordIndex.Sources, DNSRecordWebSource{
-			State: state,
-			Rules: rules,
-		})
+		cfg.DNSRecordIndex.Sources = append(cfg.DNSRecordIndex.Sources, snapshot)
 	}
 	return nil
+}
+
+func preparedCSVRecords(records []LocalRecord, ttl uint32) []LocalRecord {
+	copied := append([]LocalRecord(nil), records...)
+	return prepareCSVRecords(copied, ttl)
+}
+
+func dnsRecordSourceKind(location string) string {
+	u, err := url.Parse(strings.TrimSpace(location))
+	if err == nil {
+		switch strings.ToLower(u.Scheme) {
+		case "http", "https":
+			return "http"
+		}
+	}
+	return "file"
 }
 
 func readEnabledDNSRecordSources(db *sql.DB) ([]dnsRecordSourceDBRow, error) {
@@ -559,19 +622,6 @@ type dnsRecordLimitedReadCloser struct {
 	io.Closer
 }
 
-func validateDNSRecordSource(ctx context.Context, location string, noDataOnly bool) error {
-	body, _, err := openDNSRecordSource(ctx, location, newDNSRecordSourceClient())
-	if err != nil {
-		return err
-	}
-	_, parseErr := parseDNSRecordsCSV(body, noDataOnly)
-	closeErr := body.Close()
-	if parseErr != nil {
-		return parseErr
-	}
-	return closeErr
-}
-
 func (a *App) handleRecordImport(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		renderError(w, http.StatusMethodNotAllowed, fmt.Errorf("method not allowed"))
@@ -659,8 +709,8 @@ func (a *App) handleRecordSourceAdd(w http.ResponseWriter, r *http.Request) {
 	}
 	location := strings.TrimSpace(r.FormValue("location"))
 	noDataOnly := formBoolean(r, "no_data_only")
-	if err := validateDNSRecordSource(r.Context(), location, noDataOnly); err != nil {
-		renderError(w, http.StatusBadRequest, fmt.Errorf("validate DNS-record source: %w", err))
+	if err := validateDNSRecordSourceLocation(location); err != nil {
+		renderError(w, http.StatusBadRequest, fmt.Errorf("validate DNS-record source location: %w", err))
 		return
 	}
 	old, err := getDNSRecordSourceByLocation(a.db, location)
@@ -697,8 +747,8 @@ func (a *App) handleRecordSourceUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	noDataOnly := formBoolean(r, "no_data_only")
-	if err := validateDNSRecordSource(r.Context(), old.Location, noDataOnly); err != nil {
-		renderError(w, http.StatusBadRequest, fmt.Errorf("validate DNS-record source: %w", err))
+	if err := validateDNSRecordSourceLocation(old.Location); err != nil {
+		renderError(w, http.StatusBadRequest, fmt.Errorf("validate DNS-record source location: %w", err))
 		return
 	}
 	if _, err := a.db.Exec(`UPDATE dns_record_sources SET no_data_only = ?, enabled = 1 WHERE id = ?`, boolInt(noDataOnly), id); err != nil {
@@ -734,6 +784,18 @@ func (a *App) handleRecordSourceDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := a.reloadConfig(); err != nil {
 		restoreDNSRecordSource(a.db, old, true, old.Location)
+		renderError(w, http.StatusInternalServerError, err)
+		return
+	}
+	redirectAdmin(w, r, "/dns-records")
+}
+
+func (a *App) handleRecordSourcesRefresh(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		renderError(w, http.StatusMethodNotAllowed, fmt.Errorf("method not allowed"))
+		return
+	}
+	if err := a.refreshDNSRecordSources(r.Context()); err != nil {
 		renderError(w, http.StatusInternalServerError, err)
 		return
 	}

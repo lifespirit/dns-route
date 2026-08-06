@@ -90,14 +90,20 @@
 </div>
 
 <div class="card section-gap">
-  <h2>External CSV sources</h2>
+  <div class="section-title-row">
+    <h2>External CSV sources</h2>
+    <form method="post" action="/record/sources/refresh">
+      <input type="hidden" name="return" value="{{$return}}">
+      <button type="submit">Refresh sources</button>
+    </form>
+  </div>
   <form method="post" action="/record/source/add" class="source-form-grid">
     <input type="hidden" name="return" value="{{$return}}">
     <label>HTTP(S) URL or filesystem path<input type="text" name="location" placeholder="https://example/list.csv or /etc/dns-route/records.csv" required></label>
     <label class="checkbox-field"><input type="checkbox" name="no_data_only" value="1"> NO_DATA only</label>
     <button type="submit">Add / update source</button>
   </form>
-  <p><small>Sources are downloaded or reread on every Reload config. Their records stay in memory. Later sources override earlier sources, while enabled local database records have final priority per name and type. NO_DATA only ignores address columns and prevents DNS-address injection.</small></p>
+  <p><small>Reload config reuses the current in-memory source snapshot and performs no file or network I/O. Refresh sources explicitly downloads HTTP sources and rereads local files, then atomically replaces the snapshot. If refresh fails, the previous snapshot remains active. Later sources override earlier sources, while enabled local database records have final priority per name and type. NO_DATA only ignores address columns and prevents DNS-address injection.</small></p>
 
   <table>
     <tr><th>ID</th><th>Location</th><th>Kind</th><th>Loaded</th><th>Mode</th><th>Actions</th></tr>
@@ -106,7 +112,7 @@
       <td>{{.ID}}</td>
       <td class="error-text">{{.Location}}</td>
       <td>{{.Kind}}</td>
-      <td>{{.Domains}} names / {{.Records}} records</td>
+      <td>{{if .Loaded}}{{.Domains}} names / {{.Records}} records{{else}}<span class="badge pending">Pending refresh</span>{{end}}</td>
       <td>{{if .NoDataOnly}}<span class="badge active">NO_DATA only</span>{{else}}normal{{end}}</td>
       <td class="nowrap">
         <form class="inline" method="post" action="/record/source/update">

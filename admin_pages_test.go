@@ -69,7 +69,7 @@ func TestDNSRecordsPageUsesFilePickerAndUnifiedSourceBlock(t *testing.T) {
 				{Name: "db.lan", Type: "A", Value: "192.0.2.2", TTL: 60, DefaultTTL: true, Source: "/tmp/source.csv", SourceKind: "file", SourceID: 2, Status: "overridden"},
 			},
 		}},
-		DNSRecordSources: []DNSRecordSourceState{{ID: 2, Location: "/tmp/source.csv", Kind: "file", Domains: 1, Records: 1}},
+		DNSRecordSources: []DNSRecordSourceState{{ID: 2, Location: "/tmp/source.csv", Kind: "file", Loaded: true, Domains: 1, Records: 1}},
 	}
 	var out strings.Builder
 	if err := templates.ExecuteTemplate(&out, "dns_records.html.tmpl", data); err != nil {
@@ -87,6 +87,9 @@ func TestDNSRecordsPageUsesFilePickerAndUnifiedSourceBlock(t *testing.T) {
 		`41 domains · page 2 of 3`,
 		`/dns-records?q=db&amp;page=3`,
 		`<h2>External CSV sources</h2>`,
+		`action="/record/sources/refresh"`,
+		`Refresh sources`,
+		`Reload config reuses the current in-memory source snapshot`,
 		`overridden`,
 		`active`,
 		`/tmp/source.csv`,

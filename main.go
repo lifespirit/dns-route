@@ -1155,6 +1155,14 @@ func (a *App) validateTemplates() error {
 }
 
 func loadConfigFromDB(db *sql.DB) (*Config, error) {
+	return loadConfigFromDBWithDNSRecordSources(db, nil, true)
+}
+
+func loadConfigFromDBWithCachedDNSRecordSources(db *sql.DB, snapshots []DNSRecordWebSource) (*Config, error) {
+	return loadConfigFromDBWithDNSRecordSources(db, snapshots, false)
+}
+
+func loadConfigFromDBWithDNSRecordSources(db *sql.DB, snapshots []DNSRecordWebSource, refreshSources bool) (*Config, error) {
 	cfg := &Config{
 		UpstreamProto:    make(map[string]string),
 		SpecialDomains:   make(map[string]struct{}),
@@ -1217,10 +1225,17 @@ func loadConfigFromDB(db *sql.DB) (*Config, error) {
 	if err := readSpecialDomains(db, cfg); err != nil {
 		return nil, err
 	}
-	// External sources form the lower-priority layer. Persistent records are
-	// loaded afterwards and replace matching name/type families in memory.
-	if err := loadDNSRecordSources(context.Background(), db, cfg, newDNSRecordSourceClient()); err != nil {
-		return nil, err
+	// External sources form the lower-priority layer. Normal config reloads
+	// reuse the current immutable source snapshot; only the explicit source
+	// refresh path performs file or network I/O.
+	var sourceErr error
+	if refreshSources {
+		sourceErr = loadDNSRecordSources(context.Background(), db, cfg, newDNSRecordSourceClient())
+	} else {
+		sourceErr = applyDNSRecordSources(db, cfg, snapshots)
+	}
+	if sourceErr != nil {
+		return nil, sourceErr
 	}
 	if err := readDNSRecords(db, cfg); err != nil {
 		return nil, err
@@ -1734,15 +1749,14 @@ func (a *App) startCacheCleanup() {
 	}()
 }
 
-func (a *App) reloadConfig() error {
-	a.reloadMu.Lock()
-	defer a.reloadMu.Unlock()
-
-	cfg, err := loadConfigFromDB(a.db)
-	if err != nil {
-		return err
+func currentDNSRecordSourceSnapshots(cfg *Config) []DNSRecordWebSource {
+	if cfg == nil || cfg.DNSRecordIndex == nil {
+		return nil
 	}
-	oldCfg := a.getConfig()
+	return append([]DNSRecordWebSource(nil), cfg.DNSRecordIndex.Sources...)
+}
+
+func (a *App) activateReloadedConfig(oldCfg, cfg *Config) error {
 	a.setConfig(cfg)
 	if sameRouteBackendConfig(oldCfg, cfg) {
 		if err := a.routeMgr.ReloadBackends(context.Background()); err != nil {
@@ -1757,6 +1771,38 @@ func (a *App) reloadConfig() error {
 	a.reconcileListeners(cfg)
 	a.routeMgr.ResetCaches()
 	logConfig("CONFIG reloaded", cfg)
+	return nil
+}
+
+func (a *App) reloadConfig() error {
+	a.reloadMu.Lock()
+	defer a.reloadMu.Unlock()
+
+	oldCfg := a.getConfig()
+	cfg, err := loadConfigFromDBWithCachedDNSRecordSources(a.db, currentDNSRecordSourceSnapshots(oldCfg))
+	if err != nil {
+		return err
+	}
+	return a.activateReloadedConfig(oldCfg, cfg)
+}
+
+func (a *App) refreshDNSRecordSources(ctx context.Context) error {
+	a.reloadMu.Lock()
+	defer a.reloadMu.Unlock()
+
+	snapshots, err := fetchDNSRecordSources(ctx, a.db, newDNSRecordSourceClient())
+	if err != nil {
+		return err
+	}
+	oldCfg := a.getConfig()
+	cfg, err := loadConfigFromDBWithCachedDNSRecordSources(a.db, snapshots)
+	if err != nil {
+		return err
+	}
+	if err := a.activateReloadedConfig(oldCfg, cfg); err != nil {
+		return err
+	}
+	log.Printf("DNS record sources refreshed: sources=%d", len(snapshots))
 	return nil
 }
 
@@ -2036,6 +2082,7 @@ func (a *App) startHTTP() {
 	mux.HandleFunc("/record/source/add", a.handleRecordSourceAdd)
 	mux.HandleFunc("/record/source/update", a.handleRecordSourceUpdate)
 	mux.HandleFunc("/record/source/delete", a.handleRecordSourceDelete)
+	mux.HandleFunc("/record/sources/refresh", a.handleRecordSourcesRefresh)
 	go func() {
 		log.Printf("admin http listening on %s", a.adminAddr)
 		if err := http.ListenAndServe(a.adminAddr, mux); err != nil {

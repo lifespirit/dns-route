@@ -534,6 +534,121 @@ func TestLoadDNSRecordSourcesClosesDatabaseRowsBeforeHTTP(t *testing.T) {
 	}
 }
 
+func TestCachedDNSRecordSourcesReloadWithoutIO(t *testing.T) {
+	db := openDNSRecordTestDB(t)
+
+	var mu sync.Mutex
+	body := "cached.lan,A,192.0.2.10\n"
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		requests++
+		current := body
+		mu.Unlock()
+		_, _ = io.WriteString(w, current)
+	}))
+	defer server.Close()
+
+	if _, err := db.Exec(`INSERT INTO dns_record_sources(location, no_data_only, enabled) VALUES(?, 0, 1)`, server.URL); err != nil {
+		t.Fatal(err)
+	}
+
+	snapshots, err := fetchDNSRecordSources(context.Background(), db, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadConfigFromDBWithCachedDNSRecordSources(db, snapshots)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.LocalA["cached.lan"][0].IP.String(); got != "192.0.2.10" {
+		t.Fatalf("initial cached A = %q", got)
+	}
+	if len(cfg.DNSRecordSources) != 1 || !cfg.DNSRecordSources[0].Loaded {
+		t.Fatalf("initial source state = %#v", cfg.DNSRecordSources)
+	}
+
+	mu.Lock()
+	body = "cached.lan,A,192.0.2.20\n"
+	mu.Unlock()
+
+	cfg, err = loadConfigFromDBWithCachedDNSRecordSources(db, snapshots)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.LocalA["cached.lan"][0].IP.String(); got != "192.0.2.10" {
+		t.Fatalf("reload unexpectedly reread source, A = %q", got)
+	}
+	mu.Lock()
+	if requests != 1 {
+		t.Fatalf("requests after cached reload = %d", requests)
+	}
+	mu.Unlock()
+
+	refreshed, err := fetchDNSRecordSources(context.Background(), db, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = loadConfigFromDBWithCachedDNSRecordSources(db, refreshed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.LocalA["cached.lan"][0].IP.String(); got != "192.0.2.20" {
+		t.Fatalf("refreshed A = %q", got)
+	}
+	mu.Lock()
+	if requests != 2 {
+		t.Fatalf("requests after explicit refresh = %d", requests)
+	}
+	mu.Unlock()
+}
+
+func TestChangedDNSRecordSourceModeRequiresRefresh(t *testing.T) {
+	db := openDNSRecordTestDB(t)
+	filePath := filepath.Join(t.TempDir(), "records.csv")
+	if err := os.WriteFile(filePath, []byte("mode.lan,A,192.0.2.50\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO dns_record_sources(location, no_data_only, enabled) VALUES(?, 0, 1)`, filePath); err != nil {
+		t.Fatal(err)
+	}
+
+	snapshots, err := fetchDNSRecordSources(context.Background(), db, newDNSRecordSourceClient())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE dns_record_sources SET no_data_only = 1 WHERE location = ?`, filePath); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := loadConfigFromDBWithCachedDNSRecordSources(db, snapshots)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := cfg.LocalA["mode.lan"]; ok {
+		t.Fatalf("stale source rules remained active: %#v", cfg.LocalA["mode.lan"])
+	}
+	if len(cfg.DNSRecordSources) != 1 || cfg.DNSRecordSources[0].Loaded {
+		t.Fatalf("changed source should be pending refresh: %#v", cfg.DNSRecordSources)
+	}
+
+	refreshed, err := fetchDNSRecordSources(context.Background(), db, newDNSRecordSourceClient())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = loadConfigFromDBWithCachedDNSRecordSources(db, refreshed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := cfg.LocalA["mode.lan"][0]
+	if !record.NoData || record.IP != nil {
+		t.Fatalf("NO_DATA-only refreshed record = %#v", record)
+	}
+	if !cfg.DNSRecordSources[0].Loaded {
+		t.Fatalf("refreshed source state = %#v", cfg.DNSRecordSources[0])
+	}
+}
+
 func TestReplaceImportedDNSRecordsRemainsWritableAfterBusyCommit(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "busy-import.db")
 	writer, err := sql.Open("sqlite", path)
