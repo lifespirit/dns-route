@@ -33,6 +33,7 @@ func openDNSRecordTestDB(t *testing.T) *sql.DB {
 func TestParseDNSRecordsCSVForms(t *testing.T) {
 	parsed, err := parseDNSRecordsCSV(strings.NewReader(strings.Join([]string{
 		"test.lan",
+		"trailing-comma.lan,",
 		"a.lan,A",
 		"aaaa.lan,AAAA",
 		"empty-a.lan,A,",
@@ -47,6 +48,10 @@ func TestParseDNSRecordsCSVForms(t *testing.T) {
 	both := parsed.Domains["test.lan"]
 	if !both.ASet || !both.AAAASet || len(both.A) != 1 || !both.A[0].NoData || len(both.AAAA) != 1 || !both.AAAA[0].NoData {
 		t.Fatalf("single-column rule = %#v", both)
+	}
+	trailingComma := parsed.Domains["trailing-comma.lan"]
+	if !trailingComma.ASet || !trailingComma.AAAASet || len(trailingComma.A) != 1 || !trailingComma.A[0].NoData || len(trailingComma.AAAA) != 1 || !trailingComma.AAAA[0].NoData {
+		t.Fatalf("trailing-comma rule = %#v", trailingComma)
 	}
 	if set := parsed.Domains["a.lan"]; !set.ASet || set.AAAASet || len(set.A) != 1 || !set.A[0].NoData {
 		t.Fatalf("A-only NODATA rule = %#v", set)
@@ -69,7 +74,7 @@ func TestParseDNSRecordsCSVForms(t *testing.T) {
 }
 
 func TestParseDNSRecordsCSVNoDataOnlyIgnoresAddresses(t *testing.T) {
-	parsed, err := parseDNSRecordsCSV(strings.NewReader("evil-a.lan,A,203.0.113.10,ignored\nevil-aaaa.lan,AAAA,2001:db8::10\nboth.lan\n"), true)
+	parsed, err := parseDNSRecordsCSV(strings.NewReader("evil-a.lan,A,203.0.113.10,ignored\nevil-aaaa.lan,AAAA,2001:db8::10\nboth.lan\ntrailing.lan,\n"), true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,6 +87,10 @@ func TestParseDNSRecordsCSVNoDataOnlyIgnoresAddresses(t *testing.T) {
 	both := parsed.Domains["both.lan"]
 	if !both.A[0].NoData || !both.AAAA[0].NoData {
 		t.Fatalf("single-column source record = %#v", both)
+	}
+	trailing := parsed.Domains["trailing.lan"]
+	if !trailing.ASet || !trailing.AAAASet || !trailing.A[0].NoData || !trailing.AAAA[0].NoData {
+		t.Fatalf("trailing-comma source record = %#v", trailing)
 	}
 }
 

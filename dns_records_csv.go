@@ -148,6 +148,12 @@ func parseDNSRecordsCSV(r io.Reader, noDataOnly bool) (*dnsRecordCSV, error) {
 		} else if len(record) > 3 {
 			return nil, fmt.Errorf("CSV line %d: expected 1 to 3 columns, got %d", line, len(record))
 		}
+		// A trailing delimiter without a record type is equivalent to the
+		// one-column Pi-hole form and therefore means NODATA for both A and
+		// AAAA. encoding/csv represents "domain," as two fields.
+		if len(record) == 2 && record[1] == "" {
+			record = record[:1]
+		}
 
 		name, err := normalizeDNSRecordName(record[0])
 		if err != nil {
