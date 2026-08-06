@@ -17,10 +17,12 @@ h3 { margin-bottom: 6px; }
 a { color: inherit; }
 .topbar { border-bottom: 1px solid #8886; padding: 16px 24px; display: flex; align-items: center; justify-content: space-between; gap: 24px; flex-wrap: wrap; }
 .brand small { opacity: .72; }
+.header-controls { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 12px; }
 .nav { display: flex; flex-wrap: wrap; gap: 6px; }
 .nav a { text-decoration: none; padding: 7px 10px; border-radius: 8px; }
 .nav a:hover { background: #8882; }
 .nav a.active { background: #8883; font-weight: 650; }
+.header-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .container { width: min(1500px, 100%); margin: 0 auto; padding: 24px; flex: 1; }
 table { border-collapse: collapse; width: 100%; margin-top: 8px; }
 th, td { border: 1px solid #8886; padding: 8px; text-align: left; vertical-align: top; }
@@ -45,10 +47,10 @@ button { padding: 7px 11px; cursor: pointer; }
 .error-text { max-width: 520px; overflow-wrap: anywhere; }
 .site-footer { border-top: 1px solid #8886; padding: 14px 24px; }
 .footer-inner { width: min(1500px, 100%); margin: 0 auto; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; }
-.footer-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .footer-links { display: flex; flex-wrap: wrap; gap: 12px; }
 @media (max-width: 900px) {
   .topbar, .container, .site-footer { padding-left: 12px; padding-right: 12px; }
+  .header-controls { width: 100%; justify-content: flex-start; }
   .grid { grid-template-columns: 1fr; }
   .form-grid, .forward-grid { grid-template-columns: 1fr; }
 }
@@ -60,13 +62,20 @@ button { padding: 7px 11px; cursor: pointer; }
     <h1>dns-route</h1>
     <small>HTTP panel: {{.Message}}</small>
   </div>
-  <nav class="nav" aria-label="Admin sections">
-    <a href="/" {{if eq .Path "/"}}class="active"{{end}}>Runtime</a>
-    <a href="/settings" {{if eq .Path "/settings"}}class="active"{{end}}>Settings</a>
-    <a href="/upstreams" {{if eq .Path "/upstreams"}}class="active"{{end}}>Upstreams</a>
-    <a href="/special-domains" {{if eq .Path "/special-domains"}}class="active"{{end}}>Special domains</a>
-    <a href="/dns-records" {{if eq .Path "/dns-records"}}class="active"{{end}}>DNS records</a>
-  </nav>
+  <div class="header-controls">
+    <nav class="nav" aria-label="Admin sections">
+      <a href="/" {{if eq .Path "/"}}class="active"{{end}}>Runtime</a>
+      <a href="/settings" {{if eq .Path "/settings"}}class="active"{{end}}>Settings</a>
+      <a href="/upstreams" {{if eq .Path "/upstreams"}}class="active"{{end}}>Upstreams</a>
+      <a href="/special-domains" {{if eq .Path "/special-domains"}}class="active"{{end}}>Special domains</a>
+      <a href="/dns-records" {{if eq .Path "/dns-records"}}class="active"{{end}}>DNS records</a>
+      <a href="/statistics" {{if eq .Path "/statistics"}}class="active"{{end}}>Statistics</a>
+    </nav>
+    <div class="header-actions" aria-label="Runtime actions">
+      <form class="inline" method="post" action="/reload"><input type="hidden" name="return" value="{{.Path}}"><button type="submit">Reload config</button></form>
+      <form class="inline" method="post" action="/routes/reload"><input type="hidden" name="return" value="{{.Path}}"><button type="submit">Reload routes</button></form>
+    </div>
+  </div>
 </header>
 <main class="container">
 {{end}}
@@ -75,12 +84,7 @@ button { padding: 7px 11px; cursor: pointer; }
 </main>
 <footer class="site-footer">
   <div class="footer-inner">
-    <div class="footer-actions">
-      <form class="inline" method="post" action="/reload"><input type="hidden" name="return" value="{{.Path}}"><button type="submit">Reload config</button></form>
-      <form class="inline" method="post" action="/routes/reload"><input type="hidden" name="return" value="{{.Path}}"><button type="submit">Reload routes</button></form>
-    </div>
     <div class="footer-links">
-      <a href="/statistics">Statistics</a>
       <a href="/metrics" target="_blank" rel="noopener">Prometheus metrics</a>
       <a href="/routes/errors" target="_blank" rel="noopener">Route error log</a>
     </div>
