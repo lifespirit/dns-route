@@ -395,10 +395,8 @@ func TestLoadDNSRecordSourcesTracksActiveAndOverriddenRecords(t *testing.T) {
 		source string
 	}
 	statuses := make(map[key]string)
-	for _, entry := range cfg.DNSRecordEntries {
-		if entry.Name == "same.lan" {
-			statuses[key{entry.Value, entry.Source}] = entry.Status
-		}
+	for _, entry := range cfg.DNSRecordIndex.recordsForDomain("same.lan", cfg.DefaultTTL) {
+		statuses[key{entry.Value, entry.Source}] = entry.Status
 	}
 	if got := statuses[key{"192.0.2.10", "Database"}]; got != "active" {
 		t.Fatalf("database A status = %q", got)
@@ -433,10 +431,11 @@ func TestDisabledDatabaseRecordIsShownButNotOverridden(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(cfg.DNSRecordEntries) != 2 {
-		t.Fatalf("record entries = %d", len(cfg.DNSRecordEntries))
+	entries := cfg.DNSRecordIndex.recordsForDomain("same.lan", cfg.DefaultTTL)
+	if len(entries) != 2 {
+		t.Fatalf("record entries = %d", len(entries))
 	}
-	for _, entry := range cfg.DNSRecordEntries {
+	for _, entry := range entries {
 		if entry.Persistent && entry.Status != "disabled" {
 			t.Fatalf("disabled database status = %q", entry.Status)
 		}
@@ -476,10 +475,8 @@ func TestPersistentRecordsOverrideSourcesPerFamily(t *testing.T) {
 	}
 
 	statuses := make(map[string]string)
-	for _, entry := range cfg.DNSRecordEntries {
-		if entry.Name == "mixed.lan" {
-			statuses[entry.Source+"|"+entry.Type+"|"+entry.Value] = entry.Status
-		}
+	for _, entry := range cfg.DNSRecordIndex.recordsForDomain("mixed.lan", cfg.DefaultTTL) {
+		statuses[entry.Source+"|"+entry.Type+"|"+entry.Value] = entry.Status
 	}
 	if got := statuses[file+"|A|192.0.2.20"]; got != "overridden" {
 		t.Fatalf("source A status = %q", got)

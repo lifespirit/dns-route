@@ -1,9 +1,10 @@
 {{define "dns_records.html.tmpl"}}
 {{template "admin_header" .}}
+{{$return := .RecordReturnURL}}
 <div class="card">
   <h2>DNS records</h2>
   <form id="record-add-form" method="post" action="/record/add">
-    <input type="hidden" name="return" value="/dns-records">
+    <input type="hidden" name="return" value="{{$return}}">
     <table>
       <tr>
         <td><input type="text" name="name" placeholder="example.com or *.example.com" required></td>
@@ -16,7 +17,7 @@
   <div class="actions" aria-label="DNS record actions">
     <button type="submit" form="record-add-form">Add record</button>
     <form id="record-import-form" class="inline" method="post" action="/record/import" enctype="multipart/form-data">
-      <input type="hidden" name="return" value="/dns-records">
+      <input type="hidden" name="return" value="{{$return}}">
       <input id="record-import-file" class="visually-hidden" type="file" name="file" accept=".csv,text/csv,text/plain" required onchange="if (this.files.length) this.form.submit()">
     </form>
     <button type="button" onclick="document.getElementById('record-import-file').click()">Import CSV</button>
@@ -24,46 +25,74 @@
   </div>
   <p><small>Import replaces every persistent A/AAAA record for each name present in the selected file. Export downloads the persistent database records only.</small></p>
 
+  <form method="get" action="/dns-records" class="search-row">
+    <label>Search domains
+      <input type="text" name="q" value="{{.RecordQuery}}" placeholder="substring or /regexp/" maxlength="512">
+    </label>
+    <button type="submit">Search</button>
+    <a href="/dns-records">Clear</a>
+  </form>
+  <p><small>Plain text performs a case-insensitive substring search. Expressions wrapped in slashes use Go RE2 syntax, for example <code>/^ads\..*\.lan$/</code>.</small></p>
+  {{if .RecordSearchError}}<div class="search-error">{{.RecordSearchError}}</div>{{end}}
+
+  <div class="pagination">
+    <span>{{.RecordTotalDomains}} domains · page {{.RecordPage}} of {{.RecordTotalPages}}</span>
+    <span class="pagination-links">
+      {{if .RecordHasPrev}}<a href="{{.RecordPrevURL}}">Previous</a>{{else}}<span class="muted">Previous</span>{{end}}
+      {{if .RecordHasNext}}<a href="{{.RecordNextURL}}">Next</a>{{else}}<span class="muted">Next</span>{{end}}
+    </span>
+  </div>
+
   <table>
-    <tr><th>Name</th><th>Type</th><th>Value</th><th>TTL</th><th>Source</th><th>Status</th><th>Action</th></tr>
-    {{range .Records}}
-    <tr>
-      <td>{{.Name}}</td>
-      <td>{{.Type}}</td>
-      <td>{{if .Value}}{{.Value}}{{else}}<span class="badge disabled">NODATA</span>{{end}}</td>
-      <td>{{if .DefaultTTL}}default ({{.TTL}}){{else}}{{.TTL}}{{end}}</td>
-      <td class="source-cell">
-        {{if .Persistent}}
-          <span class="badge disabled">database</span>
-        {{else}}
-          <a href="#record-source-{{.SourceID}}"><span class="badge source">{{.SourceKind}} #{{.SourceID}}</span></a>
-          <small class="source-location">{{.Source}}</small>
-        {{end}}
-      </td>
-      <td>
-        {{if eq .Status "active"}}<span class="badge active">active</span>
-        {{else if eq .Status "overridden"}}<span class="badge overridden">overridden</span>
-        {{else if eq .Status "disabled"}}<span class="badge disabled">disabled</span>
-        {{else}}<span class="badge invalid">invalid</span>{{end}}
-      </td>
-      <td>
-        {{if .Persistent}}
-        <form class="inline" method="post" action="/record/delete">
-          <input type="hidden" name="return" value="/dns-records">
-          <input type="hidden" name="id" value="{{.ID}}">
-          <button type="submit">Delete</button>
-        </form>
-        {{else}}<span class="muted">Managed by source</span>{{end}}
-      </td>
-    </tr>
-    {{else}}<tr><td colspan="7" class="muted">No DNS records configured or loaded.</td></tr>{{end}}
+    <tr><th>Type</th><th>Value</th><th>TTL</th><th>Source</th><th>Status</th><th>Action</th></tr>
+    {{range .RecordDomains}}
+      <tr class="domain-heading"><td colspan="6">{{.Name}}</td></tr>
+      {{range .Records}}
+      <tr>
+        <td>{{.Type}}</td>
+        <td>{{if .Value}}{{.Value}}{{else}}<span class="badge disabled">NODATA</span>{{end}}</td>
+        <td>{{if .DefaultTTL}}default ({{.TTL}}){{else}}{{.TTL}}{{end}}</td>
+        <td class="source-cell">
+          {{if .Persistent}}
+            <span class="badge disabled">database</span>
+          {{else}}
+            <a href="#record-source-{{.SourceID}}"><span class="badge source">{{.SourceKind}} #{{.SourceID}}</span></a>
+            <small class="source-location">{{.Source}}</small>
+          {{end}}
+        </td>
+        <td>
+          {{if eq .Status "active"}}<span class="badge active">active</span>
+          {{else if eq .Status "overridden"}}<span class="badge overridden">overridden</span>
+          {{else if eq .Status "disabled"}}<span class="badge disabled">disabled</span>
+          {{else}}<span class="badge invalid">invalid</span>{{end}}
+        </td>
+        <td>
+          {{if .Persistent}}
+          <form class="inline" method="post" action="/record/delete">
+            <input type="hidden" name="return" value="{{$return}}">
+            <input type="hidden" name="id" value="{{.ID}}">
+            <button type="submit">Delete</button>
+          </form>
+          {{else}}<span class="muted">Managed by source</span>{{end}}
+        </td>
+      </tr>
+      {{end}}
+    {{else}}<tr><td colspan="6" class="muted">No matching DNS records.</td></tr>{{end}}
   </table>
+
+  <div class="pagination">
+    <span>{{.RecordTotalDomains}} domains · page {{.RecordPage}} of {{.RecordTotalPages}}</span>
+    <span class="pagination-links">
+      {{if .RecordHasPrev}}<a href="{{.RecordPrevURL}}">Previous</a>{{else}}<span class="muted">Previous</span>{{end}}
+      {{if .RecordHasNext}}<a href="{{.RecordNextURL}}">Next</a>{{else}}<span class="muted">Next</span>{{end}}
+    </span>
+  </div>
 </div>
 
 <div class="card section-gap">
   <h2>External CSV sources</h2>
   <form method="post" action="/record/source/add" class="source-form-grid">
-    <input type="hidden" name="return" value="/dns-records">
+    <input type="hidden" name="return" value="{{$return}}">
     <label>HTTP(S) URL or filesystem path<input type="text" name="location" placeholder="https://example/list.csv or /etc/dns-route/records.csv" required></label>
     <label class="checkbox-field"><input type="checkbox" name="no_data_only" value="1"> NO_DATA only</label>
     <button type="submit">Add / update source</button>
@@ -81,13 +110,13 @@
       <td>{{if .NoDataOnly}}<span class="badge active">NO_DATA only</span>{{else}}normal{{end}}</td>
       <td class="nowrap">
         <form class="inline" method="post" action="/record/source/update">
-          <input type="hidden" name="return" value="/dns-records">
+          <input type="hidden" name="return" value="{{$return}}">
           <input type="hidden" name="id" value="{{.ID}}">
           <label><input type="checkbox" name="no_data_only" value="1" {{if .NoDataOnly}}checked{{end}}> NO_DATA only</label>
           <button type="submit">Update</button>
         </form>
         <form class="inline" method="post" action="/record/source/delete">
-          <input type="hidden" name="return" value="/dns-records">
+          <input type="hidden" name="return" value="{{$return}}">
           <input type="hidden" name="id" value="{{.ID}}">
           <button type="submit">Delete</button>
         </form>

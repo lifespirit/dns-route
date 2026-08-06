@@ -15,6 +15,7 @@ func TestAdminReturnPath(t *testing.T) {
 		want     string
 	}{
 		{name: "known page", form: "return=%2Fupstreams", fallback: "/", want: "/upstreams"},
+		{name: "page query", form: "return=%2Fdns-records%3Fq%3Dads%26page%3D2", fallback: "/", want: "/dns-records?q=ads&page=2"},
 		{name: "statistics page", form: "return=%2Fstatistics", fallback: "/", want: "/statistics"},
 		{name: "missing", form: "", fallback: "/settings", want: "/settings"},
 		{name: "external URL rejected", form: "return=https%3A%2F%2Fexample.com", fallback: "/", want: "/"},
@@ -48,14 +49,26 @@ func TestLegacyStatsRedirect(t *testing.T) {
 
 func TestDNSRecordsPageUsesFilePickerAndUnifiedSourceBlock(t *testing.T) {
 	data := pageData{
-		Title:   "DNS records",
-		Path:    "/dns-records",
-		Config:  &Config{},
-		Message: "127.0.0.1:8080",
-		Records: []DNSRecordState{
-			{Name: "db.lan", Type: "A", Value: "192.0.2.1", TTL: 60, DefaultTTL: true, Source: "Database", SourceKind: "database", Status: "active", Persistent: true, ID: 1},
-			{Name: "db.lan", Type: "A", Value: "192.0.2.2", TTL: 60, DefaultTTL: true, Source: "/tmp/source.csv", SourceKind: "file", SourceID: 2, Status: "overridden"},
-		},
+		Title:              "DNS records",
+		Path:               "/dns-records",
+		Config:             &Config{},
+		Message:            "127.0.0.1:8080",
+		RecordQuery:        "db",
+		RecordPage:         2,
+		RecordTotalPages:   3,
+		RecordTotalDomains: 41,
+		RecordHasPrev:      true,
+		RecordHasNext:      true,
+		RecordPrevURL:      "/dns-records?q=db",
+		RecordNextURL:      "/dns-records?q=db&page=3",
+		RecordReturnURL:    "/dns-records?q=db&page=2",
+		RecordDomains: []DNSRecordDomainView{{
+			Name: "db.lan",
+			Records: []DNSRecordState{
+				{Name: "db.lan", Type: "A", Value: "192.0.2.1", TTL: 60, DefaultTTL: true, Source: "Database", SourceKind: "database", Status: "active", Persistent: true, ID: 1},
+				{Name: "db.lan", Type: "A", Value: "192.0.2.2", TTL: 60, DefaultTTL: true, Source: "/tmp/source.csv", SourceKind: "file", SourceID: 2, Status: "overridden"},
+			},
+		}},
 		DNSRecordSources: []DNSRecordSourceState{{ID: 2, Location: "/tmp/source.csv", Kind: "file", Domains: 1, Records: 1}},
 	}
 	var out strings.Builder
@@ -69,10 +82,15 @@ func TestDNSRecordsPageUsesFilePickerAndUnifiedSourceBlock(t *testing.T) {
 		`document.getElementById('record-import-file').click()`,
 		`onchange="if (this.files.length) this.form.submit()"`,
 		`action="/record/export"`,
+		`name="q" value="db"`,
+		`substring or /regexp/`,
+		`41 domains · page 2 of 3`,
+		`/dns-records?q=db&amp;page=3`,
 		`<h2>External CSV sources</h2>`,
 		`overridden`,
 		`active`,
 		`/tmp/source.csv`,
+		`value="/dns-records?q=db&amp;page=2"`,
 	} {
 		if !strings.Contains(html, expected) {
 			t.Fatalf("rendered page does not contain %q", expected)

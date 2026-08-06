@@ -17,6 +17,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -153,7 +154,7 @@ type Config struct {
 	ForwardZones     []ForwardZone
 	SpecialDomains   map[string]struct{}
 	DNSRecordSources []DNSRecordSourceState
-	DNSRecordEntries []DNSRecordState
+	DNSRecordIndex   *DNSRecordWebIndex
 	LocalA           map[string][]LocalRecord
 	LocalAAAA        map[string][]LocalRecord
 	WGGatewayV4      string
@@ -408,19 +409,29 @@ type bgpStatusView struct {
 }
 
 type pageData struct {
-	Title            string
-	Path             string
-	Config           *Config
-	Settings         map[string]string
-	ListenAddrs      []string
-	ListenerStates   []listenerView
-	Upstreams        []upstreamView
-	ForwardZones     []forwardZoneView
-	SpecialDomains   []string
-	DNSRecordSources []DNSRecordSourceState
-	Records          []DNSRecordState
-	BGP              bgpStatusView
-	Message          string
+	Title              string
+	Path               string
+	Config             *Config
+	Settings           map[string]string
+	ListenAddrs        []string
+	ListenerStates     []listenerView
+	Upstreams          []upstreamView
+	ForwardZones       []forwardZoneView
+	SpecialDomains     []string
+	DNSRecordSources   []DNSRecordSourceState
+	RecordDomains      []DNSRecordDomainView
+	RecordQuery        string
+	RecordSearchError  string
+	RecordPage         int
+	RecordTotalPages   int
+	RecordTotalDomains int
+	RecordHasPrev      bool
+	RecordHasNext      bool
+	RecordPrevURL      string
+	RecordNextURL      string
+	RecordReturnURL    string
+	BGP                bgpStatusView
+	Message            string
 }
 
 type statsData struct {
@@ -1106,7 +1117,9 @@ func (a *App) validateTemplates() error {
 		ForwardZones:     a.forwardZoneViews(cfg),
 		SpecialDomains:   []string{},
 		DNSRecordSources: []DNSRecordSourceState{},
-		Records:          []DNSRecordState{},
+		RecordPage:       1,
+		RecordTotalPages: 1,
+		RecordReturnURL:  "/dns-records",
 		BGP:              a.bgpStatus(cfg),
 		Message:          a.adminAddr,
 	}
@@ -1147,6 +1160,7 @@ func loadConfigFromDB(db *sql.DB) (*Config, error) {
 		SpecialDomains:   make(map[string]struct{}),
 		LocalA:           make(map[string][]LocalRecord),
 		LocalAAAA:        make(map[string][]LocalRecord),
+		DNSRecordIndex:   newDNSRecordWebIndex(),
 		DefaultTTL:       60,
 		RouteMode:        RouteModeKernel,
 		RouteTable:       0,
@@ -1211,7 +1225,7 @@ func loadConfigFromDB(db *sql.DB) (*Config, error) {
 	if err := readDNSRecords(db, cfg); err != nil {
 		return nil, err
 	}
-	sortDNSRecordStates(cfg.DNSRecordEntries)
+	cfg.DNSRecordIndex.finalize()
 	cfg.ListenAddrs = uniqueStrings(cfg.ListenAddrs)
 	cfg.Upstreams = uniqueStrings(cfg.Upstreams)
 	return cfg, nil
@@ -1402,6 +1416,9 @@ func readDNSRecords(db *sql.DB, cfg *Config) error {
 		return err
 	}
 	defer rows.Close()
+	if cfg.DNSRecordIndex == nil {
+		cfg.DNSRecordIndex = newDNSRecordWebIndex()
+	}
 
 	// The first valid enabled SQLite record for a name/type family replaces the
 	// complete external-source family. Further SQLite rows of that family are
@@ -1420,20 +1437,20 @@ func readDNSRecords(db *sql.DB, cfg *Config) error {
 		typ = strings.ToUpper(strings.TrimSpace(typ))
 		value = strings.TrimSpace(value)
 		state := DNSRecordState{
-			ID:          id,
-			Name:        name,
-			Type:        typ,
-			Value:       value,
-			Source:      "Database",
-			SourceKind:  "database",
-			Status:      "active",
-			Persistent:  true,
-			sourceLayer: 0,
-			nameKey:     name,
-			typeKey:     typ,
+			ID:         id,
+			Name:       name,
+			Type:       typ,
+			Value:      value,
+			Source:     "Database",
+			SourceKind: "database",
+			Status:     "active",
+			Persistent: true,
 		}
 		if state.Name == "" {
 			state.Name = rawName
+			if state.Name == "" {
+				state.Name = "(empty name)"
+			}
 		}
 		if ttl > 0 {
 			state.TTL = uint32(ttl)
@@ -1443,12 +1460,12 @@ func readDNSRecords(db *sql.DB, cfg *Config) error {
 		}
 		if enabled == 0 {
 			state.Status = "disabled"
-			cfg.DNSRecordEntries = append(cfg.DNSRecordEntries, state)
+			addPersistentDNSRecordState(cfg, state)
 			continue
 		}
 		if name == "" || (typ != "A" && typ != "AAAA") {
 			state.Status = "invalid"
-			cfg.DNSRecordEntries = append(cfg.DNSRecordEntries, state)
+			addPersistentDNSRecordState(cfg, state)
 			continue
 		}
 
@@ -1462,7 +1479,7 @@ func readDNSRecords(db *sql.DB, cfg *Config) error {
 				ip := net.ParseIP(value)
 				if ip == nil || ip.To4() == nil {
 					state.Status = "invalid"
-					cfg.DNSRecordEntries = append(cfg.DNSRecordEntries, state)
+					addPersistentDNSRecordState(cfg, state)
 					continue
 				}
 				v4 := ip.To4()
@@ -1476,7 +1493,7 @@ func readDNSRecords(db *sql.DB, cfg *Config) error {
 				ip := net.ParseIP(value)
 				if ip == nil || ip.To4() != nil {
 					state.Status = "invalid"
-					cfg.DNSRecordEntries = append(cfg.DNSRecordEntries, state)
+					addPersistentDNSRecordState(cfg, state)
 					continue
 				}
 				ip = ip.To16()
@@ -1487,7 +1504,6 @@ func readDNSRecords(db *sql.DB, cfg *Config) error {
 
 		familyKey := name + "\x00" + typ
 		if _, exists := persistentFamilies[familyKey]; !exists {
-			markDNSRecordFamilyOverridden(cfg.DNSRecordEntries, name, typ)
 			if typ == "A" {
 				delete(cfg.LocalA, name)
 			} else {
@@ -1500,9 +1516,21 @@ func readDNSRecords(db *sql.DB, cfg *Config) error {
 		} else {
 			cfg.LocalAAAA[name] = append(cfg.LocalAAAA[name], record)
 		}
-		cfg.DNSRecordEntries = append(cfg.DNSRecordEntries, state)
+		addPersistentDNSRecordState(cfg, state)
 	}
 	return rows.Err()
+}
+
+func addPersistentDNSRecordState(cfg *Config, state DNSRecordState) {
+	if cfg == nil {
+		return
+	}
+	if cfg.DNSRecordIndex == nil {
+		cfg.DNSRecordIndex = newDNSRecordWebIndex()
+	}
+	key := state.Name
+	cfg.DNSRecordIndex.addDomain(key)
+	cfg.DNSRecordIndex.Persistent[key] = append(cfg.DNSRecordIndex.Persistent[key], state)
 }
 
 func normalizeName(name string) string {
@@ -2041,7 +2069,6 @@ func (a *App) adminPageData(title, path string) (pageData, error) {
 		ForwardZones:     a.forwardZoneViews(cfg),
 		SpecialDomains:   specials,
 		DNSRecordSources: append([]DNSRecordSourceState(nil), cfg.DNSRecordSources...),
-		Records:          append([]DNSRecordState(nil), cfg.DNSRecordEntries...),
 		BGP:              a.bgpStatus(cfg),
 		Message:          a.adminAddr,
 	}, nil
@@ -2083,7 +2110,41 @@ func (a *App) handleSpecialDomainsPage(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) handleDNSRecordsPage(w http.ResponseWriter, r *http.Request) {
-	a.renderAdminPage(w, r, "/dns-records", "DNS records", "dns_records.html.tmpl")
+	if r.URL.Path != "/dns-records" {
+		http.NotFound(w, r)
+		return
+	}
+	if r.Method != http.MethodGet {
+		renderError(w, http.StatusMethodNotAllowed, fmt.Errorf("method not allowed"))
+		return
+	}
+	data, err := a.adminPageData("DNS records", "/dns-records")
+	if err != nil {
+		renderError(w, http.StatusInternalServerError, err)
+		return
+	}
+	page := 1
+	if rawPage := strings.TrimSpace(r.URL.Query().Get("page")); rawPage != "" {
+		if parsed, parseErr := strconv.Atoi(rawPage); parseErr == nil && parsed > 0 {
+			page = parsed
+		}
+	}
+	query := r.URL.Query().Get("q")
+	view := data.Config.DNSRecordIndex.page(query, page, data.Config.DefaultTTL)
+	data.RecordDomains = view.Domains
+	data.RecordQuery = view.Query
+	data.RecordSearchError = view.SearchError
+	data.RecordPage = view.Page
+	data.RecordTotalPages = view.TotalPages
+	data.RecordTotalDomains = view.TotalDomains
+	data.RecordHasPrev = view.HasPrev
+	data.RecordHasNext = view.HasNext
+	data.RecordPrevURL = view.PrevURL
+	data.RecordNextURL = view.NextURL
+	data.RecordReturnURL = view.ReturnURL
+	if err := templates.ExecuteTemplate(w, "dns_records.html.tmpl", data); err != nil {
+		renderError(w, http.StatusInternalServerError, err)
+	}
 }
 
 func (a *App) handleStatistics(w http.ResponseWriter, r *http.Request) {
@@ -2116,10 +2177,17 @@ func (a *App) handleStatsRedirect(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/statistics", http.StatusPermanentRedirect)
 }
 func adminReturnPath(r *http.Request, fallback string) string {
-	path := strings.TrimSpace(r.FormValue("return"))
-	switch path {
+	raw := strings.TrimSpace(r.FormValue("return"))
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.IsAbs() || parsed.Host != "" || parsed.Fragment != "" {
+		return fallback
+	}
+	switch parsed.Path {
 	case "/", "/settings", "/upstreams", "/special-domains", "/dns-records", "/statistics":
-		return path
+		if parsed.RawQuery != "" {
+			return parsed.Path + "?" + parsed.RawQuery
+		}
+		return parsed.Path
 	default:
 		return fallback
 	}

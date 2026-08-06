@@ -23,6 +23,8 @@ import (
 
 const dnsRecordImportMaxBytes int64 = 32 << 20
 
+var dnsRecordNoData = []LocalRecord{{NoData: true}}
+
 // DNSRecordRuleSet describes the A and AAAA records supplied for one name by
 // one CSV input. ASet/AAAASet distinguish an omitted family from an explicit
 // NODATA rule, which is represented by one LocalRecord with NoData=true.
@@ -50,20 +52,17 @@ type DNSRecordSourceState struct {
 // later external sources override earlier external layers per name and type;
 // persistent SQLite records are applied last and have final priority.
 type DNSRecordState struct {
-	ID          int64
-	Name        string
-	Type        string
-	Value       string
-	TTL         uint32
-	DefaultTTL  bool
-	Source      string
-	SourceKind  string
-	SourceID    int64
-	Status      string
-	Persistent  bool
-	sourceLayer int
-	nameKey     string
-	typeKey     string
+	ID         int64
+	Name       string
+	Type       string
+	Value      string
+	TTL        uint32
+	DefaultTTL bool
+	Source     string
+	SourceKind string
+	SourceID   int64
+	Status     string
+	Persistent bool
 }
 
 type dnsRecordCSV struct {
@@ -165,8 +164,8 @@ func parseDNSRecordsCSV(r io.Reader, noDataOnly bool) (*dnsRecordCSV, error) {
 		case 1:
 			set.ASet = true
 			set.AAAASet = true
-			set.A = []LocalRecord{{NoData: true}}
-			set.AAAA = []LocalRecord{{NoData: true}}
+			set.A = dnsRecordNoData
+			set.AAAA = dnsRecordNoData
 		case 2, 3:
 			typ := strings.ToUpper(strings.TrimSpace(record[1]))
 			if typ != "A" && typ != "AAAA" {
@@ -223,7 +222,7 @@ func dnsRecordForCSV(typ, value string) (LocalRecord, error) {
 // NODATA and additional addresses are appended as a multi-value DNS answer.
 func mergeCSVFamily(existing []LocalRecord, rec LocalRecord) []LocalRecord {
 	if rec.NoData || rec.IP == nil {
-		return []LocalRecord{{NoData: true}}
+		return dnsRecordNoData
 	}
 	if len(existing) == 1 && existing[0].NoData {
 		existing = nil
@@ -236,17 +235,14 @@ func mergeCSVFamily(existing []LocalRecord, rec LocalRecord) []LocalRecord {
 	return append(existing, rec)
 }
 
-func cloneCSVRecords(records []LocalRecord, ttl uint32) []LocalRecord {
-	out := make([]LocalRecord, 0, len(records))
-	for _, rec := range records {
-		copyRec := rec
-		copyRec.TTL = ttl
-		if rec.IP != nil {
-			copyRec.IP = append(net.IP(nil), rec.IP...)
-		}
-		out = append(out, copyRec)
+func prepareCSVRecords(records []LocalRecord, ttl uint32) []LocalRecord {
+	if len(records) == 1 && records[0].NoData {
+		return records
 	}
-	return out
+	for i := range records {
+		records[i].TTL = ttl
+	}
+	return records
 }
 
 func dnsRecordRuleCount(set DNSRecordRuleSet) int {
@@ -404,7 +400,11 @@ func loadDNSRecordSources(ctx context.Context, db *sql.DB, cfg *Config, client *
 	if cfg.LocalAAAA == nil {
 		cfg.LocalAAAA = make(map[string][]LocalRecord)
 	}
+	if cfg.DNSRecordIndex == nil {
+		cfg.DNSRecordIndex = newDNSRecordWebIndex()
+	}
 	cfg.DNSRecordSources = nil
+	cfg.DNSRecordIndex.Sources = nil
 
 	// Do not keep a SQLite cursor open while downloading or parsing external
 	// content. In rollback-journal mode that cursor holds a read lock for the
@@ -414,8 +414,7 @@ func loadDNSRecordSources(ctx context.Context, db *sql.DB, cfg *Config, client *
 		return err
 	}
 
-	for sourceIndex, source := range sources {
-		sourceLayer := sourceIndex + 1
+	for _, source := range sources {
 		id := source.ID
 		location := source.Location
 		noDataOnly := source.NoDataOnly
@@ -433,32 +432,33 @@ func loadDNSRecordSources(ctx context.Context, db *sql.DB, cfg *Config, client *
 		}
 
 		recordCount := 0
-		names := make([]string, 0, len(parsed.Domains))
-		for name := range parsed.Domains {
-			names = append(names, name)
-		}
-		sort.Strings(names)
-		for _, name := range names {
-			set := parsed.Domains[name]
+		rules := make([]DNSRecordWebRule, 0, len(parsed.Domains))
+		for name, set := range parsed.Domains {
 			if set.ASet {
-				markDNSRecordFamilyOverridden(cfg.DNSRecordEntries, name, "A")
-				cfg.LocalA[name] = cloneCSVRecords(set.A, cfg.DefaultTTL)
-				cfg.DNSRecordEntries = appendDNSRecordSourceEntries(cfg.DNSRecordEntries, id, sourceLayer, location, kind, name, "A", set.A, cfg.DefaultTTL)
+				set.A = prepareCSVRecords(set.A, cfg.DefaultTTL)
+				cfg.LocalA[name] = set.A
 			}
 			if set.AAAASet {
-				markDNSRecordFamilyOverridden(cfg.DNSRecordEntries, name, "AAAA")
-				cfg.LocalAAAA[name] = cloneCSVRecords(set.AAAA, cfg.DefaultTTL)
-				cfg.DNSRecordEntries = appendDNSRecordSourceEntries(cfg.DNSRecordEntries, id, sourceLayer, location, kind, name, "AAAA", set.AAAA, cfg.DefaultTTL)
+				set.AAAA = prepareCSVRecords(set.AAAA, cfg.DefaultTTL)
+				cfg.LocalAAAA[name] = set.AAAA
 			}
+			cfg.DNSRecordIndex.addDomain(name)
+			rules = append(rules, DNSRecordWebRule{Name: name, Set: set})
 			recordCount += dnsRecordRuleCount(set)
 		}
-		cfg.DNSRecordSources = append(cfg.DNSRecordSources, DNSRecordSourceState{
+		sort.Slice(rules, func(i, j int) bool { return rules[i].Name < rules[j].Name })
+		state := DNSRecordSourceState{
 			ID:         id,
 			Location:   location,
 			Kind:       kind,
 			NoDataOnly: noDataOnly != 0,
 			Domains:    len(parsed.Domains),
 			Records:    recordCount,
+		}
+		cfg.DNSRecordSources = append(cfg.DNSRecordSources, state)
+		cfg.DNSRecordIndex.Sources = append(cfg.DNSRecordIndex.Sources, DNSRecordWebSource{
+			State: state,
+			Rules: rules,
 		})
 	}
 	return nil
@@ -483,57 +483,6 @@ func readEnabledDNSRecordSources(db *sql.DB) ([]dnsRecordSourceDBRow, error) {
 		return nil, err
 	}
 	return sources, nil
-}
-
-func markDNSRecordFamilyOverridden(entries []DNSRecordState, name, typ string) {
-	for i := range entries {
-		if entries[i].Status == "active" && entries[i].nameKey == name && entries[i].typeKey == typ {
-			entries[i].Status = "overridden"
-		}
-	}
-}
-
-func appendDNSRecordSourceEntries(entries []DNSRecordState, sourceID int64, sourceLayer int, location, kind, name, typ string, records []LocalRecord, ttl uint32) []DNSRecordState {
-	for _, record := range records {
-		value := ""
-		if !record.NoData && record.IP != nil {
-			value = record.IP.String()
-		}
-		entries = append(entries, DNSRecordState{
-			Name:        name,
-			Type:        typ,
-			Value:       value,
-			TTL:         ttl,
-			DefaultTTL:  true,
-			Source:      location,
-			SourceKind:  kind,
-			SourceID:    sourceID,
-			Status:      "active",
-			Persistent:  false,
-			sourceLayer: sourceLayer,
-			nameKey:     name,
-			typeKey:     typ,
-		})
-	}
-	return entries
-}
-
-func sortDNSRecordStates(entries []DNSRecordState) {
-	sort.SliceStable(entries, func(i, j int) bool {
-		if entries[i].nameKey != entries[j].nameKey {
-			return entries[i].nameKey < entries[j].nameKey
-		}
-		if entries[i].typeKey != entries[j].typeKey {
-			return entries[i].typeKey < entries[j].typeKey
-		}
-		if entries[i].sourceLayer != entries[j].sourceLayer {
-			return entries[i].sourceLayer < entries[j].sourceLayer
-		}
-		if entries[i].ID != entries[j].ID {
-			return entries[i].ID < entries[j].ID
-		}
-		return entries[i].Value < entries[j].Value
-	})
 }
 
 func validateDNSRecordSourceLocation(location string) error {
