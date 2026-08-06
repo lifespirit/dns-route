@@ -65,6 +65,21 @@ After an offline database change, start or restart the service. If the database 
 
 The admin and statistics pages show the peer state, backend readiness, ephemeral desired-prefix count and embedded GoBGP Loc-RIB count. Prometheus exports the same state through `dns_route_bgp_*` metrics and exposes the selected mode through `dns_route_route_mode_info`.
 
+## Special-domain CSV configuration
+
+The Special domains page supports persistent CSV import/export and external HTTP or filesystem sources. Each non-empty row contains one pattern:
+
+```text
+example.com
+*.yandex.ru
+```
+
+A normal domain preserves the original dns-route behavior: it matches the domain itself and every subdomain. A leading `*.` wildcard matches subdomains only, so `*.yandex.ru` matches `maps.yandex.ru` but not the `yandex.ru` apex. Empty rows, `#`/`;` comments, duplicate rows, a UTF-8 BOM and a one-column `domain` or `pattern` header are accepted. Non-empty extra CSV columns are rejected.
+
+Web import stores normalized patterns in the `special_domains` SQLite table and enables an existing duplicate. Export includes persistent enabled database patterns only. External source contents remain in the immutable in-memory snapshot and are never copied into `special_domains`.
+
+Special-domain sources accept the same `http://`, `https://`, `file:///...` and filesystem-path forms as DNS-record sources. The header **Reload sources** action reloads both source classes and activates them together only after every configured source has downloaded and parsed successfully. Normal **Reload config** performs no source I/O and reuses the active snapshots. Exact and wildcard patterns are compiled into a suffix matcher, so DNS request processing does not scan the complete source list.
+
 ## DNS-record CSV configuration
 
 The DNS records page supports persistent CSV import/export and external CSV sources.

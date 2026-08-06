@@ -795,7 +795,7 @@ func (a *App) handleRecordSourcesRefresh(w http.ResponseWriter, r *http.Request)
 		renderError(w, http.StatusMethodNotAllowed, fmt.Errorf("method not allowed"))
 		return
 	}
-	if err := a.refreshDNSRecordSources(r.Context()); err != nil {
+	if err := a.refreshExternalSources(r.Context()); err != nil {
 		renderError(w, http.StatusInternalServerError, err)
 		return
 	}

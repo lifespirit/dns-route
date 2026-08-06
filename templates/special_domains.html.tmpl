@@ -2,14 +2,46 @@
 {{template "admin_header" .}}
 <div class="card">
   <h2>Special domains</h2>
-  <form method="post" action="/special/add">
+  <form id="special-add-form" method="post" action="/special/add">
     <input type="hidden" name="return" value="/special-domains">
-    <input type="text" name="domain" placeholder="example.com" required>
-    <p><button type="submit">Add special domain</button></p>
+    <input type="text" name="domain" placeholder="example.com or *.example.com" required>
   </form>
+  <div class="actions" aria-label="Special-domain actions">
+    <button type="submit" form="special-add-form">Add special domain</button>
+    <form id="special-import-form" class="inline" method="post" action="/special/import" enctype="multipart/form-data">
+      <input type="hidden" name="return" value="/special-domains">
+      <input id="special-import-file" class="visually-hidden" type="file" name="file" accept=".csv,text/csv,text/plain" required onchange="if (this.files.length) this.form.submit()">
+    </form>
+    <button type="button" onclick="document.getElementById('special-import-file').click()">Import CSV</button>
+    <form class="inline" method="get" action="/special/export"><button type="submit">Export CSV</button></form>
+  </div>
+  <p><small>Each CSV row contains one domain or one leading wildcard such as <code>*.yandex.ru</code>. A normal domain matches the domain itself and all subdomains; a wildcard matches subdomains only. Imported rows are stored in SQLite. Export contains persistent database rows only.</small></p>
+
   <table>
-    <tr><th>Domain</th><th>Action</th></tr>
-    {{range .SpecialDomains}}<tr><td>{{.}}</td><td><form class="inline" method="post" action="/special/delete"><input type="hidden" name="return" value="/special-domains"><input type="hidden" name="domain" value="{{.}}"><button type="submit">Delete</button></form></td></tr>{{else}}<tr><td colspan="2" class="muted">No special domains configured.</td></tr>{{end}}
+    <tr><th>Domain pattern</th><th>Action</th></tr>
+    {{range .SpecialDomains}}<tr><td>{{.}}</td><td><form class="inline" method="post" action="/special/delete"><input type="hidden" name="return" value="/special-domains"><input type="hidden" name="domain" value="{{.}}"><button type="submit">Delete</button></form></td></tr>{{else}}<tr><td colspan="2" class="muted">No persistent special domains configured.</td></tr>{{end}}
+  </table>
+</div>
+
+<div class="card section-gap">
+  <div class="section-title-row"><h2>External CSV sources</h2></div>
+  <form method="post" action="/special/source/add" class="special-source-form-grid">
+    <input type="hidden" name="return" value="/special-domains">
+    <label>HTTP(S) URL or filesystem path<input type="text" name="location" placeholder="https://example/domains.csv or /etc/dns-route/special-domains.csv" required></label>
+    <button type="submit">Add source</button>
+  </form>
+  <p><small>Reload config reuses the current in-memory snapshot. Reload sources downloads HTTP sources and rereads local files, then atomically activates DNS-record and special-domain sources together. If any source fails, the previous snapshot remains active.</small></p>
+  <table>
+    <tr><th>ID</th><th>Location</th><th>Kind</th><th>Loaded</th><th>Action</th></tr>
+    {{range .SpecialDomainSources}}
+    <tr>
+      <td>{{.ID}}</td>
+      <td class="error-text">{{.Location}}</td>
+      <td>{{.Kind}}</td>
+      <td>{{if .Loaded}}{{.Patterns}} patterns{{else}}<span class="badge pending">Pending reload</span>{{end}}</td>
+      <td><form class="inline" method="post" action="/special/source/delete"><input type="hidden" name="return" value="/special-domains"><input type="hidden" name="id" value="{{.ID}}"><button type="submit">Delete</button></form></td>
+    </tr>
+    {{else}}<tr><td colspan="5" class="muted">No external special-domain sources configured.</td></tr>{{end}}
   </table>
 </div>
 {{template "admin_footer" .}}
