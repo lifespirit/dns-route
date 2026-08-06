@@ -17,7 +17,6 @@
     <tr><td>Reply before route</td><td>{{.Config.ReplyBeforeRoute}}</td></tr>
     <tr><td>Listener freebind</td><td>{{.Config.ListenerFreeBind}}</td></tr>
     <tr><td>WG interface</td><td>{{.Config.WGInterface}}</td></tr>
-    <tr><td>WG gateway</td><td>{{.Config.WGGateway}}</td></tr>
     <tr><td>WG gateway v4</td><td>{{.Config.WGGatewayV4}}</td></tr>
     <tr><td>WG gateway v6</td><td>{{.Config.WGGatewayV6}}</td></tr>
     <tr><td>BGP peer</td><td>{{if .BGP.Enabled}}<span class="badge {{.BGP.State}}">{{.BGP.State}}</span> {{.BGP.PeerAddress}} AS{{.BGP.PeerASN}}{{else}}<span class="badge disabled">disabled</span>{{end}}</td></tr>

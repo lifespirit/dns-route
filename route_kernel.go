@@ -289,10 +289,7 @@ func routeGatewayForCIDR(cfg *Config, dst *net.IPNet) (net.IP, bool, error) {
 	if dst.IP.To4() != nil {
 		gatewayValue := strings.TrimSpace(cfg.WGGatewayV4)
 		if gatewayValue == "" {
-			gatewayValue = strings.TrimSpace(cfg.WGGateway)
-		}
-		if gatewayValue == "" {
-			return nil, false, fmt.Errorf("wg_gateway_v4 or legacy wg_gateway is empty")
+			return nil, false, fmt.Errorf("wg_gateway_v4 is empty")
 		}
 		gateway := net.ParseIP(gatewayValue)
 		if gateway == nil || gateway.To4() == nil {
@@ -302,12 +299,6 @@ func routeGatewayForCIDR(cfg *Config, dst *net.IPNet) (net.IP, bool, error) {
 	}
 
 	gatewayValue := strings.TrimSpace(cfg.WGGatewayV6)
-	if gatewayValue == "" {
-		gateway := net.ParseIP(strings.TrimSpace(cfg.WGGateway))
-		if gateway != nil && gateway.To4() == nil {
-			gatewayValue = strings.TrimSpace(cfg.WGGateway)
-		}
-	}
 	if gatewayValue == "" {
 		return nil, false, nil
 	}

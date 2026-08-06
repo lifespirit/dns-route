@@ -8,8 +8,7 @@
       <table>
         <tr><th>Key</th><th>Value</th></tr>
         <tr><td>wg_interface</td><td><input type="text" name="wg_interface" value="{{index .Settings "wg_interface"}}"></td></tr>
-        <tr><td>wg_gateway</td><td><input type="text" name="wg_gateway" value="{{index .Settings "wg_gateway"}}"><br><small>Legacy fallback, mainly for IPv4.</small></td></tr>
-        <tr><td>wg_gateway_v4</td><td><input type="text" name="wg_gateway_v4" value="{{index .Settings "wg_gateway_v4"}}"><br><small>Overrides wg_gateway for A routes.</small></td></tr>
+        <tr><td>wg_gateway_v4</td><td><input type="text" name="wg_gateway_v4" value="{{index .Settings "wg_gateway_v4"}}"><br><small>IPv4 gateway for routes created from A records.</small></td></tr>
         <tr><td>wg_gateway_v6</td><td><input type="text" name="wg_gateway_v6" value="{{index .Settings "wg_gateway_v6"}}"><br><small>AAAA routes are device-only when empty.</small></td></tr>
         <tr>
           <td>route_mode</td>

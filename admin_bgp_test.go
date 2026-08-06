@@ -61,6 +61,9 @@ func TestSettingsTemplateRendersBGPSettingsWithoutSecret(t *testing.T) {
 	if strings.Contains(html, cfg.BGP.Password) {
 		t.Fatal("BGP password leaked into settings HTML")
 	}
+	if strings.Contains(html, `name="wg_gateway"`) {
+		t.Fatal("legacy wg_gateway field is still rendered")
+	}
 }
 
 func TestRuntimeTemplateContainsOnlyRuntimeContent(t *testing.T) {
@@ -95,6 +98,7 @@ func TestRuntimeTemplateContainsOnlyRuntimeContent(t *testing.T) {
 	}
 	for _, unwanted := range []string{
 		`<h2>Global settings</h2>`,
+		`<td>WG gateway</td>`,
 		`action="/settings/save"`,
 		`<h2>Conditional forwarding</h2>`,
 		`action="/record/add"`,

@@ -217,3 +217,36 @@ func TestKernelBackendSnapshotRoutesReturnsExactTablePrefixes(t *testing.T) {
 		}
 	}
 }
+
+func TestRouteGatewayForCIDRRequiresExplicitIPv4Gateway(t *testing.T) {
+	gateway, ok, err := routeGatewayForCIDR(&Config{}, mustIPNet(t, "192.0.2.0/24"))
+	if err == nil {
+		t.Fatal("expected an error when wg_gateway_v4 is empty")
+	}
+	if gateway != nil || ok {
+		t.Fatalf("gateway=%v ok=%t, want no gateway", gateway, ok)
+	}
+}
+
+func TestRouteGatewayForCIDRUsesIPv4Gateway(t *testing.T) {
+	gateway, ok, err := routeGatewayForCIDR(
+		&Config{WGGatewayV4: "192.0.2.1"},
+		mustIPNet(t, "198.51.100.0/24"),
+	)
+	if err != nil {
+		t.Fatalf("routeGatewayForCIDR returned error: %v", err)
+	}
+	if !ok || gateway.String() != "192.0.2.1" {
+		t.Fatalf("gateway=%v ok=%t, want 192.0.2.1", gateway, ok)
+	}
+}
+
+func TestRouteGatewayForCIDRAllowsDirectIPv6Route(t *testing.T) {
+	gateway, ok, err := routeGatewayForCIDR(&Config{}, mustIPNet(t, "2001:db8::/32"))
+	if err != nil {
+		t.Fatalf("routeGatewayForCIDR returned error: %v", err)
+	}
+	if gateway != nil || ok {
+		t.Fatalf("gateway=%v ok=%t, want direct IPv6 route", gateway, ok)
+	}
+}

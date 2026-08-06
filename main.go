@@ -154,7 +154,6 @@ type Config struct {
 	SpecialDomains   map[string]struct{}
 	LocalA           map[string][]LocalRecord
 	LocalAAAA        map[string][]LocalRecord
-	WGGateway        string
 	WGGatewayV4      string
 	WGGatewayV6      string
 	WGInterface      string
@@ -451,7 +450,6 @@ type statsData struct {
 	RouteTable       int
 	BGP              bgpStatusView
 	WGInterface      string
-	WGGateway        string
 	WGGatewayV4      string
 	WGGatewayV6      string
 	RouteSnapshot    int
@@ -1083,8 +1081,8 @@ func effectiveRouteTable(table int) int {
 
 func logConfig(prefix string, cfg *Config) {
 	log.Printf(
-		"%s: LISTEN=%v LISTENER_FREEBIND=%t UPSTREAMS=%v FORWARD_ZONES=%d FORWARD_ZONE_UPSTREAMS=%d WG_INTERFACE=%s WG_GATEWAY=%s WG_GATEWAY_V4=%s WG_GATEWAY_V6=%s ROUTE_MODE=%s ROUTE_TABLE=%d ROUTE_IPV4=%t ROUTE_IPV6=%t BGP_LOCAL_ASN=%d BGP_ROUTER_ID=%s BGP_PEER=%s BGP_PEER_ASN=%d BGP_REQUIRE_ESTABLISHED=%t LOOKUP_CYMRU_PREFIX=%t REPLY_BEFORE_ROUTE=%t SPECIAL_DOMAINS=%d LOCAL_A=%d LOCAL_AAAA=%d",
-		prefix, cfg.ListenAddrs, cfg.ListenerFreeBind, cfg.Upstreams, len(cfg.ForwardZones), forwardZoneUpstreamCount(cfg), cfg.WGInterface, cfg.WGGateway, cfg.WGGatewayV4, cfg.WGGatewayV6, cfg.RouteMode, cfg.RouteTable,
+		"%s: LISTEN=%v LISTENER_FREEBIND=%t UPSTREAMS=%v FORWARD_ZONES=%d FORWARD_ZONE_UPSTREAMS=%d WG_INTERFACE=%s WG_GATEWAY_V4=%s WG_GATEWAY_V6=%s ROUTE_MODE=%s ROUTE_TABLE=%d ROUTE_IPV4=%t ROUTE_IPV6=%t BGP_LOCAL_ASN=%d BGP_ROUTER_ID=%s BGP_PEER=%s BGP_PEER_ASN=%d BGP_REQUIRE_ESTABLISHED=%t LOOKUP_CYMRU_PREFIX=%t REPLY_BEFORE_ROUTE=%t SPECIAL_DOMAINS=%d LOCAL_A=%d LOCAL_AAAA=%d",
+		prefix, cfg.ListenAddrs, cfg.ListenerFreeBind, cfg.Upstreams, len(cfg.ForwardZones), forwardZoneUpstreamCount(cfg), cfg.WGInterface, cfg.WGGatewayV4, cfg.WGGatewayV6, cfg.RouteMode, cfg.RouteTable,
 		cfg.RouteIPv4, cfg.RouteIPv6, cfg.BGP.LocalASN, cfg.BGP.RouterID, cfg.BGP.PeerAddress, cfg.BGP.PeerASN, cfg.BGP.RequireEstablished, cfg.LookupCIDR, cfg.ReplyBeforeRoute, len(cfg.SpecialDomains), len(cfg.LocalA), len(cfg.LocalAAAA),
 	)
 }
@@ -1162,7 +1160,6 @@ func loadConfigFromDB(db *sql.DB) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	cfg.WGGateway = settings["wg_gateway"]
 	cfg.WGGatewayV4 = settings["wg_gateway_v4"]
 	cfg.WGGatewayV6 = settings["wg_gateway_v6"]
 	cfg.WGInterface = settings["wg_interface"]
@@ -1242,6 +1239,7 @@ func boolSetting(v bool) string {
 func initDB(db *sql.DB) error {
 	stmts := []string{
 		`CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);`,
+		`DELETE FROM settings WHERE key = 'wg_gateway';`,
 		`CREATE TABLE IF NOT EXISTS listen_addrs (id INTEGER PRIMARY KEY AUTOINCREMENT, addr TEXT NOT NULL UNIQUE, enabled INTEGER NOT NULL DEFAULT 1);`,
 		`CREATE TABLE IF NOT EXISTS upstreams (id INTEGER PRIMARY KEY AUTOINCREMENT, addr TEXT NOT NULL UNIQUE, proto TEXT NOT NULL DEFAULT 'auto', enabled INTEGER NOT NULL DEFAULT 1, priority INTEGER NOT NULL DEFAULT 100);`,
 		`CREATE TABLE IF NOT EXISTS forward_zones (id INTEGER PRIMARY KEY AUTOINCREMENT, domain TEXT NOT NULL UNIQUE, enabled INTEGER NOT NULL DEFAULT 1);`,
@@ -2107,7 +2105,6 @@ func (a *App) handleSettingsSave(w http.ResponseWriter, r *http.Request) {
 
 	settings := map[string]string{
 		"wg_interface":            strings.TrimSpace(r.FormValue("wg_interface")),
-		"wg_gateway":              strings.TrimSpace(r.FormValue("wg_gateway")),
 		"wg_gateway_v4":           strings.TrimSpace(r.FormValue("wg_gateway_v4")),
 		"wg_gateway_v6":           strings.TrimSpace(r.FormValue("wg_gateway_v6")),
 		"route_mode":              strings.TrimSpace(r.FormValue("route_mode")),
@@ -3741,7 +3738,7 @@ func (a *App) statsSnapshot() statsData {
 		PendingListeners: pendingListeners,
 		ListenAddrs:      len(cfg.ListenAddrs), Upstreams: len(cfg.Upstreams), ForwardZones: len(cfg.ForwardZones), ForwardUpstreams: forwardZoneUpstreamCount(cfg), SpecialDomains: len(cfg.SpecialDomains),
 		LocalADomains: len(cfg.LocalA), LocalAAAADomains: len(cfg.LocalAAAA), LookupCIDR: cfg.LookupCIDR,
-		ReplyBeforeRoute: cfg.ReplyBeforeRoute, ListenerFreeBind: cfg.ListenerFreeBind, RouteMode: string(cfg.RouteMode), RouteIPv4: cfg.RouteIPv4, RouteIPv6: cfg.RouteIPv6, RouteTable: cfg.RouteTable, BGP: bgp, WGInterface: cfg.WGInterface, WGGateway: cfg.WGGateway, WGGatewayV4: cfg.WGGatewayV4, WGGatewayV6: cfg.WGGatewayV6,
+		ReplyBeforeRoute: cfg.ReplyBeforeRoute, ListenerFreeBind: cfg.ListenerFreeBind, RouteMode: string(cfg.RouteMode), RouteIPv4: cfg.RouteIPv4, RouteIPv6: cfg.RouteIPv6, RouteTable: cfg.RouteTable, BGP: bgp, WGInterface: cfg.WGInterface, WGGatewayV4: cfg.WGGatewayV4, WGGatewayV6: cfg.WGGatewayV6,
 		RouteSnapshot: routeSnapshot, IPCacheEntries: ipEntries, CIDRCacheEntries: cidrEntries,
 		TotalQueries: atomic.LoadUint64(&a.totalQueries), CacheHits: atomic.LoadUint64(&a.cacheHits), CacheMisses: atomic.LoadUint64(&a.cacheMisses),
 		LocalAnswers: atomic.LoadUint64(&a.localAnswers), ForwardedOK: atomic.LoadUint64(&a.forwardedOK), ServfailCount: atomic.LoadUint64(&a.servfailCount),
