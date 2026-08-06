@@ -286,8 +286,9 @@ type RouteManager struct {
 type App struct {
 	db *sql.DB
 
-	cfg   *Config
-	cfgMu sync.RWMutex
+	cfg      *Config
+	cfgMu    sync.RWMutex
+	reloadMu sync.Mutex
 
 	cache   map[string]cacheEntry
 	cacheMu sync.RWMutex
@@ -483,7 +484,7 @@ func main() {
 	httpAddr := flag.String("http", "127.0.0.1:8080", "admin http listen addr")
 	flag.Parse()
 
-	db, err := sql.Open("sqlite", *dbPath)
+	db, err := sql.Open("sqlite", sqliteDSN(*dbPath))
 	if err != nil {
 		log.Fatalf("open db: %v", err)
 	}
@@ -1706,6 +1707,9 @@ func (a *App) startCacheCleanup() {
 }
 
 func (a *App) reloadConfig() error {
+	a.reloadMu.Lock()
+	defer a.reloadMu.Unlock()
+
 	cfg, err := loadConfigFromDB(a.db)
 	if err != nil {
 		return err
@@ -2231,19 +2235,14 @@ func (a *App) handleSettingsSave(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	tx, err := a.db.Begin()
-	if err != nil {
-		renderError(w, http.StatusInternalServerError, err)
-		return
-	}
-	for k, v := range settings {
-		if _, err := tx.Exec(`INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`, k, v); err != nil {
-			_ = tx.Rollback()
-			renderError(w, http.StatusInternalServerError, err)
-			return
+	if err := withSQLiteWriteTx(r.Context(), a.db, func(conn *sql.Conn) error {
+		for k, v := range settings {
+			if _, err := conn.ExecContext(r.Context(), `INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`, k, v); err != nil {
+				return err
+			}
 		}
-	}
-	if err := tx.Commit(); err != nil {
+		return nil
+	}); err != nil {
 		renderError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -2339,26 +2338,19 @@ func (a *App) handleForwardZoneAdd(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tx, err := a.db.Begin()
-	if err != nil {
-		renderError(w, http.StatusInternalServerError, err)
-		return
-	}
-	defer func() { _ = tx.Rollback() }()
-	if _, err := tx.Exec(`INSERT INTO forward_zones(domain, enabled) VALUES(?, 1) ON CONFLICT(domain) DO UPDATE SET enabled = 1`, domain); err != nil {
-		renderError(w, http.StatusInternalServerError, err)
-		return
-	}
-	var zoneID int64
-	if err := tx.QueryRow(`SELECT id FROM forward_zones WHERE domain = ?`, domain).Scan(&zoneID); err != nil {
-		renderError(w, http.StatusInternalServerError, err)
-		return
-	}
-	if _, err := tx.Exec(`INSERT INTO forward_zone_upstreams(zone_id, addr, proto, enabled, priority) VALUES(?, ?, ?, 1, 100) ON CONFLICT(zone_id, addr) DO UPDATE SET proto = excluded.proto, enabled = 1`, zoneID, addr, proto); err != nil {
-		renderError(w, http.StatusInternalServerError, err)
-		return
-	}
-	if err := tx.Commit(); err != nil {
+	if err := withSQLiteWriteTx(r.Context(), a.db, func(conn *sql.Conn) error {
+		if _, err := conn.ExecContext(r.Context(), `INSERT INTO forward_zones(domain, enabled) VALUES(?, 1) ON CONFLICT(domain) DO UPDATE SET enabled = 1`, domain); err != nil {
+			return err
+		}
+		var zoneID int64
+		if err := conn.QueryRowContext(r.Context(), `SELECT id FROM forward_zones WHERE domain = ?`, domain).Scan(&zoneID); err != nil {
+			return err
+		}
+		if _, err := conn.ExecContext(r.Context(), `INSERT INTO forward_zone_upstreams(zone_id, addr, proto, enabled, priority) VALUES(?, ?, ?, 1, 100) ON CONFLICT(zone_id, addr) DO UPDATE SET proto = excluded.proto, enabled = 1`, zoneID, addr, proto); err != nil {
+			return err
+		}
+		return nil
+	}); err != nil {
 		renderError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -2400,21 +2392,15 @@ func (a *App) handleForwardZoneDelete(w http.ResponseWriter, r *http.Request) {
 		renderError(w, http.StatusBadRequest, fmt.Errorf("invalid forward-zone id"))
 		return
 	}
-	tx, err := a.db.Begin()
-	if err != nil {
-		renderError(w, http.StatusInternalServerError, err)
-		return
-	}
-	defer func() { _ = tx.Rollback() }()
-	if _, err := tx.Exec(`DELETE FROM forward_zone_upstreams WHERE zone_id = ?`, id); err != nil {
-		renderError(w, http.StatusInternalServerError, err)
-		return
-	}
-	if _, err := tx.Exec(`DELETE FROM forward_zones WHERE id = ?`, id); err != nil {
-		renderError(w, http.StatusInternalServerError, err)
-		return
-	}
-	if err := tx.Commit(); err != nil {
+	if err := withSQLiteWriteTx(r.Context(), a.db, func(conn *sql.Conn) error {
+		if _, err := conn.ExecContext(r.Context(), `DELETE FROM forward_zone_upstreams WHERE zone_id = ?`, id); err != nil {
+			return err
+		}
+		if _, err := conn.ExecContext(r.Context(), `DELETE FROM forward_zones WHERE id = ?`, id); err != nil {
+			return err
+		}
+		return nil
+	}); err != nil {
 		renderError(w, http.StatusInternalServerError, err)
 		return
 	}

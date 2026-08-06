@@ -13,13 +13,14 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/miekg/dns"
 )
 
 func openDNSRecordTestDB(t *testing.T) *sql.DB {
 	t.Helper()
-	db, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "dns-route.db"))
+	db, err := sql.Open("sqlite", sqliteDSN(filepath.Join(t.TempDir(), "dns-route.db")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -491,5 +492,118 @@ func TestPersistentRecordsOverrideSourcesPerFamily(t *testing.T) {
 	}
 	if got := statuses["Database|A|192.0.2.11"]; got != "active" {
 		t.Fatalf("second database A status = %q", got)
+	}
+}
+
+func TestLoadDNSRecordSourcesClosesDatabaseRowsBeforeHTTP(t *testing.T) {
+	db := openDNSRecordTestDB(t)
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// This write must be able to borrow the only database connection while the
+		// source is being downloaded. If loadDNSRecordSources still holds its
+		// SELECT rows open, this handler cannot respond and the client times out.
+		if _, err := db.Exec(`INSERT INTO settings(key, value) VALUES('source_probe', 'ok') ON CONFLICT(key) DO UPDATE SET value = excluded.value`); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		_, _ = io.WriteString(w, "probe.lan,A,192.0.2.77\n")
+	}))
+	defer server.Close()
+
+	if _, err := db.Exec(`INSERT INTO dns_record_sources(location, no_data_only, enabled) VALUES(?, 0, 1)`, server.URL); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &Config{
+		LocalA:     make(map[string][]LocalRecord),
+		LocalAAAA:  make(map[string][]LocalRecord),
+		DefaultTTL: 60,
+	}
+	client := server.Client()
+	client.Timeout = 2 * time.Second
+	if err := loadDNSRecordSources(context.Background(), db, cfg, client); err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.LocalA["probe.lan"]; len(got) != 1 || got[0].IP.String() != "192.0.2.77" {
+		t.Fatalf("probe records = %#v", got)
+	}
+	var value string
+	if err := db.QueryRow(`SELECT value FROM settings WHERE key = 'source_probe'`).Scan(&value); err != nil {
+		t.Fatal(err)
+	}
+	if value != "ok" {
+		t.Fatalf("source_probe = %q", value)
+	}
+}
+
+func TestReplaceImportedDNSRecordsRemainsWritableAfterBusyCommit(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "busy-import.db")
+	writer, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	writer.SetMaxOpenConns(1)
+	writer.SetMaxIdleConns(1)
+	reader, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	reader.SetMaxOpenConns(1)
+	reader.SetMaxIdleConns(1)
+
+	if _, err := writer.Exec(`PRAGMA journal_mode=DELETE`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.Exec(`PRAGMA busy_timeout=0`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reader.Exec(`PRAGMA busy_timeout=0`); err != nil {
+		t.Fatal(err)
+	}
+	if err := initDB(writer); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.Exec(`INSERT INTO dns_records(name, type, value, ttl, enabled) VALUES('busy.lan', 'A', '192.0.2.1', 0, 1)`); err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := parseDNSRecordsCSV(strings.NewReader("busy.lan,A,192.0.2.2\n"), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := reader.Query(`SELECT value FROM dns_records WHERE name = 'busy.lan'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rows.Next() {
+		rows.Close()
+		t.Fatal("reader returned no row")
+	}
+
+	err = replaceImportedDNSRecords(writer, parsed)
+	if err == nil {
+		rows.Close()
+		t.Skip("SQLite build allowed the import commit while the reader was open")
+	}
+	if !strings.Contains(strings.ToLower(err.Error()), "busy") && !strings.Contains(strings.ToLower(err.Error()), "locked") {
+		rows.Close()
+		t.Fatalf("expected busy import, got %v", err)
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := replaceImportedDNSRecords(writer, parsed); err != nil {
+		t.Fatalf("second import after SQLITE_BUSY: %v", err)
+	}
+	var value string
+	if err := writer.QueryRow(`SELECT value FROM dns_records WHERE name = 'busy.lan' AND type = 'A'`).Scan(&value); err != nil {
+		t.Fatal(err)
+	}
+	if value != "192.0.2.2" {
+		t.Fatalf("value = %q", value)
 	}
 }

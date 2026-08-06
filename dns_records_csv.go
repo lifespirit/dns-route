@@ -257,43 +257,41 @@ func replaceImportedDNSRecords(db *sql.DB, imported *dnsRecordCSV) error {
 	if imported == nil || len(imported.Domains) == 0 {
 		return fmt.Errorf("empty DNS-record import")
 	}
-	tx, err := db.Begin()
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback() }()
 
 	names := make([]string, 0, len(imported.Domains))
 	for name := range imported.Domains {
 		names = append(names, name)
 	}
 	sort.Strings(names)
-	for _, name := range names {
-		set := imported.Domains[name]
-		if _, err := tx.Exec(`DELETE FROM dns_records WHERE lower(rtrim(trim(name), '.')) = ?`, name); err != nil {
-			return fmt.Errorf("replace DNS records for %q: %w", name, err)
-		}
-		if set.ASet {
-			if err := insertImportedDNSRecords(tx, name, "A", set.A); err != nil {
-				return err
+
+	return withSQLiteWriteTx(context.Background(), db, func(conn *sql.Conn) error {
+		for _, name := range names {
+			set := imported.Domains[name]
+			if _, err := conn.ExecContext(context.Background(), `DELETE FROM dns_records WHERE lower(rtrim(trim(name), '.')) = ?`, name); err != nil {
+				return fmt.Errorf("replace DNS records for %q: %w", name, err)
+			}
+			if set.ASet {
+				if err := insertImportedDNSRecords(conn, name, "A", set.A); err != nil {
+					return err
+				}
+			}
+			if set.AAAASet {
+				if err := insertImportedDNSRecords(conn, name, "AAAA", set.AAAA); err != nil {
+					return err
+				}
 			}
 		}
-		if set.AAAASet {
-			if err := insertImportedDNSRecords(tx, name, "AAAA", set.AAAA); err != nil {
-				return err
-			}
-		}
-	}
-	return tx.Commit()
+		return nil
+	})
 }
 
-func insertImportedDNSRecords(tx *sql.Tx, name, typ string, records []LocalRecord) error {
+func insertImportedDNSRecords(conn *sql.Conn, name, typ string, records []LocalRecord) error {
 	for _, rec := range records {
 		value := ""
 		if !rec.NoData && rec.IP != nil {
 			value = rec.IP.String()
 		}
-		if _, err := tx.Exec(`INSERT INTO dns_records(name, type, value, ttl, enabled) VALUES(?, ?, ?, 0, 1)`, name, typ, value); err != nil {
+		if _, err := conn.ExecContext(context.Background(), `INSERT INTO dns_records(name, type, value, ttl, enabled) VALUES(?, ?, ?, 0, 1)`, name, typ, value); err != nil {
 			return fmt.Errorf("store imported %s record for %q: %w", typ, name, err)
 		}
 	}
@@ -408,21 +406,19 @@ func loadDNSRecordSources(ctx context.Context, db *sql.DB, cfg *Config, client *
 	}
 	cfg.DNSRecordSources = nil
 
-	rows, err := db.Query(`SELECT id, location, no_data_only FROM dns_record_sources WHERE enabled = 1 ORDER BY id`)
+	// Do not keep a SQLite cursor open while downloading or parsing external
+	// content. In rollback-journal mode that cursor holds a read lock for the
+	// entire network operation and can make an unrelated import fail at COMMIT.
+	sources, err := readEnabledDNSRecordSources(db)
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
 
-	sourceLayer := 0
-	for rows.Next() {
-		sourceLayer++
-		var id int64
-		var location string
-		var noDataOnly int
-		if err := rows.Scan(&id, &location, &noDataOnly); err != nil {
-			return err
-		}
+	for sourceIndex, source := range sources {
+		sourceLayer := sourceIndex + 1
+		id := source.ID
+		location := source.Location
+		noDataOnly := source.NoDataOnly
 		body, kind, err := openDNSRecordSource(ctx, strings.TrimSpace(location), client)
 		if err != nil {
 			return fmt.Errorf("load DNS-record source %q: %w", location, err)
@@ -465,10 +461,28 @@ func loadDNSRecordSources(ctx context.Context, db *sql.DB, cfg *Config, client *
 			Records:    recordCount,
 		})
 	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
 	return nil
+}
+
+func readEnabledDNSRecordSources(db *sql.DB) ([]dnsRecordSourceDBRow, error) {
+	rows, err := db.Query(`SELECT id, location, no_data_only, enabled FROM dns_record_sources WHERE enabled = 1 ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var sources []dnsRecordSourceDBRow
+	for rows.Next() {
+		var source dnsRecordSourceDBRow
+		if err := rows.Scan(&source.ID, &source.Location, &source.NoDataOnly, &source.Enabled); err != nil {
+			return nil, err
+		}
+		sources = append(sources, source)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return sources, nil
 }
 
 func markDNSRecordFamilyOverridden(entries []DNSRecordState, name, typ string) {
