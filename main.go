@@ -234,6 +234,7 @@ func (f conntrackIPFilter) MatchConntrackFlow(flow *netlink.ConntrackFlow) bool 
 
 type routeErrorDiagnostic struct {
 	Time                    string   `json:"time"`
+	Backend                 string   `json:"backend"`
 	IP                      string   `json:"ip"`
 	CIDR                    string   `json:"cidr"`
 	Family                  string   `json:"family"`
@@ -261,6 +262,7 @@ type routeErrorDiagnostic struct {
 type RouteManager struct {
 	app            *App
 	prefixResolver PrefixResolver
+	backends       []RouteBackend
 
 	ipMu    sync.RWMutex
 	ipCache map[string]routeCacheEntry
@@ -268,15 +270,12 @@ type RouteManager struct {
 	cidrMu    sync.RWMutex
 	cidrCache map[string]routeCacheEntry
 
-	snapMu   sync.RWMutex
-	snapshot []netip.Prefix
-
 	lookupGroup  singleflight.Group
 	applyGroup   singleflight.Group
 	processGroup singleflight.Group
 
 	resetMu         sync.Mutex
-	resetAfterApply map[string]struct{}
+	resetAfterApply map[string]bool
 
 	queue chan string
 	wg    sync.WaitGroup
@@ -492,8 +491,8 @@ func main() {
 	}
 	app.syncUpstreamCircuits(cfg)
 	app.routeMgr = NewRouteManager(app, 8)
-	if err := app.routeMgr.ReloadSnapshot(); err != nil {
-		log.Printf("initial route snapshot reload failed: %v", err)
+	if err := app.routeMgr.ReloadBackends(context.Background()); err != nil {
+		log.Printf("initial route backend reload failed: %v", err)
 	}
 
 	logConfig("CONFIG", cfg)
@@ -509,12 +508,14 @@ func main() {
 }
 
 func NewRouteManager(app *App, workers int) *RouteManager {
+	kernelBackend := NewKernelRouteBackend(app)
 	rm := &RouteManager{
 		app:             app,
 		prefixResolver:  NewCymruPrefixResolver(app.lookupCymruTXT),
+		backends:        []RouteBackend{kernelBackend},
 		ipCache:         make(map[string]routeCacheEntry),
 		cidrCache:       make(map[string]routeCacheEntry),
-		resetAfterApply: make(map[string]struct{}),
+		resetAfterApply: make(map[string]bool),
 		queue:           make(chan string, 1024),
 	}
 	for i := 0; i < workers; i++ {
@@ -548,7 +549,7 @@ func (rm *RouteManager) EnsureIPs(ips []net.IP) {
 		unique[ipString] = struct{}{}
 
 		defaultCIDR := defaultCIDRForIP(routeIP)
-		if rm.ipCoveredBySnapshot(routeIP) {
+		if rm.backendsCoverIP(routeIP) {
 			rm.completeIPApplied(ipString, defaultCIDR, false)
 			continue
 		}
@@ -564,7 +565,9 @@ func (rm *RouteManager) EnsureIPs(ips []net.IP) {
 		// The DNS answer has already been sent. Record that a successful route
 		// completion must invalidate any flow that raced with route installation.
 		rm.resetMu.Lock()
-		rm.resetAfterApply[ipString] = struct{}{}
+		if _, exists := rm.resetAfterApply[ipString]; !exists {
+			rm.resetAfterApply[ipString] = false
+		}
 		rm.resetMu.Unlock()
 
 		if !ok || ent.State != StatePending {
@@ -601,7 +604,7 @@ func (rm *RouteManager) EnsureIPsAndWait(ips []net.IP) error {
 	errCh := make(chan error, len(unique))
 	for ipString, routeIP := range unique {
 		defaultCIDR := defaultCIDRForIP(routeIP)
-		if rm.ipCoveredBySnapshot(routeIP) {
+		if rm.backendsCoverIP(routeIP) {
 			rm.completeIPApplied(ipString, defaultCIDR, false)
 			continue
 		}
@@ -657,114 +660,115 @@ func (rm *RouteManager) processIPOnce(ip string) error {
 		return fmt.Errorf("invalid route IP %q", ip)
 	}
 	addr = addr.Unmap()
-	defaultResolution := hostPrefixResolution(addr)
-	defaultCIDR := defaultResolution.Prefix.String()
-	if rm.ipCoveredBySnapshot(parsed) {
+	resolution := hostPrefixResolution(addr)
+	defaultCIDR := resolution.Prefix.String()
+	if rm.backendsCoverAddress(addr) {
 		rm.completeIPApplied(ip, defaultCIDR, false)
 		return nil
 	}
 
-	cidr := defaultCIDR
 	if cfg.LookupCIDR {
 		atomic.AddUint64(&rm.app.lookupCIDRAttempts, 1)
 		val, _, _ := rm.lookupGroup.Do(ip, func() (any, error) {
-			if rm.ipCoveredBySnapshot(parsed) {
-				return defaultResolution, nil
+			if rm.backendsCoverAddress(addr) {
+				return resolution, nil
 			}
-			resolution, resolveErr := rm.prefixResolver.Resolve(context.Background(), addr)
-			if resolveErr != nil || resolution.Source != PrefixSourceCymru {
+			resolved, resolveErr := rm.prefixResolver.Resolve(context.Background(), addr)
+			if resolveErr != nil || resolved.Source != PrefixSourceCymru {
 				atomic.AddUint64(&rm.app.lookupCIDRFailed, 1)
-				return defaultResolution, nil
+				return resolution, nil
 			}
-			return resolution, nil
+			return resolved, nil
 		})
-		resolution := val.(PrefixResolution)
-		cidr = resolution.Prefix.String()
+		resolution = val.(PrefixResolution)
 	}
 
+	cidr := resolution.Prefix.String()
 	rm.ipMu.Lock()
 	rm.ipCache[ip] = routeCacheEntry{State: StatePending, CIDR: cidr, UpdatedAt: time.Now()}
 	rm.ipMu.Unlock()
 
-	if rm.cidrCoveredBySnapshot(cidr) {
-		rm.markCIDRApplied(cidr, time.Now())
-		rm.completeIPApplied(ip, cidr, false)
-		return nil
+	intent := RouteIntent{
+		IP:         addr,
+		Prefix:     resolution.Prefix,
+		ResolvedBy: resolution.Source,
 	}
-
 	applyResult, applyErr, _ := rm.applyGroup.Do(cidr, func() (any, error) {
-		if rm.cidrCoveredBySnapshot(cidr) {
-			rm.markCIDRApplied(cidr, time.Now())
-			return false, nil
-		}
-
-		// Refresh from the kernel immediately before RouteReplace. The in-memory
-		// snapshot may not yet contain a route installed by another process. If
-		// the prefix is already covered, no routing change is required and any
-		// existing conntrack state must be left untouched.
-		routeAbsentConfirmed := false
-		if reloadErr := rm.ReloadSnapshot(); reloadErr != nil {
-			// Continue trying to install the route, but suppress conntrack reset:
-			// without a successful live precheck we cannot prove that the route did
-			// not already exist.
-			log.Printf("ROUTE_PRECHECK_RELOAD_ERROR ip=%s cidr=%s error=%v", ip, cidr, reloadErr)
-		} else if rm.cidrCoveredBySnapshot(cidr) {
-			rm.markCIDRApplied(cidr, time.Now())
-			return false, nil
-		} else {
-			routeAbsentConfirmed = true
-		}
-
 		rm.cidrMu.Lock()
 		rm.cidrCache[cidr] = routeCacheEntry{State: StatePending, CIDR: cidr, UpdatedAt: time.Now()}
 		rm.cidrMu.Unlock()
 
-		if err := rm.app.addRoute(cidr); err != nil {
-			atomic.AddUint64(&rm.app.routeAddErrors, 1)
-			reloadErr := rm.ReloadSnapshot()
-			recovered := reloadErr == nil && rm.cidrCoveredBySnapshot(cidr)
-			rm.app.recordRouteAddError(ip, cidr, err, reloadErr, recovered)
-			if recovered {
-				rm.markCIDRApplied(cidr, time.Now())
-				// The route appeared without a successful RouteReplace from this
-				// operation. Do not disturb existing conntrack entries.
-				return false, nil
-			}
+		kernelChanged, err := rm.ensureBackends(context.Background(), intent)
+		if err != nil {
 			rm.markCIDRFailed(cidr, time.Now())
-			return false, err
+			return kernelChanged, err
 		}
-
-		atomic.AddUint64(&rm.app.routeAdds, 1)
-		rm.addCIDRToSnapshot(cidr)
 		rm.markCIDRApplied(cidr, time.Now())
-		// Reset conntrack only when the live kernel precheck confirmed that the
-		// route was absent before our successful RouteReplace.
-		return routeAbsentConfirmed, nil
+		return kernelChanged, nil
 	})
 
+	kernelChanged, _ := applyResult.(bool)
+	if kernelChanged {
+		rm.rememberKernelChange(ip)
+	}
 	if applyErr != nil {
 		rm.markIPFailed(ip, cidr, time.Now())
 		return applyErr
 	}
-	routeReplaced, _ := applyResult.(bool)
-	rm.completeIPApplied(ip, cidr, routeReplaced)
+	rm.completeIPApplied(ip, cidr, kernelChanged)
 	return nil
 }
 
-func (rm *RouteManager) completeIPApplied(ip, cidr string, routeReplaced bool) {
+func (rm *RouteManager) ensureBackends(ctx context.Context, route RouteIntent) (bool, error) {
+	if len(rm.backends) == 0 {
+		return false, fmt.Errorf("no route backends configured")
+	}
+
+	kernelChanged := false
+	var errs []error
+	for _, backend := range rm.backends {
+		if backend == nil {
+			errs = append(errs, fmt.Errorf("nil route backend"))
+			continue
+		}
+		result, err := backend.Ensure(ctx, route)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s backend: %w", backend.Name(), err))
+			continue
+		}
+		if !result.Ready {
+			errs = append(errs, fmt.Errorf("%s backend did not accept prefix %s", backend.Name(), route.Prefix))
+			continue
+		}
+		if backend.Name() == KernelRouteBackendName && result.Changed {
+			kernelChanged = true
+		}
+	}
+	return kernelChanged, errors.Join(errs...)
+}
+
+func (rm *RouteManager) rememberKernelChange(ip string) {
+	rm.resetMu.Lock()
+	if _, resetRequested := rm.resetAfterApply[ip]; resetRequested {
+		rm.resetAfterApply[ip] = true
+	}
+	rm.resetMu.Unlock()
+}
+
+func (rm *RouteManager) completeIPApplied(ip, cidr string, kernelChanged bool) {
 	// Mark the route applied before consuming the pending reset request.
-	// A reset is allowed only when this operation observed a successful
-	// RouteReplace. Merely finding the address/prefix in the route table must
+	// A reset is allowed only when the kernel backend confirmed that it installed
+	// a previously absent route. Merely finding a route in the kernel table must
 	// never disturb an already valid connection.
 	rm.ipMu.Lock()
 	rm.ipCache[ip] = routeCacheEntry{State: StateApplied, CIDR: cidr, UpdatedAt: time.Now()}
 	rm.resetMu.Lock()
-	_, resetRequested := rm.resetAfterApply[ip]
+	pendingKernelChange, resetRequested := rm.resetAfterApply[ip]
 	delete(rm.resetAfterApply, ip)
 	rm.resetMu.Unlock()
 	rm.ipMu.Unlock()
 
-	if routeReplaced && resetRequested {
+	if resetRequested && (kernelChanged || pendingKernelChange) {
 		rm.app.resetConntrackForIP(ip)
 	}
 }
@@ -790,9 +794,62 @@ func (rm *RouteManager) markCIDRFailed(cidr string, now time.Time) {
 	rm.cidrMu.Unlock()
 }
 
-func (rm *RouteManager) routeTableForLookup() int {
-	cfg := rm.app.getConfig()
-	return effectiveRouteTable(cfg.RouteTable)
+func (rm *RouteManager) backendsCoverIP(ip net.IP) bool {
+	addr, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return false
+	}
+	return rm.backendsCoverAddress(addr.Unmap())
+}
+
+func (rm *RouteManager) backendsCoverAddress(addr netip.Addr) bool {
+	addr = addr.Unmap()
+	if !addr.IsValid() || len(rm.backends) == 0 {
+		return false
+	}
+	for _, backend := range rm.backends {
+		if backend == nil || !backend.CoversAddress(addr) {
+			return false
+		}
+	}
+	return true
+}
+
+func (rm *RouteManager) ReloadBackends(ctx context.Context) error {
+	var errs []error
+	for _, backend := range rm.backends {
+		if backend == nil {
+			errs = append(errs, fmt.Errorf("nil route backend"))
+			continue
+		}
+		if err := backend.Reload(ctx); err != nil {
+			errs = append(errs, fmt.Errorf("reload %s backend: %w", backend.Name(), err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func (rm *RouteManager) BackendSnapshotSize() int {
+	total := 0
+	for _, backend := range rm.backends {
+		if backend != nil {
+			total += backend.SnapshotSize()
+		}
+	}
+	return total
+}
+
+func (rm *RouteManager) CloseBackends() error {
+	var errs []error
+	for _, backend := range rm.backends {
+		if backend == nil {
+			continue
+		}
+		if err := backend.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("close %s backend: %w", backend.Name(), err))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 func (rm *RouteManager) ResetCaches() {
@@ -803,102 +860,6 @@ func (rm *RouteManager) ResetCaches() {
 	rm.cidrMu.Lock()
 	rm.cidrCache = make(map[string]routeCacheEntry)
 	rm.cidrMu.Unlock()
-}
-
-func (rm *RouteManager) ReloadSnapshot() error {
-	filter := &netlink.Route{Table: rm.routeTableForLookup()}
-	routes, err := netlink.RouteListFiltered(netlink.FAMILY_ALL, filter, netlink.RT_FILTER_TABLE)
-	if err != nil {
-		return fmt.Errorf("route list filtered: %w", err)
-	}
-	prefixes := make([]netip.Prefix, 0, len(routes))
-	for _, r := range routes {
-		if r.Dst == nil {
-			continue
-		}
-		prefix, parseErr := netip.ParsePrefix(r.Dst.String())
-		if parseErr != nil {
-			log.Printf("ROUTE_SNAPSHOT_SKIP dst=%q error=%v", r.Dst.String(), parseErr)
-			continue
-		}
-		prefixes = append(prefixes, prefix.Masked())
-	}
-	rm.snapMu.Lock()
-	rm.snapshot = prefixes
-	rm.snapMu.Unlock()
-	return nil
-}
-
-func (rm *RouteManager) addCIDRToSnapshot(cidr string) {
-	prefix, err := netip.ParsePrefix(cidr)
-	if err != nil {
-		return
-	}
-	prefix = prefix.Masked()
-	rm.snapMu.Lock()
-	defer rm.snapMu.Unlock()
-	for _, existing := range rm.snapshot {
-		if existing == prefix {
-			return
-		}
-	}
-	rm.snapshot = append(rm.snapshot, prefix)
-}
-
-func (rm *RouteManager) ipCoveredBySnapshot(ip net.IP) bool {
-	addr, ok := netip.AddrFromSlice(ip)
-	if !ok {
-		return false
-	}
-	addr = addr.Unmap()
-
-	rm.snapMu.RLock()
-	defer rm.snapMu.RUnlock()
-	for _, prefix := range rm.snapshot {
-		if prefix.Addr().Is4() != addr.Is4() {
-			continue
-		}
-		if prefix.Contains(addr) {
-			return true
-		}
-	}
-	return false
-}
-
-func (rm *RouteManager) cidrCoveredBySnapshot(cidr string) bool {
-	want, err := netip.ParsePrefix(cidr)
-	if err != nil {
-		return false
-	}
-	want = want.Masked()
-
-	rm.snapMu.RLock()
-	defer rm.snapMu.RUnlock()
-	for _, have := range rm.snapshot {
-		if prefixCovers(have, want) {
-			return true
-		}
-	}
-	return false
-}
-
-// prefixCovers reports whether every address in want is contained in have.
-// Checking only have.Contains(want.Addr()) is insufficient: 10.0.0.0/25
-// contains the network address of 10.0.0.0/24 but not the whole /24.
-func prefixCovers(have, want netip.Prefix) bool {
-	if !have.IsValid() || !want.IsValid() {
-		return false
-	}
-
-	have = have.Masked()
-	want = want.Masked()
-	if have.Addr().BitLen() != want.Addr().BitLen() {
-		return false
-	}
-	if have.Bits() > want.Bits() {
-		return false
-	}
-	return have.Contains(want.Addr())
 }
 
 func normalizeRouteIP(ip net.IP) net.IP {
@@ -1436,8 +1397,8 @@ func (a *App) reloadConfig() error {
 	a.setConfig(cfg)
 	a.reconcileListeners(cfg)
 	a.routeMgr.ResetCaches()
-	if err := a.routeMgr.ReloadSnapshot(); err != nil {
-		return fmt.Errorf("reload route snapshot after config change: %w", err)
+	if err := a.routeMgr.ReloadBackends(context.Background()); err != nil {
+		return fmt.Errorf("reload route backends after config change: %w", err)
 	}
 	logConfig("CONFIG reloaded", cfg)
 	return nil
@@ -1774,7 +1735,7 @@ func (a *App) handleRoutesReload(w http.ResponseWriter, r *http.Request) {
 		renderError(w, 405, fmt.Errorf("method not allowed"))
 		return
 	}
-	if err := a.routeMgr.ReloadSnapshot(); err != nil {
+	if err := a.routeMgr.ReloadBackends(context.Background()); err != nil {
 		renderError(w, 500, err)
 		return
 	}
@@ -3133,79 +3094,11 @@ func (a *App) resetConntrackForIP(ipString string) {
 	}
 }
 
-func (a *App) addRoute(cidr string) error {
-	cfg := a.getConfig()
-	if cfg.WGInterface == "" {
-		return fmt.Errorf("prepare route %s: wg_interface is empty", cidr)
-	}
-	_, dst, err := net.ParseCIDR(cidr)
-	if err != nil {
-		return fmt.Errorf("parse route CIDR %q: %w", cidr, err)
-	}
-	link, err := netlink.LinkByName(cfg.WGInterface)
-	if err != nil {
-		return fmt.Errorf("lookup interface %q for route %s: %w", cfg.WGInterface, cidr, err)
-	}
-	table := effectiveRouteTable(cfg.RouteTable)
-	route := netlink.Route{LinkIndex: link.Attrs().Index, Dst: dst, Table: table}
-	if gw, ok, err := routeGatewayForCIDR(cfg, dst); err != nil {
-		return fmt.Errorf("select gateway for route %s table %d dev %s: %w", cidr, table, cfg.WGInterface, err)
-	} else if ok {
-		route.Gw = gw
-	}
-	if err := netlink.RouteReplace(&route); err != nil {
-		return fmt.Errorf(
-			"netlink RouteReplace dst=%s table=%d dev=%s(index=%d) gw=%s: %w",
-			cidr, table, cfg.WGInterface, link.Attrs().Index, routeGatewayString(route.Gw), err,
-		)
-	}
-	return nil
-}
-
-func routeGatewayString(gw net.IP) string {
-	if gw == nil {
-		return "<direct>"
-	}
-	return gw.String()
-}
-
-func routeGatewayForCIDR(cfg *Config, dst *net.IPNet) (net.IP, bool, error) {
-	if dst.IP.To4() != nil {
-		gwValue := strings.TrimSpace(cfg.WGGatewayV4)
-		if gwValue == "" {
-			gwValue = strings.TrimSpace(cfg.WGGateway)
-		}
-		if gwValue == "" {
-			return nil, false, fmt.Errorf("wg_gateway_v4 or legacy wg_gateway is empty")
-		}
-		gw := net.ParseIP(gwValue)
-		if gw == nil || gw.To4() == nil {
-			return nil, false, fmt.Errorf("gateway %q is not an IPv4 address for IPv4 route %s", gwValue, dst.String())
-		}
-		return gw.To4(), true, nil
-	}
-
-	gwValue := strings.TrimSpace(cfg.WGGatewayV6)
-	if gwValue == "" {
-		gw := net.ParseIP(strings.TrimSpace(cfg.WGGateway))
-		if gw != nil && gw.To4() == nil {
-			gwValue = strings.TrimSpace(cfg.WGGateway)
-		}
-	}
-	if gwValue == "" {
-		return nil, false, nil
-	}
-	gw := net.ParseIP(gwValue)
-	if gw == nil || gw.To4() != nil {
-		return nil, false, fmt.Errorf("gateway %q is not an IPv6 address for IPv6 route %s", gwValue, dst.String())
-	}
-	return gw.To16(), true, nil
-}
-
 func (a *App) recordRouteAddError(ip, cidr string, routeErr, reloadErr error, recovered bool) {
 	cfg := a.getConfig()
 	diag := routeErrorDiagnostic{
 		Time:                    time.Now().Format(time.RFC3339Nano),
+		Backend:                 KernelRouteBackendName,
 		IP:                      ip,
 		CIDR:                    cidr,
 		Table:                   effectiveRouteTable(cfg.RouteTable),
@@ -3473,9 +3366,7 @@ func (a *App) statsSnapshot() statsData {
 	pendingListeners := len(a.pendingListeners)
 	a.srvMu.Unlock()
 	listenerStates := a.listenerViews()
-	a.routeMgr.snapMu.RLock()
-	routeSnapshot := len(a.routeMgr.snapshot)
-	a.routeMgr.snapMu.RUnlock()
+	routeSnapshot := a.routeMgr.BackendSnapshotSize()
 	a.routeMgr.ipMu.RLock()
 	ipEntries := len(a.routeMgr.ipCache)
 	a.routeMgr.ipMu.RUnlock()

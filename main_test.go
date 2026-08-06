@@ -1,7 +1,6 @@
 package main
 
 import (
-	"net"
 	"net/netip"
 	"testing"
 )
@@ -30,35 +29,5 @@ func TestPrefixCovers(t *testing.T) {
 				t.Fatalf("prefixCovers(%s, %s) = %t, want %t", have, want, got, tt.ok)
 			}
 		})
-	}
-}
-
-func TestCIDRCoveredBySnapshotDoesNotAcceptNarrowerRoute(t *testing.T) {
-	rm := &RouteManager{snapshot: []netip.Prefix{netip.MustParsePrefix("10.0.0.0/25")}}
-
-	if rm.cidrCoveredBySnapshot("10.0.0.0/24") {
-		t.Fatal("10.0.0.0/25 must not cover the requested 10.0.0.0/24")
-	}
-	if !rm.cidrCoveredBySnapshot("10.0.0.64/26") {
-		t.Fatal("10.0.0.0/25 must cover 10.0.0.64/26")
-	}
-}
-
-func TestIPCoveredBySnapshotHandlesIPv4AndIPv6(t *testing.T) {
-	rm := &RouteManager{
-		snapshot: []netip.Prefix{
-			netip.MustParsePrefix("192.0.2.0/24"),
-			netip.MustParsePrefix("2001:db8::/32"),
-		},
-	}
-
-	if !rm.ipCoveredBySnapshot(net.ParseIP("192.0.2.10")) {
-		t.Fatal("IPv4 address should be covered")
-	}
-	if !rm.ipCoveredBySnapshot(net.ParseIP("2001:db8::10")) {
-		t.Fatal("IPv6 address should be covered")
-	}
-	if rm.ipCoveredBySnapshot(net.ParseIP("198.51.100.10")) {
-		t.Fatal("unrelated IPv4 address must not be covered")
 	}
 }
