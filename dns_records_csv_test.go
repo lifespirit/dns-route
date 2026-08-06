@@ -73,6 +73,20 @@ func TestParseDNSRecordsCSVForms(t *testing.T) {
 	}
 }
 
+func TestParseDNSRecordsCSVSkipsEmptyRows(t *testing.T) {
+	parsed, err := parseDNSRecordsCSV(strings.NewReader("\n   \n,\n,,\n\t, \nkept.lan,A,192.0.2.10\n\n"), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(parsed.Domains) != 1 {
+		t.Fatalf("domains = %#v", parsed.Domains)
+	}
+	set, ok := parsed.Domains["kept.lan"]
+	if !ok || !set.ASet || set.AAAASet || len(set.A) != 1 || set.A[0].IP.String() != "192.0.2.10" {
+		t.Fatalf("kept.lan = %#v", set)
+	}
+}
+
 func TestParseDNSRecordsCSVNoDataOnlyIgnoresAddresses(t *testing.T) {
 	parsed, err := parseDNSRecordsCSV(strings.NewReader("evil-a.lan,A,203.0.113.10,ignored\nevil-aaaa.lan,AAAA,2001:db8::10\nboth.lan\ntrailing.lan,\n"), true)
 	if err != nil {
