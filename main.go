@@ -16,6 +16,7 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"net/netip"
 	"sort"
 	"strconv"
 	"strings"
@@ -267,7 +268,7 @@ type RouteManager struct {
 	cidrCache map[string]routeCacheEntry
 
 	snapMu   sync.RWMutex
-	snapshot []*net.IPNet
+	snapshot []netip.Prefix
 
 	lookupGroup  singleflight.Group
 	applyGroup   singleflight.Group
@@ -801,41 +802,54 @@ func (rm *RouteManager) ReloadSnapshot() error {
 	if err != nil {
 		return fmt.Errorf("route list filtered: %w", err)
 	}
-	nets := make([]*net.IPNet, 0, len(routes))
+	prefixes := make([]netip.Prefix, 0, len(routes))
 	for _, r := range routes {
 		if r.Dst == nil {
 			continue
 		}
-		dup := &net.IPNet{IP: append(net.IP(nil), r.Dst.IP...), Mask: append(net.IPMask(nil), r.Dst.Mask...)}
-		nets = append(nets, dup)
+		prefix, parseErr := netip.ParsePrefix(r.Dst.String())
+		if parseErr != nil {
+			log.Printf("ROUTE_SNAPSHOT_SKIP dst=%q error=%v", r.Dst.String(), parseErr)
+			continue
+		}
+		prefixes = append(prefixes, prefix.Masked())
 	}
 	rm.snapMu.Lock()
-	rm.snapshot = nets
+	rm.snapshot = prefixes
 	rm.snapMu.Unlock()
 	return nil
 }
 
 func (rm *RouteManager) addCIDRToSnapshot(cidr string) {
-	_, dst, err := net.ParseCIDR(cidr)
+	prefix, err := netip.ParsePrefix(cidr)
 	if err != nil {
 		return
 	}
+	prefix = prefix.Masked()
 	rm.snapMu.Lock()
 	defer rm.snapMu.Unlock()
-	for _, n := range rm.snapshot {
-		if n.String() == dst.String() {
+	for _, existing := range rm.snapshot {
+		if existing == prefix {
 			return
 		}
 	}
-	dup := &net.IPNet{IP: append(net.IP(nil), dst.IP...), Mask: append(net.IPMask(nil), dst.Mask...)}
-	rm.snapshot = append(rm.snapshot, dup)
+	rm.snapshot = append(rm.snapshot, prefix)
 }
 
 func (rm *RouteManager) ipCoveredBySnapshot(ip net.IP) bool {
+	addr, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return false
+	}
+	addr = addr.Unmap()
+
 	rm.snapMu.RLock()
 	defer rm.snapMu.RUnlock()
-	for _, n := range rm.snapshot {
-		if n.Contains(ip) {
+	for _, prefix := range rm.snapshot {
+		if prefix.Addr().Is4() != addr.Is4() {
+			continue
+		}
+		if prefix.Contains(addr) {
 			return true
 		}
 	}
@@ -843,18 +857,39 @@ func (rm *RouteManager) ipCoveredBySnapshot(ip net.IP) bool {
 }
 
 func (rm *RouteManager) cidrCoveredBySnapshot(cidr string) bool {
-	_, dst, err := net.ParseCIDR(cidr)
+	want, err := netip.ParsePrefix(cidr)
 	if err != nil {
 		return false
 	}
+	want = want.Masked()
+
 	rm.snapMu.RLock()
 	defer rm.snapMu.RUnlock()
-	for _, n := range rm.snapshot {
-		if n.String() == dst.String() || n.Contains(dst.IP) {
+	for _, have := range rm.snapshot {
+		if prefixCovers(have, want) {
 			return true
 		}
 	}
 	return false
+}
+
+// prefixCovers reports whether every address in want is contained in have.
+// Checking only have.Contains(want.Addr()) is insufficient: 10.0.0.0/25
+// contains the network address of 10.0.0.0/24 but not the whole /24.
+func prefixCovers(have, want netip.Prefix) bool {
+	if !have.IsValid() || !want.IsValid() {
+		return false
+	}
+
+	have = have.Masked()
+	want = want.Masked()
+	if have.Addr().BitLen() != want.Addr().BitLen() {
+		return false
+	}
+	if have.Bits() > want.Bits() {
+		return false
+	}
+	return have.Contains(want.Addr())
 }
 
 func normalizeRouteIP(ip net.IP) net.IP {
