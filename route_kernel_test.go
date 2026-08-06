@@ -160,3 +160,60 @@ func TestKernelBackendReloadUsesConfiguredTable(t *testing.T) {
 		t.Fatal("reloaded prefix does not cover expected address")
 	}
 }
+
+func TestKernelBackendEnsureExactInstallsPrefixDespiteBroaderCoverage(t *testing.T) {
+	backend := newTestKernelBackend()
+	backend.snapshot = []netip.Prefix{netip.MustParsePrefix("192.0.2.0/24")}
+	var replaced netip.Prefix
+	backend.ops = kernelRouteOperations{
+		listRoutes: func(int) ([]netlink.Route, error) {
+			return []netlink.Route{{Dst: mustIPNet(t, "192.0.2.0/24")}}, nil
+		},
+		replaceRoute: func(_ *Config, prefix netip.Prefix) error {
+			replaced = prefix
+			return nil
+		},
+	}
+
+	requested := RouteIntent{
+		IP:     netip.MustParseAddr("192.0.2.129"),
+		Prefix: netip.MustParsePrefix("192.0.2.128/25"),
+	}
+	result, err := backend.EnsureExact(context.Background(), requested)
+	if err != nil {
+		t.Fatalf("EnsureExact returned error: %v", err)
+	}
+	if !result.Ready || !result.Changed {
+		t.Fatalf("result=%+v, want exact route installation", result)
+	}
+	if replaced != requested.Prefix {
+		t.Fatalf("replaced=%s, want %s", replaced, requested.Prefix)
+	}
+	if !backend.hasExactPrefix(requested.Prefix) {
+		t.Fatal("exact prefix missing from snapshot")
+	}
+}
+
+func TestKernelBackendSnapshotRoutesReturnsExactTablePrefixes(t *testing.T) {
+	backend := newTestKernelBackend()
+	backend.snapshot = []netip.Prefix{
+		netip.MustParsePrefix("192.0.2.0/24"),
+		netip.MustParsePrefix("2001:db8::/32"),
+	}
+
+	routes := backend.SnapshotRoutes()
+	if len(routes) != 2 {
+		t.Fatalf("routes=%d, want 2", len(routes))
+	}
+	for i, route := range routes {
+		if route.Prefix != backend.snapshot[i] {
+			t.Fatalf("route[%d]=%s, want %s", i, route.Prefix, backend.snapshot[i])
+		}
+		if route.IP != route.Prefix.Addr() {
+			t.Fatalf("route[%d] IP=%s, want network address %s", i, route.IP, route.Prefix.Addr())
+		}
+		if route.ResolvedBy != PrefixSourceKernel {
+			t.Fatalf("route[%d] source=%q, want %q", i, route.ResolvedBy, PrefixSourceKernel)
+		}
+	}
+}

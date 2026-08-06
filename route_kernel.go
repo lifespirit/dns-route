@@ -45,6 +45,22 @@ func (b *KernelRouteBackend) SnapshotSize() int {
 	return len(b.snapshot)
 }
 
+func (b *KernelRouteBackend) SnapshotRoutes() []RouteIntent {
+	b.snapshotMu.RLock()
+	defer b.snapshotMu.RUnlock()
+
+	routes := make([]RouteIntent, 0, len(b.snapshot))
+	for _, prefix := range b.snapshot {
+		prefix = prefix.Masked()
+		routes = append(routes, RouteIntent{
+			IP:         prefix.Addr(),
+			Prefix:     prefix,
+			ResolvedBy: PrefixSourceKernel,
+		})
+	}
+	return routes
+}
+
 func (b *KernelRouteBackend) Reload(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -119,6 +135,22 @@ func (b *KernelRouteBackend) coversPrefix(prefix netip.Prefix) bool {
 	return false
 }
 
+func (b *KernelRouteBackend) hasExactPrefix(prefix netip.Prefix) bool {
+	if !prefix.IsValid() {
+		return false
+	}
+	prefix = prefix.Masked()
+
+	b.snapshotMu.RLock()
+	defer b.snapshotMu.RUnlock()
+	for _, existing := range b.snapshot {
+		if existing.Masked() == prefix {
+			return true
+		}
+	}
+	return false
+}
+
 func (b *KernelRouteBackend) addPrefixToSnapshot(prefix netip.Prefix) {
 	if !prefix.IsValid() {
 		return
@@ -136,6 +168,17 @@ func (b *KernelRouteBackend) addPrefixToSnapshot(prefix netip.Prefix) {
 }
 
 func (b *KernelRouteBackend) Ensure(ctx context.Context, route RouteIntent) (ApplyResult, error) {
+	return b.ensure(ctx, route, false)
+}
+
+// EnsureExact requires the precise prefix to exist in the configured kernel
+// table. A broader covering route is not sufficient when the same prefix will
+// be exported through BGP.
+func (b *KernelRouteBackend) EnsureExact(ctx context.Context, route RouteIntent) (ApplyResult, error) {
+	return b.ensure(ctx, route, true)
+}
+
+func (b *KernelRouteBackend) ensure(ctx context.Context, route RouteIntent, exact bool) (ApplyResult, error) {
 	if err := ctx.Err(); err != nil {
 		return ApplyResult{}, err
 	}
@@ -150,21 +193,25 @@ func (b *KernelRouteBackend) Ensure(ctx context.Context, route RouteIntent) (App
 	if err != nil {
 		return ApplyResult{}, err
 	}
-	if b.coversPrefix(route.Prefix) {
+	present := b.coversPrefix
+	if exact {
+		present = b.hasExactPrefix
+	}
+	if present(route.Prefix) {
 		return ApplyResult{Ready: true}, nil
 	}
 
 	// Refresh from the kernel immediately before RouteReplace. The in-memory
 	// snapshot may not yet contain a route installed by another process. If the
-	// prefix is already covered, no routing change is required and existing
-	// conntrack state must be left untouched.
+	// required prefix is already present, no routing change is required and
+	// existing conntrack state must be left untouched.
 	routeAbsentConfirmed := false
 	if reloadErr := b.Reload(ctx); reloadErr != nil {
 		// Continue trying to install the route, but suppress conntrack reset:
 		// without a successful live precheck we cannot prove that the route did
 		// not already exist.
-		log.Printf("ROUTE_PRECHECK_RELOAD_ERROR backend=%s ip=%s cidr=%s error=%v", b.Name(), route.IP, route.Prefix, reloadErr)
-	} else if b.coversPrefix(route.Prefix) {
+		log.Printf("ROUTE_PRECHECK_RELOAD_ERROR backend=%s ip=%s cidr=%s exact=%t error=%v", b.Name(), route.IP, route.Prefix, exact, reloadErr)
+	} else if present(route.Prefix) {
 		return ApplyResult{Ready: true}, nil
 	} else {
 		routeAbsentConfirmed = true
@@ -174,7 +221,7 @@ func (b *KernelRouteBackend) Ensure(ctx context.Context, route RouteIntent) (App
 	if err := b.ops.replaceRoute(cfg, route.Prefix); err != nil {
 		atomic.AddUint64(&b.app.routeAddErrors, 1)
 		reloadErr := b.Reload(ctx)
-		recovered := reloadErr == nil && b.coversPrefix(route.Prefix)
+		recovered := reloadErr == nil && present(route.Prefix)
 		b.app.recordRouteAddError(route.IP.String(), route.Prefix.String(), err, reloadErr, recovered)
 		if recovered {
 			// The route appeared without a successful RouteReplace from this

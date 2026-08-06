@@ -7,53 +7,23 @@ import (
 	"testing"
 )
 
-type memoryManagedPrefixStore struct {
-	routes   map[netip.Prefix]RouteIntent
-	saveErr  error
-	listErr  error
-	saveCall int
-}
-
-func newMemoryManagedPrefixStore() *memoryManagedPrefixStore {
-	return &memoryManagedPrefixStore{routes: make(map[netip.Prefix]RouteIntent)}
-}
-
-func (s *memoryManagedPrefixStore) Save(_ context.Context, route RouteIntent) error {
-	s.saveCall++
-	if s.saveErr != nil {
-		return s.saveErr
-	}
-	s.routes[route.Prefix.Masked()] = route
-	return nil
-}
-
-func (s *memoryManagedPrefixStore) ListEnabled(context.Context) ([]RouteIntent, error) {
-	if s.listErr != nil {
-		return nil, s.listErr
-	}
-	out := make([]RouteIntent, 0, len(s.routes))
-	for _, route := range s.routes {
-		out = append(out, route)
-	}
-	return out, nil
-}
-
-func (s *memoryManagedPrefixStore) Disable(_ context.Context, prefix netip.Prefix) error {
-	delete(s.routes, prefix.Masked())
-	return nil
-}
-
 type fakeBGPSpeaker struct {
 	established bool
 	announceErr error
+	withdrawErr error
 	changed     bool
 	announced   []RouteIntent
+	withdrawn   []netip.Prefix
 	closed      bool
 }
 
 func (s *fakeBGPSpeaker) Announce(_ context.Context, route RouteIntent) (bool, error) {
 	s.announced = append(s.announced, route)
 	return s.changed, s.announceErr
+}
+func (s *fakeBGPSpeaker) Withdraw(_ context.Context, prefix netip.Prefix) (bool, error) {
+	s.withdrawn = append(s.withdrawn, prefix.Masked())
+	return s.changed, s.withdrawErr
 }
 func (s *fakeBGPSpeaker) Established() bool { return s.established }
 func (s *fakeBGPSpeaker) Close() error {
@@ -69,10 +39,9 @@ func bgpTestRoute(prefix, ip string) RouteIntent {
 	}
 }
 
-func TestBGPBackendEnsurePersistsAndAnnounces(t *testing.T) {
-	store := newMemoryManagedPrefixStore()
+func TestBGPBackendEnsureRemembersAndAnnounces(t *testing.T) {
 	speaker := &fakeBGPSpeaker{established: true, changed: true}
-	backend, err := NewBGPRouteBackend(store, speaker, true, true, true)
+	backend, err := NewBGPRouteBackend(speaker, true, true, true)
 	if err != nil {
 		t.Fatalf("new backend: %v", err)
 	}
@@ -85,19 +54,21 @@ func TestBGPBackendEnsurePersistsAndAnnounces(t *testing.T) {
 	if !result.Changed || !result.Ready {
 		t.Fatalf("result = %+v", result)
 	}
-	if store.saveCall != 1 || len(speaker.announced) != 1 {
-		t.Fatalf("save=%d announced=%d", store.saveCall, len(speaker.announced))
+	if backend.DesiredSize() != 1 || backend.SnapshotSize() != 1 {
+		t.Fatalf("desired=%d announced=%d", backend.DesiredSize(), backend.SnapshotSize())
+	}
+	if len(speaker.announced) != 1 {
+		t.Fatalf("announced=%d", len(speaker.announced))
 	}
 	if !backend.CoversAddress(route.IP) {
 		t.Fatal("announced prefix must cover route address")
 	}
 }
 
-func TestBGPBackendPersistsBeforeAnnouncementFailure(t *testing.T) {
+func TestBGPBackendKeepsFailedAnnouncementInMemory(t *testing.T) {
 	announceErr := errors.New("session unavailable")
-	store := newMemoryManagedPrefixStore()
 	speaker := &fakeBGPSpeaker{announceErr: announceErr}
-	backend, err := NewBGPRouteBackend(store, speaker, false, true, false)
+	backend, err := NewBGPRouteBackend(speaker, false, true, false)
 	if err != nil {
 		t.Fatalf("new backend: %v", err)
 	}
@@ -106,18 +77,25 @@ func TestBGPBackendPersistsBeforeAnnouncementFailure(t *testing.T) {
 	if _, err := backend.Ensure(context.Background(), route); !errors.Is(err, announceErr) {
 		t.Fatalf("ensure error = %v, want %v", err, announceErr)
 	}
-	if _, ok := store.routes[route.Prefix]; !ok {
-		t.Fatal("desired prefix was not persisted")
+	if backend.DesiredSize() != 1 {
+		t.Fatalf("desired size = %d, want 1", backend.DesiredSize())
 	}
 	if backend.SnapshotSize() != 0 {
-		t.Fatalf("snapshot size = %d, want 0", backend.SnapshotSize())
+		t.Fatalf("announced size = %d, want 0", backend.SnapshotSize())
+	}
+
+	speaker.announceErr = nil
+	if err := backend.Reload(context.Background()); err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if backend.SnapshotSize() != 1 {
+		t.Fatalf("announced size after retry = %d", backend.SnapshotSize())
 	}
 }
 
 func TestBGPBackendRequireEstablishedControlsReadyAndCoverage(t *testing.T) {
-	store := newMemoryManagedPrefixStore()
 	speaker := &fakeBGPSpeaker{}
-	backend, err := NewBGPRouteBackend(store, speaker, true, true, false)
+	backend, err := NewBGPRouteBackend(speaker, true, true, false)
 	if err != nil {
 		t.Fatalf("new backend: %v", err)
 	}
@@ -140,39 +118,64 @@ func TestBGPBackendRequireEstablishedControlsReadyAndCoverage(t *testing.T) {
 	}
 }
 
-func TestBGPBackendReloadReannouncesEnabledFamilies(t *testing.T) {
-	store := newMemoryManagedPrefixStore()
-	v4 := bgpTestRoute("192.0.2.0/24", "192.0.2.1")
-	v6 := bgpTestRoute("2001:db8::/32", "2001:db8::1")
-	store.routes[v4.Prefix] = v4
-	store.routes[v6.Prefix] = v6
+func TestBGPBackendReplaceDesiredMirrorsRouteSet(t *testing.T) {
 	speaker := &fakeBGPSpeaker{established: true}
-	backend, err := NewBGPRouteBackend(store, speaker, false, true, false)
+	backend, err := NewBGPRouteBackend(speaker, false, true, true)
 	if err != nil {
 		t.Fatalf("new backend: %v", err)
 	}
+	stale := bgpTestRoute("192.0.2.0/24", "192.0.2.1")
+	if _, err := backend.Ensure(context.Background(), stale); err != nil {
+		t.Fatalf("seed stale: %v", err)
+	}
 
-	if err := backend.Reload(context.Background()); err != nil {
-		t.Fatalf("reload: %v", err)
+	v4 := bgpTestRoute("198.51.100.0/24", "198.51.100.0")
+	v6 := bgpTestRoute("2001:db8::/32", "2001:db8::")
+	speaker.announced = nil
+	if err := backend.ReplaceDesired(context.Background(), []RouteIntent{v4, v6}); err != nil {
+		t.Fatalf("replace desired: %v", err)
 	}
-	if len(speaker.announced) != 1 || speaker.announced[0].Prefix != v4.Prefix {
-		t.Fatalf("announced = %+v", speaker.announced)
+
+	if backend.DesiredSize() != 2 || backend.SnapshotSize() != 2 {
+		t.Fatalf("desired=%d announced=%d", backend.DesiredSize(), backend.SnapshotSize())
 	}
-	if backend.SnapshotSize() != 1 {
-		t.Fatalf("snapshot size = %d", backend.SnapshotSize())
+	if len(speaker.announced) != 2 {
+		t.Fatalf("reannounced=%d, want 2", len(speaker.announced))
+	}
+	if len(speaker.withdrawn) != 1 || speaker.withdrawn[0] != stale.Prefix {
+		t.Fatalf("withdrawn=%v, want %s", speaker.withdrawn, stale.Prefix)
+	}
+	if backend.CoversAddress(stale.IP) {
+		t.Fatal("stale prefix still covered")
+	}
+	if !backend.CoversAddress(v4.IP) || !backend.CoversAddress(v6.IP) {
+		t.Fatal("replacement prefixes not covered")
+	}
+}
+
+func TestBGPBackendReplaceDesiredFiltersDisabledFamily(t *testing.T) {
+	speaker := &fakeBGPSpeaker{established: true}
+	backend, err := NewBGPRouteBackend(speaker, false, true, false)
+	if err != nil {
+		t.Fatalf("new backend: %v", err)
+	}
+	v4 := bgpTestRoute("192.0.2.0/24", "192.0.2.0")
+	v6 := bgpTestRoute("2001:db8::/32", "2001:db8::")
+
+	if err := backend.ReplaceDesired(context.Background(), []RouteIntent{v4, v6}); err != nil {
+		t.Fatalf("replace desired: %v", err)
+	}
+	if backend.DesiredSize() != 1 || len(speaker.announced) != 1 || speaker.announced[0].Prefix != v4.Prefix {
+		t.Fatalf("desired=%d announced=%+v", backend.DesiredSize(), speaker.announced)
 	}
 }
 
 func TestNewBGPRouteBackendValidatesDependencies(t *testing.T) {
-	store := newMemoryManagedPrefixStore()
 	speaker := &fakeBGPSpeaker{}
-	if _, err := NewBGPRouteBackend(nil, speaker, false, true, true); err == nil {
-		t.Fatal("nil store accepted")
-	}
-	if _, err := NewBGPRouteBackend(store, nil, false, true, true); err == nil {
+	if _, err := NewBGPRouteBackend(nil, false, true, true); err == nil {
 		t.Fatal("nil speaker accepted")
 	}
-	if _, err := NewBGPRouteBackend(store, speaker, false, false, false); err == nil {
+	if _, err := NewBGPRouteBackend(speaker, false, false, false); err == nil {
 		t.Fatal("backend without address families accepted")
 	}
 }

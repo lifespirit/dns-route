@@ -4,17 +4,31 @@ import (
 	"context"
 	"errors"
 	"net/netip"
+	"reflect"
 	"testing"
 )
 
 type fakeRouteBackend struct {
-	name      string
-	covered   bool
-	result    ApplyResult
-	ensureErr error
-	reloadErr error
-	ensures   int
-	reloads   int
+	name              string
+	covered           bool
+	result            ApplyResult
+	ensureErr         error
+	exactResult       ApplyResult
+	exactErr          error
+	reloadErr         error
+	replaceDesiredErr error
+	ensures           int
+	exactEnsures      int
+	reloads           int
+	snapshotRoutes    []RouteIntent
+	replacedDesired   []RouteIntent
+	events            *[]string
+}
+
+func (b *fakeRouteBackend) record(event string) {
+	if b.events != nil {
+		*b.events = append(*b.events, event)
+	}
 }
 
 func (b *fakeRouteBackend) Name() string { return b.name }
@@ -23,11 +37,26 @@ func (b *fakeRouteBackend) CoversAddress(netip.Addr) bool {
 }
 func (b *fakeRouteBackend) Ensure(context.Context, RouteIntent) (ApplyResult, error) {
 	b.ensures++
+	b.record("ensure:" + b.name)
 	return b.result, b.ensureErr
+}
+func (b *fakeRouteBackend) EnsureExact(context.Context, RouteIntent) (ApplyResult, error) {
+	b.exactEnsures++
+	b.record("ensure-exact:" + b.name)
+	return b.exactResult, b.exactErr
 }
 func (b *fakeRouteBackend) Reload(context.Context) error {
 	b.reloads++
+	b.record("reload:" + b.name)
 	return b.reloadErr
+}
+func (b *fakeRouteBackend) SnapshotRoutes() []RouteIntent {
+	return append([]RouteIntent(nil), b.snapshotRoutes...)
+}
+func (b *fakeRouteBackend) ReplaceDesired(_ context.Context, routes []RouteIntent) error {
+	b.record("replace-desired:" + b.name)
+	b.replacedDesired = append([]RouteIntent(nil), routes...)
+	return b.replaceDesiredErr
 }
 func (b *fakeRouteBackend) SnapshotSize() int { return 1 }
 func (b *fakeRouteBackend) Close() error      { return nil }
@@ -72,13 +101,64 @@ func TestBackendsCoverAddressRequiresEveryBackend(t *testing.T) {
 	}
 }
 
-func TestEnsureBackendsCollectsErrorsAndTracksKernelChange(t *testing.T) {
-	backendErr := errors.New("BGP unavailable")
+func TestEnsureBackendsUsesExactKernelBeforeBGP(t *testing.T) {
+	var events []string
 	kernel := &fakeRouteBackend{
-		name:   KernelRouteBackendName,
-		result: ApplyResult{Changed: true, Ready: true},
+		name:        KernelRouteBackendName,
+		exactResult: ApplyResult{Changed: true, Ready: true},
+		events:      &events,
 	}
-	bgp := &fakeRouteBackend{name: "bgp", ensureErr: backendErr}
+	bgp := &fakeRouteBackend{
+		name:   BGPRouteBackendName,
+		result: ApplyResult{Ready: true},
+		events: &events,
+	}
+	rm := &RouteManager{backends: []RouteBackend{bgp, kernel}}
+
+	changed, err := rm.ensureBackends(context.Background(), RouteIntent{
+		IP:     netip.MustParseAddr("192.0.2.10"),
+		Prefix: netip.MustParsePrefix("192.0.2.0/24"),
+	})
+	if err != nil {
+		t.Fatalf("ensure: %v", err)
+	}
+	if !changed {
+		t.Fatal("kernel change not retained")
+	}
+	if kernel.exactEnsures != 1 || kernel.ensures != 0 || bgp.ensures != 1 {
+		t.Fatalf("kernel exact=%d normal=%d bgp=%d", kernel.exactEnsures, kernel.ensures, bgp.ensures)
+	}
+	wantEvents := []string{"ensure-exact:kernel", "ensure:bgp"}
+	if !reflect.DeepEqual(events, wantEvents) {
+		t.Fatalf("events=%v, want %v", events, wantEvents)
+	}
+}
+
+func TestEnsureBackendsNeverAnnouncesWhenKernelFails(t *testing.T) {
+	kernelErr := errors.New("kernel route failed")
+	kernel := &fakeRouteBackend{name: KernelRouteBackendName, exactErr: kernelErr}
+	bgp := &fakeRouteBackend{name: BGPRouteBackendName, result: ApplyResult{Ready: true}}
+	rm := &RouteManager{backends: []RouteBackend{kernel, bgp}}
+
+	_, err := rm.ensureBackends(context.Background(), RouteIntent{
+		IP:     netip.MustParseAddr("192.0.2.10"),
+		Prefix: netip.MustParsePrefix("192.0.2.0/24"),
+	})
+	if !errors.Is(err, kernelErr) {
+		t.Fatalf("error=%v, want %v", err, kernelErr)
+	}
+	if bgp.ensures != 0 {
+		t.Fatalf("BGP ensure calls=%d, want 0", bgp.ensures)
+	}
+}
+
+func TestEnsureBackendsRetainsKernelChangeWhenBGPFails(t *testing.T) {
+	bgpErr := errors.New("BGP unavailable")
+	kernel := &fakeRouteBackend{
+		name:        KernelRouteBackendName,
+		exactResult: ApplyResult{Changed: true, Ready: true},
+	}
+	bgp := &fakeRouteBackend{name: BGPRouteBackendName, ensureErr: bgpErr}
 	rm := &RouteManager{backends: []RouteBackend{kernel, bgp}}
 
 	changed, err := rm.ensureBackends(context.Background(), RouteIntent{
@@ -86,12 +166,54 @@ func TestEnsureBackendsCollectsErrorsAndTracksKernelChange(t *testing.T) {
 		Prefix: netip.MustParsePrefix("192.0.2.0/24"),
 	})
 	if !changed {
-		t.Fatal("kernel change must be retained when another backend fails")
+		t.Fatal("kernel change must be retained when BGP fails")
 	}
-	if !errors.Is(err, backendErr) {
-		t.Fatalf("error = %v, want %v", err, backendErr)
+	if !errors.Is(err, bgpErr) {
+		t.Fatalf("error = %v, want %v", err, bgpErr)
 	}
-	if kernel.ensures != 1 || bgp.ensures != 1 {
-		t.Fatalf("ensure counts: kernel=%d bgp=%d", kernel.ensures, bgp.ensures)
+}
+
+func TestReloadBackendsMirrorsKernelSnapshotIntoBGP(t *testing.T) {
+	var events []string
+	routes := []RouteIntent{{
+		IP:         netip.MustParseAddr("198.51.100.0"),
+		Prefix:     netip.MustParsePrefix("198.51.100.0/24"),
+		ResolvedBy: PrefixSourceKernel,
+	}}
+	kernel := &fakeRouteBackend{
+		name:           KernelRouteBackendName,
+		snapshotRoutes: routes,
+		events:         &events,
+	}
+	bgp := &fakeRouteBackend{name: BGPRouteBackendName, events: &events}
+	rm := &RouteManager{backends: []RouteBackend{bgp, kernel}}
+
+	if err := rm.ReloadBackends(context.Background()); err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	wantEvents := []string{"reload:kernel", "replace-desired:bgp"}
+	if !reflect.DeepEqual(events, wantEvents) {
+		t.Fatalf("events=%v, want %v", events, wantEvents)
+	}
+	if !reflect.DeepEqual(bgp.replacedDesired, routes) {
+		t.Fatalf("replaced=%+v, want %+v", bgp.replacedDesired, routes)
+	}
+	if bgp.reloads != 0 {
+		t.Fatalf("BGP Reload called separately %d times", bgp.reloads)
+	}
+}
+
+func TestReloadBackendsDoesNotUseStaleSnapshotAfterKernelFailure(t *testing.T) {
+	kernelErr := errors.New("route dump failed")
+	kernel := &fakeRouteBackend{name: KernelRouteBackendName, reloadErr: kernelErr}
+	bgp := &fakeRouteBackend{name: BGPRouteBackendName}
+	rm := &RouteManager{backends: []RouteBackend{kernel, bgp}}
+
+	err := rm.ReloadBackends(context.Background())
+	if !errors.Is(err, kernelErr) {
+		t.Fatalf("error=%v, want %v", err, kernelErr)
+	}
+	if bgp.reloads != 0 || bgp.replacedDesired != nil {
+		t.Fatalf("BGP touched after kernel failure: reloads=%d replaced=%v", bgp.reloads, bgp.replacedDesired)
 	}
 }

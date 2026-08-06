@@ -25,6 +25,27 @@ type ApplyResult struct {
 	Ready   bool
 }
 
+// RouteSnapshotProvider exposes the exact prefixes currently present in a
+// backend snapshot. KernelRouteBackend implements it for ordered kernel+bgp
+// reconciliation during startup and explicit route reloads.
+type RouteSnapshotProvider interface {
+	SnapshotRoutes() []RouteIntent
+}
+
+// DesiredRouteSetBackend replaces a backend's complete desired route set.
+// BGPRouteBackend implements it so its table can mirror the configured kernel
+// table without persistent route storage.
+type DesiredRouteSetBackend interface {
+	ReplaceDesired(ctx context.Context, routes []RouteIntent) error
+}
+
+// ExactRouteBackend can require the precise prefix to exist instead of merely
+// accepting coverage by a broader route. RouteManager uses this for the kernel
+// side of kernel+bgp before allowing the matching BGP announcement.
+type ExactRouteBackend interface {
+	EnsureExact(ctx context.Context, route RouteIntent) (ApplyResult, error)
+}
+
 // RouteBackend applies one normalized route intent to a routing system. The
 // address coverage check is an optional fast path: every active backend must
 // report coverage before RouteManager may skip prefix resolution and Ensure.

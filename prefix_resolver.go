@@ -11,8 +11,9 @@ import (
 type PrefixSource string
 
 const (
-	PrefixSourceHost  PrefixSource = "host"
-	PrefixSourceCymru PrefixSource = "cymru"
+	PrefixSourceHost   PrefixSource = "host"
+	PrefixSourceCymru  PrefixSource = "cymru"
+	PrefixSourceKernel PrefixSource = "kernel"
 )
 
 var ErrNoUsableCymruPrefix = errors.New("Team Cymru response contains no usable covering prefix")

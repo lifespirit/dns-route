@@ -263,6 +263,7 @@ type RouteManager struct {
 	app            *App
 	prefixResolver PrefixResolver
 	backends       []RouteBackend
+	backendMu      sync.RWMutex
 
 	ipMu    sync.RWMutex
 	ipCache map[string]routeCacheEntry
@@ -719,25 +720,79 @@ func (rm *RouteManager) processIPOnce(ip string) error {
 	return nil
 }
 
+func (rm *RouteManager) backendByName(name string) RouteBackend {
+	for _, backend := range rm.backends {
+		if backend != nil && backend.Name() == name {
+			return backend
+		}
+	}
+	return nil
+}
+
+func ensureRouteBackend(ctx context.Context, backend RouteBackend, route RouteIntent) (ApplyResult, error) {
+	if backend == nil {
+		return ApplyResult{}, fmt.Errorf("nil route backend")
+	}
+	result, err := backend.Ensure(ctx, route)
+	if err != nil {
+		return result, fmt.Errorf("%s backend: %w", backend.Name(), err)
+	}
+	if !result.Ready {
+		return result, fmt.Errorf("%s backend did not accept prefix %s", backend.Name(), route.Prefix)
+	}
+	return result, nil
+}
+
 func (rm *RouteManager) ensureBackends(ctx context.Context, route RouteIntent) (bool, error) {
+	rm.backendMu.RLock()
+	defer rm.backendMu.RUnlock()
+
 	if len(rm.backends) == 0 {
 		return false, fmt.Errorf("no route backends configured")
 	}
 
+	kernel := rm.backendByName(KernelRouteBackendName)
+	bgp := rm.backendByName(BGPRouteBackendName)
 	kernelChanged := false
+	processed := make(map[string]struct{}, 2)
+
+	// In kernel+bgp mode the exact route must exist in the configured kernel
+	// table before the matching BGP prefix may be announced. A broader kernel
+	// route is insufficient because traffic attracted by BGP must have the same
+	// forwarding entry on the dns-route node.
+	if kernel != nil && bgp != nil {
+		exactKernel, ok := kernel.(ExactRouteBackend)
+		if !ok {
+			return false, fmt.Errorf("kernel backend does not support exact-prefix installation")
+		}
+		result, err := exactKernel.EnsureExact(ctx, route)
+		if err != nil {
+			return false, fmt.Errorf("%s backend: %w", kernel.Name(), err)
+		}
+		if !result.Ready {
+			return false, fmt.Errorf("%s backend did not accept exact prefix %s", kernel.Name(), route.Prefix)
+		}
+		kernelChanged = result.Changed
+		processed[kernel.Name()] = struct{}{}
+
+		if _, err := ensureRouteBackend(ctx, bgp, route); err != nil {
+			return kernelChanged, err
+		}
+		processed[bgp.Name()] = struct{}{}
+	}
+
 	var errs []error
 	for _, backend := range rm.backends {
 		if backend == nil {
 			errs = append(errs, fmt.Errorf("nil route backend"))
 			continue
 		}
-		result, err := backend.Ensure(ctx, route)
-		if err != nil {
-			errs = append(errs, fmt.Errorf("%s backend: %w", backend.Name(), err))
+		if _, done := processed[backend.Name()]; done {
 			continue
 		}
-		if !result.Ready {
-			errs = append(errs, fmt.Errorf("%s backend did not accept prefix %s", backend.Name(), route.Prefix))
+		result, err := ensureRouteBackend(ctx, backend, route)
+		if err != nil {
+			errs = append(errs, err)
 			continue
 		}
 		if backend.Name() == KernelRouteBackendName && result.Changed {
@@ -816,10 +871,43 @@ func (rm *RouteManager) backendsCoverAddress(addr netip.Addr) bool {
 }
 
 func (rm *RouteManager) ReloadBackends(ctx context.Context) error {
+	rm.backendMu.Lock()
+	defer rm.backendMu.Unlock()
+
+	kernel := rm.backendByName(KernelRouteBackendName)
+	bgp := rm.backendByName(BGPRouteBackendName)
+	processed := make(map[string]struct{}, 2)
 	var errs []error
+
+	// Reuse the existing kernel snapshot reload as the source of truth for
+	// kernel+bgp. Startup and the manual route-reload action both execute this
+	// same ordered sequence. There is intentionally no background polling.
+	if kernel != nil && bgp != nil {
+		if err := kernel.Reload(ctx); err != nil {
+			// Never reconcile BGP from a stale kernel snapshot.
+			return fmt.Errorf("reload %s backend: %w", kernel.Name(), err)
+		}
+		provider, ok := kernel.(RouteSnapshotProvider)
+		if !ok {
+			return fmt.Errorf("kernel backend does not expose its route snapshot")
+		}
+		reconciler, ok := bgp.(DesiredRouteSetBackend)
+		if !ok {
+			return fmt.Errorf("BGP backend does not support desired-set replacement")
+		}
+		if err := reconciler.ReplaceDesired(ctx, provider.SnapshotRoutes()); err != nil {
+			errs = append(errs, fmt.Errorf("reconcile %s backend from kernel snapshot: %w", bgp.Name(), err))
+		}
+		processed[kernel.Name()] = struct{}{}
+		processed[bgp.Name()] = struct{}{}
+	}
+
 	for _, backend := range rm.backends {
 		if backend == nil {
 			errs = append(errs, fmt.Errorf("nil route backend"))
+			continue
+		}
+		if _, done := processed[backend.Name()]; done {
 			continue
 		}
 		if err := backend.Reload(ctx); err != nil {
@@ -1040,8 +1128,6 @@ func initDB(db *sql.DB) error {
 		`CREATE TABLE IF NOT EXISTS special_domains (id INTEGER PRIMARY KEY AUTOINCREMENT, domain TEXT NOT NULL UNIQUE, enabled INTEGER NOT NULL DEFAULT 1);`,
 		`CREATE TABLE IF NOT EXISTS dns_records (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, type TEXT NOT NULL, value TEXT NOT NULL, ttl INTEGER NOT NULL DEFAULT 0, enabled INTEGER NOT NULL DEFAULT 1);`,
 		`CREATE INDEX IF NOT EXISTS idx_dns_records_name_type ON dns_records(name, type, enabled);`,
-		`CREATE TABLE IF NOT EXISTS managed_prefixes (prefix TEXT PRIMARY KEY, family INTEGER NOT NULL, resolved_by TEXT NOT NULL, first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL, enabled INTEGER NOT NULL DEFAULT 1);`,
-		`CREATE INDEX IF NOT EXISTS idx_managed_prefixes_enabled_family ON managed_prefixes(enabled, family, prefix);`,
 	}
 	for _, stmt := range stmts {
 		if _, err := db.Exec(stmt); err != nil {

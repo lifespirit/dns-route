@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"sort"
 	"sync"
 )
 
@@ -14,25 +15,27 @@ const BGPRouteBackendName = "bgp"
 // BGP implementation, such as an embedded GoBGP server.
 type BGPSpeaker interface {
 	Announce(ctx context.Context, route RouteIntent) (changed bool, err error)
+	Withdraw(ctx context.Context, prefix netip.Prefix) (changed bool, err error)
 	Established() bool
 	Close() error
 }
 
+// BGPRouteBackend keeps only ephemeral process state. In bgp-only mode the
+// desired set is rebuilt from DNS answers after every dns-route restart. In
+// kernel+bgp mode RouteManager replaces this set from the configured kernel
+// table during startup and every explicit route reload.
 type BGPRouteBackend struct {
-	store              ManagedPrefixStore
 	speaker            BGPSpeaker
 	requireEstablished bool
 	ipv4               bool
 	ipv6               bool
 
-	snapshotMu sync.RWMutex
-	snapshot   map[netip.Prefix]struct{}
+	mu        sync.RWMutex
+	desired   map[netip.Prefix]RouteIntent
+	announced map[netip.Prefix]struct{}
 }
 
-func NewBGPRouteBackend(store ManagedPrefixStore, speaker BGPSpeaker, requireEstablished, ipv4, ipv6 bool) (*BGPRouteBackend, error) {
-	if store == nil {
-		return nil, fmt.Errorf("BGP managed prefix store is nil")
-	}
+func NewBGPRouteBackend(speaker BGPSpeaker, requireEstablished, ipv4, ipv6 bool) (*BGPRouteBackend, error) {
 	if speaker == nil {
 		return nil, fmt.Errorf("BGP speaker is nil")
 	}
@@ -40,12 +43,12 @@ func NewBGPRouteBackend(store ManagedPrefixStore, speaker BGPSpeaker, requireEst
 		return nil, fmt.Errorf("BGP backend has no enabled address family")
 	}
 	return &BGPRouteBackend{
-		store:              store,
 		speaker:            speaker,
 		requireEstablished: requireEstablished,
 		ipv4:               ipv4,
 		ipv6:               ipv6,
-		snapshot:           make(map[netip.Prefix]struct{}),
+		desired:            make(map[netip.Prefix]RouteIntent),
+		announced:          make(map[netip.Prefix]struct{}),
 	}, nil
 }
 
@@ -74,9 +77,9 @@ func (b *BGPRouteBackend) CoversAddress(addr netip.Addr) bool {
 		return false
 	}
 
-	b.snapshotMu.RLock()
-	defer b.snapshotMu.RUnlock()
-	for prefix := range b.snapshot {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	for prefix := range b.announced {
 		if prefix.Addr().Is4() == addr.Is4() && prefix.Contains(addr) {
 			return true
 		}
@@ -85,29 +88,40 @@ func (b *BGPRouteBackend) CoversAddress(addr netip.Addr) bool {
 }
 
 func (b *BGPRouteBackend) SnapshotSize() int {
-	b.snapshotMu.RLock()
-	defer b.snapshotMu.RUnlock()
-	return len(b.snapshot)
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return len(b.announced)
 }
 
-func (b *BGPRouteBackend) addSnapshot(prefix netip.Prefix) {
-	prefix = prefix.Masked()
-	b.snapshotMu.Lock()
-	b.snapshot[prefix] = struct{}{}
-	b.snapshotMu.Unlock()
+func (b *BGPRouteBackend) DesiredSize() int {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return len(b.desired)
 }
 
-func (b *BGPRouteBackend) replaceSnapshot(prefixes map[netip.Prefix]struct{}) {
-	b.snapshotMu.Lock()
-	b.snapshot = prefixes
-	b.snapshotMu.Unlock()
+func (b *BGPRouteBackend) rememberDesired(route RouteIntent) {
+	b.mu.Lock()
+	b.desired[route.Prefix] = route
+	b.mu.Unlock()
+}
+
+func (b *BGPRouteBackend) markAnnounced(prefix netip.Prefix) {
+	b.mu.Lock()
+	b.announced[prefix.Masked()] = struct{}{}
+	b.mu.Unlock()
+}
+
+func (b *BGPRouteBackend) markWithdrawn(prefix netip.Prefix) {
+	b.mu.Lock()
+	delete(b.announced, prefix.Masked())
+	b.mu.Unlock()
 }
 
 func (b *BGPRouteBackend) Ensure(ctx context.Context, route RouteIntent) (ApplyResult, error) {
 	if err := ctx.Err(); err != nil {
 		return ApplyResult{}, err
 	}
-	if b == nil || b.store == nil || b.speaker == nil {
+	if b == nil || b.speaker == nil {
 		return ApplyResult{}, fmt.Errorf("BGP route backend is not configured")
 	}
 	route, err := validateRouteIntent(route)
@@ -118,49 +132,95 @@ func (b *BGPRouteBackend) Ensure(ctx context.Context, route RouteIntent) (ApplyR
 		return ApplyResult{}, fmt.Errorf("BGP address family is disabled for prefix %s", route.Prefix)
 	}
 
-	// Persist first. If the speaker is temporarily unavailable, the desired
-	// prefix remains available for replay during Reload or after restart.
-	if err := b.store.Save(ctx, route); err != nil {
-		return ApplyResult{}, err
-	}
+	// Remember the prefix before touching the speaker. A temporary session or
+	// speaker failure can then be retried from memory without SQLite.
+	b.rememberDesired(route)
 	changed, err := b.speaker.Announce(ctx, route)
 	if err != nil {
 		return ApplyResult{}, fmt.Errorf("announce BGP prefix %s: %w", route.Prefix, err)
 	}
-	b.addSnapshot(route.Prefix)
+	b.markAnnounced(route.Prefix)
 	return ApplyResult{Changed: changed, Ready: b.ready()}, nil
 }
 
-func (b *BGPRouteBackend) Reload(ctx context.Context) error {
+// ReplaceDesired makes routes the complete desired BGP table and reconciles
+// the speaker to it. RouteManager uses this only after successfully reloading
+// the configured kernel table in kernel+bgp mode.
+func (b *BGPRouteBackend) ReplaceDesired(ctx context.Context, routes []RouteIntent) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if b == nil || b.store == nil || b.speaker == nil {
+	if b == nil || b.speaker == nil {
 		return fmt.Errorf("BGP route backend is not configured")
 	}
-	routes, err := b.store.ListEnabled(ctx)
-	if err != nil {
-		return err
-	}
 
-	loaded := make(map[netip.Prefix]struct{}, len(routes))
-	var errs []error
+	desired := make(map[netip.Prefix]RouteIntent, len(routes))
 	for _, route := range routes {
-		route, validateErr := validateRouteIntent(route)
-		if validateErr != nil {
-			errs = append(errs, validateErr)
-			continue
+		route, err := validateRouteIntent(route)
+		if err != nil {
+			return err
 		}
 		if !b.familyEnabled(route.Prefix) {
 			continue
 		}
-		if _, announceErr := b.speaker.Announce(ctx, route); announceErr != nil {
-			errs = append(errs, fmt.Errorf("reannounce BGP prefix %s: %w", route.Prefix, announceErr))
+		desired[route.Prefix] = route
+	}
+
+	b.mu.Lock()
+	b.desired = desired
+	b.mu.Unlock()
+	return b.Reload(ctx)
+}
+
+func (b *BGPRouteBackend) desiredAndAnnounced() ([]RouteIntent, []netip.Prefix) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	desired := make([]RouteIntent, 0, len(b.desired))
+	for _, route := range b.desired {
+		desired = append(desired, route)
+	}
+	sort.Slice(desired, func(i, j int) bool {
+		return desired[i].Prefix.String() < desired[j].Prefix.String()
+	})
+
+	stale := make([]netip.Prefix, 0)
+	for prefix := range b.announced {
+		if _, wanted := b.desired[prefix]; !wanted {
+			stale = append(stale, prefix)
+		}
+	}
+	sort.Slice(stale, func(i, j int) bool { return stale[i].String() < stale[j].String() })
+	return desired, stale
+}
+
+// Reload replays every desired prefix, so it also restores a newly-created
+// speaker whose Loc-RIB is empty. Prefixes no longer present in desired are
+// withdrawn after all wanted routes have been announced.
+func (b *BGPRouteBackend) Reload(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if b == nil || b.speaker == nil {
+		return fmt.Errorf("BGP route backend is not configured")
+	}
+
+	desired, stale := b.desiredAndAnnounced()
+	var errs []error
+	for _, route := range desired {
+		if _, err := b.speaker.Announce(ctx, route); err != nil {
+			errs = append(errs, fmt.Errorf("reannounce BGP prefix %s: %w", route.Prefix, err))
 			continue
 		}
-		loaded[route.Prefix] = struct{}{}
+		b.markAnnounced(route.Prefix)
 	}
-	b.replaceSnapshot(loaded)
+	for _, prefix := range stale {
+		if _, err := b.speaker.Withdraw(ctx, prefix); err != nil {
+			errs = append(errs, fmt.Errorf("withdraw BGP prefix %s: %w", prefix, err))
+			continue
+		}
+		b.markWithdrawn(prefix)
+	}
 	return errors.Join(errs...)
 }
 
