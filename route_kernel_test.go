@@ -20,8 +20,10 @@ func mustIPNet(t *testing.T, cidr string) *net.IPNet {
 }
 
 func newTestKernelBackend() *KernelRouteBackend {
+	cfg := &Config{RouteTable: 101}
 	return &KernelRouteBackend{
-		app: &App{cfg: &Config{RouteTable: 101}},
+		app: &App{cfg: cfg},
+		cfg: cfg,
 	}
 }
 

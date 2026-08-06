@@ -192,22 +192,26 @@ func allFieldsEmpty(fields []string) bool {
 }
 
 func importSpecialDomains(db *sql.DB, parsed *specialDomainCSV) error {
+	return withSQLiteWriteTx(context.Background(), db, func(conn *sql.Conn) error {
+		return importSpecialDomainsConn(context.Background(), conn, parsed)
+	})
+}
+
+func importSpecialDomainsConn(ctx context.Context, conn *sql.Conn, parsed *specialDomainCSV) error {
 	if parsed == nil || len(parsed.Patterns) == 0 {
 		return fmt.Errorf("empty special-domain import")
 	}
-	return withSQLiteWriteTx(context.Background(), db, func(conn *sql.Conn) error {
-		stmt, err := conn.PrepareContext(context.Background(), `INSERT INTO special_domains(domain, enabled) VALUES(?, 1) ON CONFLICT(domain) DO UPDATE SET enabled = 1`)
-		if err != nil {
+	stmt, err := conn.PrepareContext(ctx, `INSERT INTO special_domains(domain, enabled) VALUES(?, 1) ON CONFLICT(domain) DO UPDATE SET enabled = 1`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+	for _, pattern := range parsed.Patterns {
+		if _, err := stmt.ExecContext(ctx, pattern); err != nil {
 			return err
 		}
-		defer stmt.Close()
-		for _, pattern := range parsed.Patterns {
-			if _, err := stmt.ExecContext(context.Background(), pattern); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
+	}
+	return nil
 }
 
 func exportSpecialDomainsCSV(db *sql.DB, w io.Writer) error {
@@ -244,7 +248,11 @@ type specialDomainSourceDBRow struct {
 }
 
 func readEnabledSpecialDomainSources(db *sql.DB) ([]specialDomainSourceDBRow, error) {
-	rows, err := db.Query(`SELECT id, location, enabled FROM special_domain_sources WHERE enabled = 1 ORDER BY id`)
+	return readEnabledSpecialDomainSourcesFrom(context.Background(), db)
+}
+
+func readEnabledSpecialDomainSourcesFrom(ctx context.Context, db sqlQueryer) ([]specialDomainSourceDBRow, error) {
+	rows, err := db.QueryContext(ctx, `SELECT id, location, enabled FROM special_domain_sources WHERE enabled = 1 ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -298,6 +306,10 @@ func fetchSpecialDomainSources(ctx context.Context, db *sql.DB, client *http.Cli
 }
 
 func applySpecialDomainSources(db *sql.DB, cfg *Config, snapshots []SpecialDomainSourceSnapshot) error {
+	return applySpecialDomainSourcesFrom(context.Background(), db, cfg, snapshots)
+}
+
+func applySpecialDomainSourcesFrom(ctx context.Context, db sqlQueryer, cfg *Config, snapshots []SpecialDomainSourceSnapshot) error {
 	if cfg == nil {
 		return fmt.Errorf("nil config")
 	}
@@ -310,7 +322,7 @@ func applySpecialDomainSources(db *sql.DB, cfg *Config, snapshots []SpecialDomai
 	cfg.SpecialDomainSources = nil
 	cfg.SpecialDomainSourceSnapshots = nil
 
-	configured, err := readEnabledSpecialDomainSources(db)
+	configured, err := readEnabledSpecialDomainSourcesFrom(ctx, db)
 	if err != nil {
 		return err
 	}
@@ -348,14 +360,6 @@ func getSpecialDomainSourceByID(db *sql.DB, id int64) (specialDomainSourceDBRow,
 	return row, err
 }
 
-func restoreSpecialDomainSource(db *sql.DB, old specialDomainSourceDBRow, existed bool, location string) {
-	if existed {
-		_, _ = db.Exec(`INSERT INTO special_domain_sources(id, location, enabled) VALUES(?, ?, ?) ON CONFLICT(id) DO UPDATE SET location=excluded.location, enabled=excluded.enabled`, old.ID, old.Location, old.Enabled)
-		return
-	}
-	_, _ = db.Exec(`DELETE FROM special_domain_sources WHERE location = ?`, location)
-}
-
 func (a *App) handleSpecialImport(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		renderError(w, http.StatusMethodNotAllowed, fmt.Errorf("method not allowed"))
@@ -377,11 +381,9 @@ func (a *App) handleSpecialImport(w http.ResponseWriter, r *http.Request) {
 		renderError(w, http.StatusBadRequest, err)
 		return
 	}
-	if err := importSpecialDomains(a.db, parsed); err != nil {
-		renderError(w, http.StatusInternalServerError, err)
-		return
-	}
-	if err := a.reloadConfig(); err != nil {
+	if err := a.applyConfigMutation(r.Context(), func(conn *sql.Conn) error {
+		return importSpecialDomainsConn(r.Context(), conn, parsed)
+	}); err != nil {
 		renderError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -413,19 +415,10 @@ func (a *App) handleSpecialSourceAdd(w http.ResponseWriter, r *http.Request) {
 		renderError(w, http.StatusBadRequest, fmt.Errorf("validate special-domain source location: %w", err))
 		return
 	}
-	var old specialDomainSourceDBRow
-	err := a.db.QueryRow(`SELECT id, location, enabled FROM special_domain_sources WHERE location = ?`, location).Scan(&old.ID, &old.Location, &old.Enabled)
-	existed := err == nil
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		renderError(w, http.StatusInternalServerError, err)
-		return
-	}
-	if _, err := a.db.Exec(`INSERT INTO special_domain_sources(location, enabled) VALUES(?, 1) ON CONFLICT(location) DO UPDATE SET enabled = 1`, location); err != nil {
-		renderError(w, http.StatusInternalServerError, err)
-		return
-	}
-	if err := a.reloadConfig(); err != nil {
-		restoreSpecialDomainSource(a.db, old, existed, location)
+	if err := a.applyConfigMutation(r.Context(), func(conn *sql.Conn) error {
+		_, err := conn.ExecContext(r.Context(), `INSERT INTO special_domain_sources(location, enabled) VALUES(?, 1) ON CONFLICT(location) DO UPDATE SET enabled = 1`, location)
+		return err
+	}); err != nil {
 		renderError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -442,17 +435,14 @@ func (a *App) handleSpecialSourceDelete(w http.ResponseWriter, r *http.Request) 
 		renderError(w, http.StatusBadRequest, fmt.Errorf("invalid id"))
 		return
 	}
-	old, err := getSpecialDomainSourceByID(a.db, id)
-	if err != nil {
+	if _, err := getSpecialDomainSourceByID(a.db, id); err != nil {
 		renderError(w, http.StatusNotFound, err)
 		return
 	}
-	if _, err := a.db.Exec(`DELETE FROM special_domain_sources WHERE id = ?`, id); err != nil {
-		renderError(w, http.StatusInternalServerError, err)
-		return
-	}
-	if err := a.reloadConfig(); err != nil {
-		restoreSpecialDomainSource(a.db, old, true, old.Location)
+	if err := a.applyConfigMutation(r.Context(), func(conn *sql.Conn) error {
+		_, err := conn.ExecContext(r.Context(), `DELETE FROM special_domain_sources WHERE id = ?`, id)
+		return err
+	}); err != nil {
 		renderError(w, http.StatusInternalServerError, err)
 		return
 	}

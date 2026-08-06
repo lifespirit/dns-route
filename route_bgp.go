@@ -250,22 +250,30 @@ func (b *BGPRouteBackend) Reload(ctx context.Context) error {
 	}
 
 	desired, stale := b.desiredAndAnnounced()
-	var errs []error
+	var announceErrs []error
 	for _, route := range desired {
 		if _, err := b.speaker.Announce(ctx, route); err != nil {
-			errs = append(errs, fmt.Errorf("reannounce BGP prefix %s: %w", route.Prefix, err))
+			announceErrs = append(announceErrs, fmt.Errorf("reannounce BGP prefix %s: %w", route.Prefix, err))
 			continue
 		}
 		b.markAnnounced(route.Prefix)
 	}
+	if err := errors.Join(announceErrs...); err != nil {
+		// Keep every previously announced route until the complete replacement
+		// set is present. Withdrawing stale routes after a partial announce would
+		// create an avoidable traffic black hole.
+		return err
+	}
+
+	var withdrawErrs []error
 	for _, prefix := range stale {
 		if _, err := b.speaker.Withdraw(ctx, prefix); err != nil {
-			errs = append(errs, fmt.Errorf("withdraw BGP prefix %s: %w", prefix, err))
+			withdrawErrs = append(withdrawErrs, fmt.Errorf("withdraw BGP prefix %s: %w", prefix, err))
 			continue
 		}
 		b.markWithdrawn(prefix)
 	}
-	return errors.Join(errs...)
+	return errors.Join(withdrawErrs...)
 }
 
 func (b *BGPRouteBackend) Close() error {

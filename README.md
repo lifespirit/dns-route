@@ -1,109 +1,112 @@
 # dns-route
 
-DNS proxy with:
-- SQLite-backed config
-- Web admin panel
-- Separate web pages for Runtime, Settings, Upstreams, Special domains and DNS records
-- local A/AAAA records with wildcard support
-- empty local A/AAAA values act as NODATA rules: the daemon replies NOERROR with no addresses and does not forward the query upstream
-- special domains route programming via netlink
-- IPv4 routing from A answers and IPv6 routing from AAAA answers
-- independent route toggles in the UI: `route_ipv4` and `route_ipv6`
-- route manager with IP/prefix dedupe, snapshot cache and on-demand route reload
-- Prometheus metrics
+[Русская версия](README.rus.md)
 
-Routing notes:
-- Team Cymru prefixes `/32` for IPv4 and `/128` for IPv6 are ignored as prefix-lookup results; in that case the daemon falls back to the normal host route.
-- A answers are routed as IPv4 routes; without Team Cymru lookup they are added as `/32`.
-- AAAA answers are routed as IPv6 routes; without Team Cymru lookup they are added as `/128`.
-- `wg_gateway_v4` is required for IPv4 routes installed through the kernel backend.
-- `wg_gateway_v6` is optional for IPv6 routes. If it is empty, AAAA routes are added as dev-only routes via `wg_interface`.
-- `lookup_cidr` is kept as a compatibility setting name, but it now uses Team Cymru DNS TXT lookups to resolve IP addresses to BGP prefixes (`origin.asn.cymru.com` for IPv4 and `origin6.asn.cymru.com` for IPv6). WHOIS/RIR `CIDR:` lookup is no longer used.
+`dns-route` is a Linux DNS proxy that turns selected DNS answers into dynamic routes. It can forward DNS over UDP, TCP, DNS-over-TLS, or DNS-over-HTTPS, serve local A/AAAA records, load domain lists from CSV files or URLs, and program Linux or BGP routes for addresses returned for selected domains.
 
-Build:
-
-```bash
-go get
-go build .
-```
-
-Run:
-
-```bash
-./dns-route -http 127.0.0.1:9010 -db ./config.db
-```
-
-## Embedded BGP (experimental)
-
-The default `route_mode` is `kernel`, so upgrading does not enable BGP automatically. The supported modes are:
-
-- `kernel` — install routes only in the configured Linux route table.
-- `bgp` — announce routes only through the embedded GoBGP speaker. The in-memory table is rebuilt from DNS answers after a full process restart.
-- `kernel+bgp` — install the exact prefix in the configured Linux route table first, then announce the same prefix through BGP. Startup and the manual route reload mirror the configured kernel table into BGP.
-
-BGP settings are available on the web admin Settings page. The form validates the route mode, table number, ASNs, router ID, peer/source addresses, next hops and multihop TTL before saving. The configured TCP MD5 password is never rendered back into HTML: leave the password field empty to keep it, or use the clear checkbox to remove it.
-
-The same values can still be written directly to the existing `settings` table. Example for IPv4 `kernel+bgp`:
-
-```sql
-INSERT INTO settings(key, value) VALUES
-  ('route_mode', 'kernel+bgp'),
-  ('bgp_local_asn', '65001'),
-  ('bgp_router_id', '192.0.2.10'),
-  ('bgp_peer_address', '192.0.2.1'),
-  ('bgp_peer_asn', '65000'),
-  ('bgp_local_address', '192.0.2.10'),
-  ('bgp_next_hop_v4', '192.0.2.10'),
-  ('bgp_multihop_ttl', '1'),
-  ('bgp_require_established', 'false')
-ON CONFLICT(key) DO UPDATE SET value = excluded.value;
-```
-
-For IPv6 routing, set `bgp_next_hop_v6` to the address that the peer must use as next hop. `bgp_next_hop_v4` and `bgp_next_hop_v6` are required only for enabled route families. `bgp_local_address` is optional. A multihop TTL greater than `1` enables eBGP multihop.
-
-After an offline database change, start or restart the service. If the database was edited while dns-route was running, send `POST /reload`. `POST /routes/reload` rereads the configured kernel table and mirrors it into BGP in `kernel+bgp` mode without reloading unrelated configuration.
-
-The admin and statistics pages show the peer state, backend readiness, ephemeral desired-prefix count and embedded GoBGP Loc-RIB count. Prometheus exports the same state through `dns_route_bgp_*` metrics and exposes the selected mode through `dns_route_route_mode_info`.
-
-## Special-domain CSV configuration
-
-The Special domains page supports persistent CSV import/export and external HTTP or filesystem sources. Each non-empty row contains one pattern:
+The daemon is intended for split-routing deployments where only particular domains should use a tunnel, a dedicated gateway, or a downstream router.
 
 ```text
-example.com
-*.yandex.ru
+client DNS query
+      |
+      v
++-------------+       +----------------------+
+|  dns-route  | ----> | default/zone upstream|
++-------------+       +----------------------+
+      |
+      +-- local A/AAAA or NODATA response
+      |
+      +-- special-domain match
+              |
+              +-- optional Team Cymru prefix lookup
+              |
+              +-- Linux route / embedded BGP announcement
 ```
 
-A normal domain preserves the original dns-route behavior: it matches the domain itself and every subdomain. A leading `*.` wildcard matches subdomains only, so `*.yandex.ru` matches `maps.yandex.ru` but not the `yandex.ru` apex. Empty rows, `#`/`;` comments, duplicate rows, a UTF-8 BOM and a one-column `domain` or `pattern` header are accepted. Non-empty extra CSV columns are rejected.
+![dns-route admin panel](docs/admin_panel.png)
 
-Web import stores normalized patterns in the `special_domains` SQLite table and enables an existing duplicate. Export includes persistent enabled database patterns only. External source contents remain in the immutable in-memory snapshot and are never copied into `special_domains`.
+## Features
 
-Special-domain sources accept the same `http://`, `https://`, `file:///...` and filesystem-path forms as DNS-record sources. The header **Reload sources** action reloads both source classes and activates them together only after every configured source has downloaded and parsed successfully. Normal **Reload config** performs no source I/O and reuses the active snapshots. Exact and wildcard patterns are compiled into a suffix matcher, so DNS request processing does not scan the complete source list.
+- DNS listeners on multiple IPv4 and IPv6 addresses, over both UDP and TCP.
+- Pending listener retry for interfaces that appear after daemon startup.
+- Optional Linux `IP_FREEBIND`/`IPV6_FREEBIND` support.
+- Default upstreams and longest-suffix conditional forwarding zones.
+- UDP, TCP, DoT, and DoH upstream transports with TLS certificate verification.
+- Upstream priorities, randomized balancing inside the same priority, UDP-to-TCP fallback, and a failure circuit breaker.
+- Positive DNS response cache with request-aware keys and decreasing TTL values.
+- Persistent local A/AAAA records, wildcard records, multi-value answers, and explicit NODATA rules.
+- Persistent and external CSV sources for special domains and local DNS records.
+- Route creation from A and AAAA answers only for selected special domains.
+- Optional Team Cymru DNS TXT lookup to replace host routes with covering BGP prefixes.
+- Route backends: Linux kernel, embedded GoBGP, or `kernel+bgp`.
+- Optional reply-before-route mode with asynchronous route installation and conntrack reset after a newly installed kernel route.
+- SQLite-backed transactional configuration and an embedded web admin panel.
+- Runtime pages, statistics, route diagnostics, and Prometheus metrics.
+- Graceful shutdown on `SIGINT` and `SIGTERM`.
 
-## DNS-record CSV configuration
+## Quick start
 
-The DNS records page supports persistent CSV import/export and external CSV sources.
+Requirements: Linux and Go 1.23 or newer.
 
-CSV rows use these forms:
+```bash
+go mod download
+go test ./...
+go build -o dns-route .
 
-```text
-test.lan
-test.lan,A
-test.lan,AAAA
-test.lan,A,
-test.lan,AAAA,
-test.lan,A,192.0.2.10
-test.lan,AAAA,2001:db8::10
+sudo install -Dm755 dns-route /usr/bin/dns-route
+sudo mkdir -p /var/lib/dns-route
+sudo /usr/bin/dns-route \
+  -db /var/lib/dns-route/config.db \
+  -http 127.0.0.1:8080
 ```
 
-- one column creates NOERROR/NODATA records for both A and AAAA;
-- `name,A` and `name,A,` create NODATA only for A;
-- `name,AAAA` and `name,AAAA,` create NODATA only for AAAA;
-- a non-empty third column creates a static record of the selected type;
-- repeated address rows for the same name and type create a multi-value answer.
+Open `http://127.0.0.1:8080`, then:
 
-A normal web import replaces every persistent A/AAAA row for each name present in the uploaded file and stores the imported result in SQLite. Names absent from the file remain unchanged. The CSV format has no TTL column, so imported rows use `ttl=0`, which means the configured default local-record TTL. Export includes only persistent enabled records from SQLite; external source contents are not exported.
+1. Add at least one DNS listen address, for example `127.0.0.1:53`.
+2. Add at least one default upstream, for example `1.1.1.1:53` with protocol `udp`.
+3. Configure the route interface, gateways, route table, and route families.
+4. Add special domains whose resolved addresses must be routed.
 
-A source can be an `http://` or `https://` URL, a `file:///absolute/path.csv` URL, or a normal filesystem path. **Reload sources** explicitly downloads HTTP sources and rereads filesystem sources, then atomically replaces the in-memory source snapshot. If any source fails, the previous snapshot remains active. Normal **Reload config** reuses that snapshot and performs no source file or network I/O. Newly added sources, or sources whose mode changed, remain pending until the next source reload. Source contents are never inserted into `dns_records`. Sources are applied in database-id order as the lower-priority layer; later sources win for the same name and family, while enabled persistent SQLite records have final priority.
+Each configured DNS address creates both a UDP and a TCP listener.
 
-Each source has its own **NO_DATA only** option. When enabled, dns-route reads only the first two CSV columns and ignores all later columns. Therefore an address supplied by a public list can never become a DNS answer: `name,A,203.0.113.10` is treated as `name,A`, and `name,AAAA,2001:db8::10` is treated as `name,AAAA`.
+> [!WARNING]
+> The admin HTTP interface currently has no built-in authentication or TLS. Keep it on loopback or place it behind a trusted authenticated reverse proxy and firewall.
+
+## Documentation
+
+| Topic | English | Russian |
+|---|---|---|
+| Build, installation, systemd, upgrades | [Build and installation](docs/build-install.md) | [Сборка и установка](docs/build-install.rus.md) |
+| CLI flags, SQLite settings, listeners, upstreams, routing and BGP | [Configuration reference](docs/configuration.md) | [Описание параметров](docs/configuration.rus.md) |
+| Deployment patterns with AmneziaWG and Xray | [AmneziaWG and Xray](docs/amneziawg-xray.md) | [AmneziaWG и Xray](docs/amneziawg-xray.rus.md) |
+| Special-domain and DNS-record CSV import | [Domain import](docs/domain-import.md) | [Импорт доменов](docs/domain-import.rus.md) |
+
+## Web endpoints
+
+| Path | Purpose |
+|---|---|
+| `/` | Runtime state and route backend status |
+| `/settings` | Listeners and routing settings |
+| `/upstreams` | Default upstreams and conditional forwarding zones |
+| `/special-domains` | Domains whose DNS answers trigger routing |
+| `/dns-records` | Local A/AAAA/NODATA records and external sources |
+| `/statistics` | Runtime counters and circuit state |
+| `/metrics` | Prometheus exposition format |
+| `/routes/errors` | Recent kernel route errors as JSON |
+
+## Routing model
+
+A route is considered only when all of the following are true:
+
+- the queried name matches a configured special-domain pattern;
+- the query type is `A` or `AAAA`;
+- routing for that address family is enabled;
+- the DNS answer contains an address of the requested family.
+
+With `lookup_cidr=1`, dns-route queries Team Cymru and uses a covering prefix when one is available. Otherwise it falls back to `/32` for IPv4 or `/128` for IPv6.
+
+`route_table=0` means Linux main table `254`. A dedicated policy-routing table is usually safer for split routing and avoids interference from unrelated routes already present in the main table.
+
+## License
+
+See [LICENSE](LICENSE).

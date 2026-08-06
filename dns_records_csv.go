@@ -251,6 +251,12 @@ func dnsRecordRuleCount(set DNSRecordRuleSet) int {
 }
 
 func replaceImportedDNSRecords(db *sql.DB, imported *dnsRecordCSV) error {
+	return withSQLiteWriteTx(context.Background(), db, func(conn *sql.Conn) error {
+		return replaceImportedDNSRecordsConn(context.Background(), conn, imported)
+	})
+}
+
+func replaceImportedDNSRecordsConn(ctx context.Context, conn *sql.Conn, imported *dnsRecordCSV) error {
 	if imported == nil || len(imported.Domains) == 0 {
 		return fmt.Errorf("empty DNS-record import")
 	}
@@ -261,34 +267,32 @@ func replaceImportedDNSRecords(db *sql.DB, imported *dnsRecordCSV) error {
 	}
 	sort.Strings(names)
 
-	return withSQLiteWriteTx(context.Background(), db, func(conn *sql.Conn) error {
-		for _, name := range names {
-			set := imported.Domains[name]
-			if _, err := conn.ExecContext(context.Background(), `DELETE FROM dns_records WHERE lower(rtrim(trim(name), '.')) = ?`, name); err != nil {
-				return fmt.Errorf("replace DNS records for %q: %w", name, err)
-			}
-			if set.ASet {
-				if err := insertImportedDNSRecords(conn, name, "A", set.A); err != nil {
-					return err
-				}
-			}
-			if set.AAAASet {
-				if err := insertImportedDNSRecords(conn, name, "AAAA", set.AAAA); err != nil {
-					return err
-				}
+	for _, name := range names {
+		set := imported.Domains[name]
+		if _, err := conn.ExecContext(ctx, `DELETE FROM dns_records WHERE lower(rtrim(trim(name), '.')) = ?`, name); err != nil {
+			return fmt.Errorf("replace DNS records for %q: %w", name, err)
+		}
+		if set.ASet {
+			if err := insertImportedDNSRecords(ctx, conn, name, "A", set.A); err != nil {
+				return err
 			}
 		}
-		return nil
-	})
+		if set.AAAASet {
+			if err := insertImportedDNSRecords(ctx, conn, name, "AAAA", set.AAAA); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
-func insertImportedDNSRecords(conn *sql.Conn, name, typ string, records []LocalRecord) error {
+func insertImportedDNSRecords(ctx context.Context, conn *sql.Conn, name, typ string, records []LocalRecord) error {
 	for _, rec := range records {
 		value := ""
 		if !rec.NoData && rec.IP != nil {
 			value = rec.IP.String()
 		}
-		if _, err := conn.ExecContext(context.Background(), `INSERT INTO dns_records(name, type, value, ttl, enabled) VALUES(?, ?, ?, 0, 1)`, name, typ, value); err != nil {
+		if _, err := conn.ExecContext(ctx, `INSERT INTO dns_records(name, type, value, ttl, enabled) VALUES(?, ?, ?, 0, 1)`, name, typ, value); err != nil {
 			return fmt.Errorf("store imported %s record for %q: %w", typ, name, err)
 		}
 	}
@@ -449,6 +453,10 @@ func fetchDNSRecordSources(ctx context.Context, db *sql.DB, client *http.Client)
 }
 
 func applyDNSRecordSources(db *sql.DB, cfg *Config, snapshots []DNSRecordWebSource) error {
+	return applyDNSRecordSourcesFrom(context.Background(), db, cfg, snapshots)
+}
+
+func applyDNSRecordSourcesFrom(ctx context.Context, db sqlQueryer, cfg *Config, snapshots []DNSRecordWebSource) error {
 	if cfg == nil {
 		return fmt.Errorf("nil config")
 	}
@@ -464,7 +472,7 @@ func applyDNSRecordSources(db *sql.DB, cfg *Config, snapshots []DNSRecordWebSour
 	cfg.DNSRecordSources = nil
 	cfg.DNSRecordIndex.Sources = nil
 
-	configured, err := readEnabledDNSRecordSources(db)
+	configured, err := readEnabledDNSRecordSourcesFrom(ctx, db)
 	if err != nil {
 		return err
 	}
@@ -528,7 +536,11 @@ func dnsRecordSourceKind(location string) string {
 }
 
 func readEnabledDNSRecordSources(db *sql.DB) ([]dnsRecordSourceDBRow, error) {
-	rows, err := db.Query(`SELECT id, location, no_data_only, enabled FROM dns_record_sources WHERE enabled = 1 ORDER BY id`)
+	return readEnabledDNSRecordSourcesFrom(context.Background(), db)
+}
+
+func readEnabledDNSRecordSourcesFrom(ctx context.Context, db sqlQueryer) ([]dnsRecordSourceDBRow, error) {
+	rows, err := db.QueryContext(ctx, `SELECT id, location, no_data_only, enabled FROM dns_record_sources WHERE enabled = 1 ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -643,11 +655,9 @@ func (a *App) handleRecordImport(w http.ResponseWriter, r *http.Request) {
 		renderError(w, http.StatusBadRequest, err)
 		return
 	}
-	if err := replaceImportedDNSRecords(a.db, parsed); err != nil {
-		renderError(w, http.StatusInternalServerError, err)
-		return
-	}
-	if err := a.reloadConfig(); err != nil {
+	if err := a.applyConfigMutation(r.Context(), func(conn *sql.Conn) error {
+		return replaceImportedDNSRecordsConn(r.Context(), conn, parsed)
+	}); err != nil {
 		renderError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -688,20 +698,6 @@ func getDNSRecordSourceByID(db *sql.DB, id int64) (dnsRecordSourceDBRow, error) 
 	return row, err
 }
 
-func getDNSRecordSourceByLocation(db *sql.DB, location string) (dnsRecordSourceDBRow, error) {
-	var row dnsRecordSourceDBRow
-	err := db.QueryRow(`SELECT id, location, no_data_only, enabled FROM dns_record_sources WHERE location = ?`, location).Scan(&row.ID, &row.Location, &row.NoDataOnly, &row.Enabled)
-	return row, err
-}
-
-func restoreDNSRecordSource(db *sql.DB, old dnsRecordSourceDBRow, existed bool, location string) {
-	if existed {
-		_, _ = db.Exec(`INSERT INTO dns_record_sources(id, location, no_data_only, enabled) VALUES(?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET location=excluded.location, no_data_only=excluded.no_data_only, enabled=excluded.enabled`, old.ID, old.Location, old.NoDataOnly, old.Enabled)
-		return
-	}
-	_, _ = db.Exec(`DELETE FROM dns_record_sources WHERE location = ?`, location)
-}
-
 func (a *App) handleRecordSourceAdd(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		renderError(w, http.StatusMethodNotAllowed, fmt.Errorf("method not allowed"))
@@ -713,18 +709,10 @@ func (a *App) handleRecordSourceAdd(w http.ResponseWriter, r *http.Request) {
 		renderError(w, http.StatusBadRequest, fmt.Errorf("validate DNS-record source location: %w", err))
 		return
 	}
-	old, err := getDNSRecordSourceByLocation(a.db, location)
-	existed := err == nil
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		renderError(w, http.StatusInternalServerError, err)
-		return
-	}
-	if _, err := a.db.Exec(`INSERT INTO dns_record_sources(location, no_data_only, enabled) VALUES(?, ?, 1) ON CONFLICT(location) DO UPDATE SET no_data_only=excluded.no_data_only, enabled=1`, location, boolInt(noDataOnly)); err != nil {
-		renderError(w, http.StatusInternalServerError, err)
-		return
-	}
-	if err := a.reloadConfig(); err != nil {
-		restoreDNSRecordSource(a.db, old, existed, location)
+	if err := a.applyConfigMutation(r.Context(), func(conn *sql.Conn) error {
+		_, err := conn.ExecContext(r.Context(), `INSERT INTO dns_record_sources(location, no_data_only, enabled) VALUES(?, ?, 1) ON CONFLICT(location) DO UPDATE SET no_data_only=excluded.no_data_only, enabled=1`, location, boolInt(noDataOnly))
+		return err
+	}); err != nil {
 		renderError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -751,12 +739,10 @@ func (a *App) handleRecordSourceUpdate(w http.ResponseWriter, r *http.Request) {
 		renderError(w, http.StatusBadRequest, fmt.Errorf("validate DNS-record source location: %w", err))
 		return
 	}
-	if _, err := a.db.Exec(`UPDATE dns_record_sources SET no_data_only = ?, enabled = 1 WHERE id = ?`, boolInt(noDataOnly), id); err != nil {
-		renderError(w, http.StatusInternalServerError, err)
-		return
-	}
-	if err := a.reloadConfig(); err != nil {
-		restoreDNSRecordSource(a.db, old, true, old.Location)
+	if err := a.applyConfigMutation(r.Context(), func(conn *sql.Conn) error {
+		_, err := conn.ExecContext(r.Context(), `UPDATE dns_record_sources SET no_data_only = ?, enabled = 1 WHERE id = ?`, boolInt(noDataOnly), id)
+		return err
+	}); err != nil {
 		renderError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -773,17 +759,14 @@ func (a *App) handleRecordSourceDelete(w http.ResponseWriter, r *http.Request) {
 		renderError(w, http.StatusBadRequest, fmt.Errorf("invalid id"))
 		return
 	}
-	old, err := getDNSRecordSourceByID(a.db, id)
-	if err != nil {
+	if _, err := getDNSRecordSourceByID(a.db, id); err != nil {
 		renderError(w, http.StatusNotFound, err)
 		return
 	}
-	if _, err := a.db.Exec(`DELETE FROM dns_record_sources WHERE id = ?`, id); err != nil {
-		renderError(w, http.StatusInternalServerError, err)
-		return
-	}
-	if err := a.reloadConfig(); err != nil {
-		restoreDNSRecordSource(a.db, old, true, old.Location)
+	if err := a.applyConfigMutation(r.Context(), func(conn *sql.Conn) error {
+		_, err := conn.ExecContext(r.Context(), `DELETE FROM dns_record_sources WHERE id = ?`, id)
+		return err
+	}); err != nil {
 		renderError(w, http.StatusInternalServerError, err)
 		return
 	}

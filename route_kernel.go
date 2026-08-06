@@ -20,6 +20,7 @@ type kernelRouteOperations struct {
 
 type KernelRouteBackend struct {
 	app *App
+	cfg *Config
 	ops kernelRouteOperations
 
 	snapshotMu sync.RWMutex
@@ -27,7 +28,15 @@ type KernelRouteBackend struct {
 }
 
 func NewKernelRouteBackend(app *App) *KernelRouteBackend {
-	backend := &KernelRouteBackend{app: app}
+	var cfg *Config
+	if app != nil {
+		cfg = app.getConfig()
+	}
+	return NewKernelRouteBackendForConfig(app, cfg)
+}
+
+func NewKernelRouteBackendForConfig(app *App, cfg *Config) *KernelRouteBackend {
+	backend := &KernelRouteBackend{app: app, cfg: cfg}
 	backend.ops = kernelRouteOperations{
 		listRoutes:   listKernelRoutes,
 		replaceRoute: replaceKernelRoute,
@@ -72,7 +81,7 @@ func (b *KernelRouteBackend) Reload(ctx context.Context) error {
 		return fmt.Errorf("kernel route listing is not configured")
 	}
 
-	cfg := b.app.getConfig()
+	cfg := b.cfg
 	if cfg == nil {
 		return fmt.Errorf("kernel route config is nil")
 	}
@@ -217,7 +226,7 @@ func (b *KernelRouteBackend) ensure(ctx context.Context, route RouteIntent, exac
 		routeAbsentConfirmed = true
 	}
 
-	cfg := b.app.getConfig()
+	cfg := b.cfg
 	if err := b.ops.replaceRoute(cfg, route.Prefix); err != nil {
 		atomic.AddUint64(&b.app.routeAddErrors, 1)
 		reloadErr := b.Reload(ctx)

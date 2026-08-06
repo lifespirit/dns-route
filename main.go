@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"database/sql"
 	"embed"
@@ -18,6 +19,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"os/signal"
 	"sort"
 	"strconv"
 	"strings"
@@ -41,6 +43,12 @@ const (
 	upstreamFailureThreshold   = 2
 	upstreamCircuitBaseBackoff = 30 * time.Second
 	upstreamCircuitMaxBackoff  = 5 * time.Minute
+	routeOperationTimeout      = 15 * time.Second
+	shutdownTimeout            = 10 * time.Second
+	httpReadHeaderTimeout      = 5 * time.Second
+	httpReadTimeout            = 30 * time.Second
+	httpWriteTimeout           = 30 * time.Second
+	httpIdleTimeout            = 2 * time.Minute
 	ipv6FreeBind               = 78
 )
 
@@ -54,6 +62,7 @@ var templates = template.Must(template.ParseFS(
 
 type cacheEntry struct {
 	msg        *dns.Msg
+	storedAt   time.Time
 	expiration time.Time
 }
 
@@ -122,8 +131,9 @@ type LocalRecord struct {
 }
 
 type upstreamTarget struct {
-	Addr  string
-	Proto string
+	Addr     string
+	Proto    string
+	Priority int
 }
 
 type ForwardZoneUpstream struct {
@@ -151,6 +161,7 @@ type Config struct {
 	ListenerFreeBind             bool
 	Upstreams                    []string
 	UpstreamProto                map[string]string
+	UpstreamPriority             map[string]int
 	ForwardZones                 []ForwardZone
 	SpecialDomains               map[string]struct{}
 	SpecialDomainMatcher         *SpecialDomainMatcher
@@ -266,6 +277,8 @@ type routeErrorDiagnostic struct {
 
 type RouteManager struct {
 	app            *App
+	ctx            context.Context
+	cancel         context.CancelFunc
 	prefixResolver PrefixResolver
 	backends       []RouteBackend
 	backendMu      sync.RWMutex
@@ -290,9 +303,17 @@ type RouteManager struct {
 type App struct {
 	db *sql.DB
 
+	ctx    context.Context
+	cancel context.CancelFunc
+
 	cfg      *Config
 	cfgMu    sync.RWMutex
 	reloadMu sync.Mutex
+	// routeConfigMu publishes the active Config and RouteManager backend set as
+	// one runtime generation. Route workers hold a read lock for the complete
+	// lookup/apply operation so they never combine an old config with newly
+	// reconfigured backends (or the reverse).
+	routeConfigMu sync.RWMutex
 
 	cache   map[string]cacheEntry
 	cacheMu sync.RWMutex
@@ -314,8 +335,9 @@ type App struct {
 	srvMu               sync.Mutex
 	listenerReconcileMu sync.Mutex
 
-	adminAddr string
-	startedAt time.Time
+	adminAddr  string
+	httpServer *http.Server
+	startedAt  time.Time
 
 	routeMgr *RouteManager
 
@@ -502,6 +524,13 @@ type statsData struct {
 	ListenerStates   []listenerView
 }
 
+func (a *App) context() context.Context {
+	if a != nil && a.ctx != nil {
+		return a.ctx
+	}
+	return context.Background()
+}
+
 func main() {
 	dbPath := flag.String("db", "/var/lib/dns-route/config.db", "path to sqlite config db")
 	httpAddr := flag.String("http", "127.0.0.1:8080", "admin http listen addr")
@@ -522,8 +551,13 @@ func main() {
 		log.Fatalf("load config: %v", err)
 	}
 
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	appCtx, cancel := context.WithCancel(ctx)
 	app := &App{
 		db:                 db,
+		ctx:                appCtx,
+		cancel:             cancel,
 		cfg:                cfg,
 		cache:              make(map[string]cacheEntry),
 		dohClient:          newDoHClient(),
@@ -534,14 +568,23 @@ func main() {
 		adminAddr:          *httpAddr,
 		startedAt:          time.Now(),
 	}
+	defer func() {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer shutdownCancel()
+		if err := app.Close(shutdownCtx); err != nil {
+			log.Printf("shutdown: %v", err)
+		}
+	}()
 	app.syncUpstreamCircuits(cfg)
 	app.routeMgr, err = NewRouteManager(app, 8)
 	if err != nil {
 		log.Fatalf("create route manager: %v", err)
 	}
-	if err := app.routeMgr.ReloadBackends(context.Background()); err != nil {
+	initialRouteCtx, initialRouteCancel := context.WithTimeout(appCtx, routeOperationTimeout)
+	if err := app.routeMgr.ReloadBackends(initialRouteCtx); err != nil {
 		log.Printf("initial route backend reload failed: %v", err)
 	}
+	initialRouteCancel()
 
 	logConfig("CONFIG", cfg)
 	rand.Seed(time.Now().UnixNano())
@@ -549,19 +592,35 @@ func main() {
 	if err := app.validateTemplates(); err != nil {
 		log.Fatalf("validate templates: %v", err)
 	}
-	app.startHTTP()
+	if err := app.startHTTP(); err != nil {
+		log.Fatalf("start admin http: %v", err)
+	}
 	app.reconcileListeners(cfg)
 	app.startListenerRetry()
-	select {}
+	<-appCtx.Done()
 }
 
 func NewRouteManager(app *App, workers int) (*RouteManager, error) {
-	backends, err := buildRouteBackends(context.Background(), app, app.getConfig())
+	if app == nil {
+		return nil, fmt.Errorf("route manager app is nil")
+	}
+	if workers <= 0 {
+		return nil, fmt.Errorf("route manager workers must be positive")
+	}
+	parentCtx := app.ctx
+	if parentCtx == nil {
+		parentCtx = context.Background()
+	}
+	ctx, cancel := context.WithCancel(parentCtx)
+	backends, err := buildRouteBackends(ctx, app, app.getConfig())
 	if err != nil {
+		cancel()
 		return nil, err
 	}
 	rm := &RouteManager{
 		app:             app,
+		ctx:             ctx,
+		cancel:          cancel,
 		prefixResolver:  NewCymruPrefixResolver(app.lookupCymruTXT),
 		backends:        backends,
 		ipCache:         make(map[string]routeCacheEntry),
@@ -578,9 +637,17 @@ func NewRouteManager(app *App, workers int) (*RouteManager, error) {
 
 func (rm *RouteManager) worker() {
 	defer rm.wg.Done()
-	for ip := range rm.queue {
-		if err := rm.processIP(ip); err != nil {
-			log.Printf("ROUTE_PROCESS_ERROR ip=%s error=%v", ip, err)
+	for {
+		select {
+		case <-rm.ctx.Done():
+			return
+		case ip, ok := <-rm.queue:
+			if !ok {
+				return
+			}
+			if err := rm.processIP(rm.ctx, ip); err != nil && !errors.Is(err, context.Canceled) {
+				log.Printf("ROUTE_PROCESS_ERROR ip=%s error=%v", ip, err)
+			}
 		}
 	}
 }
@@ -600,7 +667,10 @@ func (rm *RouteManager) EnsureIPs(ips []net.IP) {
 		unique[ipString] = struct{}{}
 
 		defaultCIDR := defaultCIDRForIP(routeIP)
-		if rm.backendsCoverIP(routeIP) {
+		rm.app.routeConfigMu.RLock()
+		covered := rm.backendsCoverIP(routeIP)
+		rm.app.routeConfigMu.RUnlock()
+		if covered {
 			rm.completeIPApplied(ipString, defaultCIDR, false)
 			continue
 		}
@@ -608,10 +678,6 @@ func (rm *RouteManager) EnsureIPs(ips []net.IP) {
 		shouldQueue := false
 		rm.ipMu.Lock()
 		ent, ok := rm.ipCache[ipString]
-		if ok && ent.State == StateApplied {
-			rm.ipMu.Unlock()
-			continue
-		}
 
 		// The DNS answer has already been sent. Record that a successful route
 		// completion must invalidate any flow that raced with route installation.
@@ -631,6 +697,8 @@ func (rm *RouteManager) EnsureIPs(ips []net.IP) {
 			continue
 		}
 		select {
+		case <-rm.ctx.Done():
+			rm.markIPFailed(ipString, defaultCIDR, time.Now())
 		case rm.queue <- ipString:
 		default:
 			atomic.AddUint64(&rm.app.routeQueueDrops, 1)
@@ -655,17 +723,16 @@ func (rm *RouteManager) EnsureIPsAndWait(ips []net.IP) error {
 	errCh := make(chan error, len(unique))
 	for ipString, routeIP := range unique {
 		defaultCIDR := defaultCIDRForIP(routeIP)
-		if rm.backendsCoverIP(routeIP) {
+		rm.app.routeConfigMu.RLock()
+		covered := rm.backendsCoverIP(routeIP)
+		rm.app.routeConfigMu.RUnlock()
+		if covered {
 			rm.completeIPApplied(ipString, defaultCIDR, false)
 			continue
 		}
 
 		rm.ipMu.Lock()
 		ent, ok := rm.ipCache[ipString]
-		if ok && ent.State == StateApplied {
-			rm.ipMu.Unlock()
-			continue
-		}
 		if !ok || ent.State != StatePending {
 			rm.ipCache[ipString] = routeCacheEntry{State: StatePending, CIDR: defaultCIDR, UpdatedAt: time.Now()}
 		}
@@ -674,7 +741,7 @@ func (rm *RouteManager) EnsureIPsAndWait(ips []net.IP) error {
 		wg.Add(1)
 		go func(ip string) {
 			defer wg.Done()
-			if err := rm.processIP(ip); err != nil {
+			if err := rm.processIP(rm.ctx, ip); err != nil {
 				errCh <- fmt.Errorf("route for %s: %w", ip, err)
 			}
 		}(ipString)
@@ -691,14 +758,24 @@ func (rm *RouteManager) EnsureIPsAndWait(ips []net.IP) error {
 
 // processIP serializes all work for one destination IP. A synchronous DNS
 // request can therefore join an already queued asynchronous route operation.
-func (rm *RouteManager) processIP(ip string) error {
+func (rm *RouteManager) processIP(ctx context.Context, ip string) error {
 	_, err, _ := rm.processGroup.Do(ip, func() (any, error) {
-		return nil, rm.processIPOnce(ip)
+		return nil, rm.processIPOnce(ctx, ip)
 	})
 	return err
 }
 
-func (rm *RouteManager) processIPOnce(ip string) error {
+func (rm *RouteManager) processIPOnce(ctx context.Context, ip string) error {
+	if ctx == nil {
+		ctx = rm.app.context()
+	}
+	ctx, cancel := context.WithTimeout(ctx, routeOperationTimeout)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	rm.app.routeConfigMu.RLock()
+	defer rm.app.routeConfigMu.RUnlock()
 	cfg := rm.app.getConfig()
 	parsed := normalizeRouteIP(net.ParseIP(ip))
 	if parsed == nil {
@@ -724,7 +801,7 @@ func (rm *RouteManager) processIPOnce(ip string) error {
 			if rm.backendsCoverAddress(addr) {
 				return resolution, nil
 			}
-			resolved, resolveErr := rm.prefixResolver.Resolve(context.Background(), addr)
+			resolved, resolveErr := rm.prefixResolver.Resolve(ctx, addr)
 			if resolveErr != nil || resolved.Source != PrefixSourceCymru {
 				atomic.AddUint64(&rm.app.lookupCIDRFailed, 1)
 				return resolution, nil
@@ -749,7 +826,7 @@ func (rm *RouteManager) processIPOnce(ip string) error {
 		rm.cidrCache[cidr] = routeCacheEntry{State: StatePending, CIDR: cidr, UpdatedAt: time.Now()}
 		rm.cidrMu.Unlock()
 
-		kernelChanged, err := rm.ensureBackends(context.Background(), intent)
+		kernelChanged, err := rm.ensureBackends(ctx, intent)
 		if err != nil {
 			rm.markCIDRFailed(cidr, time.Now())
 			return kernelChanged, err
@@ -1063,6 +1140,17 @@ func (rm *RouteManager) CloseBackends() error {
 	return closeRouteBackends(backends)
 }
 
+func (rm *RouteManager) Close() error {
+	if rm == nil {
+		return nil
+	}
+	if rm.cancel != nil {
+		rm.cancel()
+	}
+	rm.wg.Wait()
+	return rm.CloseBackends()
+}
+
 func (rm *RouteManager) ResetCaches() {
 	rm.ipMu.Lock()
 	rm.ipCache = make(map[string]routeCacheEntry)
@@ -1102,18 +1190,40 @@ func effectiveRouteTable(table int) int {
 
 func logConfig(prefix string, cfg *Config) {
 	log.Printf(
-		"%s: LISTEN=%v LISTENER_FREEBIND=%t UPSTREAMS=%v FORWARD_ZONES=%d FORWARD_ZONE_UPSTREAMS=%d WG_INTERFACE=%s WG_GATEWAY_V4=%s WG_GATEWAY_V6=%s ROUTE_MODE=%s ROUTE_TABLE=%d ROUTE_IPV4=%t ROUTE_IPV6=%t BGP_LOCAL_ASN=%d BGP_ROUTER_ID=%s BGP_PEER=%s BGP_PEER_ASN=%d BGP_REQUIRE_ESTABLISHED=%t LOOKUP_CYMRU_PREFIX=%t REPLY_BEFORE_ROUTE=%t SPECIAL_DOMAINS=%d SPECIAL_DOMAIN_SOURCES=%d DNS_RECORD_SOURCES=%d LOCAL_A=%d LOCAL_AAAA=%d",
-		prefix, cfg.ListenAddrs, cfg.ListenerFreeBind, cfg.Upstreams, len(cfg.ForwardZones), forwardZoneUpstreamCount(cfg), cfg.WGInterface, cfg.WGGatewayV4, cfg.WGGatewayV6, cfg.RouteMode, cfg.RouteTable,
+		"%s: LISTEN=%v LISTENER_FREEBIND=%t UPSTREAMS=%v FORWARD_ZONES=%d FORWARD_ZONE_UPSTREAMS=%d WG_INTERFACE=%s WG_GATEWAY_V4=%s WG_GATEWAY_V6=%s ROUTE_MODE=%s ROUTE_TABLE_CONFIGURED=%d ROUTE_TABLE_EFFECTIVE=%d ROUTE_IPV4=%t ROUTE_IPV6=%t BGP_LOCAL_ASN=%d BGP_ROUTER_ID=%s BGP_PEER=%s BGP_PEER_ASN=%d BGP_REQUIRE_ESTABLISHED=%t LOOKUP_CYMRU_PREFIX=%t REPLY_BEFORE_ROUTE=%t SPECIAL_DOMAINS=%d SPECIAL_DOMAIN_SOURCES=%d DNS_RECORD_SOURCES=%d LOCAL_A=%d LOCAL_AAAA=%d",
+		prefix, cfg.ListenAddrs, cfg.ListenerFreeBind, cfg.Upstreams, len(cfg.ForwardZones), forwardZoneUpstreamCount(cfg), cfg.WGInterface, cfg.WGGatewayV4, cfg.WGGatewayV6, cfg.RouteMode, cfg.RouteTable, effectiveRouteTable(cfg.RouteTable),
 		cfg.RouteIPv4, cfg.RouteIPv6, cfg.BGP.LocalASN, cfg.BGP.RouterID, cfg.BGP.PeerAddress, cfg.BGP.PeerASN, cfg.BGP.RequireEstablished, cfg.LookupCIDR, cfg.ReplyBeforeRoute, len(cfg.SpecialDomains), len(cfg.SpecialDomainSources), len(cfg.DNSRecordSources), len(cfg.LocalA), len(cfg.LocalAAAA),
 	)
 }
 
 func renderError(w http.ResponseWriter, status int, err error) {
-	w.WriteHeader(status)
-	data := struct{ Error string }{Error: err.Error()}
-	if tplErr := templates.ExecuteTemplate(w, "error.html.tmpl", data); tplErr != nil {
-		http.Error(w, err.Error(), status)
+	if err == nil {
+		err = fmt.Errorf("unknown error")
 	}
+	data := struct{ Error string }{Error: err.Error()}
+	var body bytes.Buffer
+	if tplErr := templates.ExecuteTemplate(&body, "error.html.tmpl", data); tplErr != nil {
+		http.Error(w, err.Error(), status)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(status)
+	if _, writeErr := w.Write(body.Bytes()); writeErr != nil {
+		log.Printf("HTTP_ERROR_WRITE_ERROR status=%d error=%v", status, writeErr)
+	}
+}
+
+func renderTemplateResponse(w http.ResponseWriter, status int, templateName string, data any) error {
+	var body bytes.Buffer
+	if err := templates.ExecuteTemplate(&body, templateName, data); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(status)
+	if _, err := w.Write(body.Bytes()); err != nil {
+		log.Printf("HTTP_TEMPLATE_WRITE_ERROR template=%s status=%d error=%v", templateName, status, err)
+	}
+	return nil
 }
 
 func (a *App) validateTemplates() error {
@@ -1190,8 +1300,29 @@ func loadConfigFromDBWithCachedSources(db *sql.DB, dnsSnapshots []DNSRecordWebSo
 }
 
 func loadConfigFromDBWithExternalSources(db *sql.DB, dnsSnapshots []DNSRecordWebSource, specialSnapshots []SpecialDomainSourceSnapshot, refreshSources bool) (*Config, error) {
+	ctx := context.Background()
+	if refreshSources {
+		client := newDNSRecordSourceClient()
+		var err error
+		dnsSnapshots, err = fetchDNSRecordSources(ctx, db, client)
+		if err != nil {
+			return nil, err
+		}
+		specialSnapshots, err = fetchSpecialDomainSources(ctx, db, client)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return loadConfigFromQueryer(ctx, db, dnsSnapshots, specialSnapshots)
+}
+
+func loadConfigFromQueryer(ctx context.Context, db sqlQueryer, dnsSnapshots []DNSRecordWebSource, specialSnapshots []SpecialDomainSourceSnapshot) (*Config, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	cfg := &Config{
 		UpstreamProto:        make(map[string]string),
+		UpstreamPriority:     make(map[string]int),
 		SpecialDomains:       make(map[string]struct{}),
 		SpecialDomainMatcher: newSpecialDomainMatcher(),
 		LocalA:               make(map[string][]LocalRecord),
@@ -1209,7 +1340,7 @@ func loadConfigFromDBWithExternalSources(db *sql.DB, dnsSnapshots []DNSRecordWeb
 			MultihopTTL: 1,
 		},
 	}
-	settings, err := readSettings(db)
+	settings, err := readSettingsFrom(ctx, db)
 	if err != nil {
 		return nil, err
 	}
@@ -1241,42 +1372,28 @@ func loadConfigFromDBWithExternalSources(db *sql.DB, dnsSnapshots []DNSRecordWeb
 	if v := strings.TrimSpace(settings["listener_freebind"]); v != "" {
 		cfg.ListenerFreeBind = isTrueString(v)
 	}
-	if err := readListenAddrs(db, cfg); err != nil {
+	if err := readListenAddrsFrom(ctx, db, cfg); err != nil {
 		return nil, err
 	}
-	if err := readUpstreams(db, cfg); err != nil {
+	if err := readUpstreamsFrom(ctx, db, cfg); err != nil {
 		return nil, err
 	}
-	if err := readForwardZones(db, cfg); err != nil {
+	if err := readForwardZonesFrom(ctx, db, cfg); err != nil {
 		return nil, err
 	}
-	if err := readSpecialDomains(db, cfg); err != nil {
+	if err := readSpecialDomainsFrom(ctx, db, cfg); err != nil {
 		return nil, err
 	}
 
-	// External source I/O is reserved for startup and the explicit Reload
-	// sources action. Normal config reloads rebuild the runtime config from the
-	// current immutable snapshots without touching the network or filesystem.
-	if refreshSources {
-		client := newDNSRecordSourceClient()
-		dnsSnapshots, err = fetchDNSRecordSources(context.Background(), db, client)
-		if err != nil {
-			return nil, err
-		}
-		specialSnapshots, err = fetchSpecialDomainSources(context.Background(), db, client)
-		if err != nil {
-			return nil, err
-		}
-	}
-	if err := applySpecialDomainSources(db, cfg, specialSnapshots); err != nil {
+	if err := applySpecialDomainSourcesFrom(ctx, db, cfg, specialSnapshots); err != nil {
 		return nil, err
 	}
 	// DNS-record sources are the lower-priority DNS-answer layer. Persistent
 	// database records are read afterwards and retain final priority.
-	if err := applyDNSRecordSources(db, cfg, dnsSnapshots); err != nil {
+	if err := applyDNSRecordSourcesFrom(ctx, db, cfg, dnsSnapshots); err != nil {
 		return nil, err
 	}
-	if err := readDNSRecords(db, cfg); err != nil {
+	if err := readDNSRecordsFrom(ctx, db, cfg); err != nil {
 		return nil, err
 	}
 	cfg.DNSRecordIndex.finalize()
@@ -1340,7 +1457,11 @@ func initDB(db *sql.DB) error {
 }
 
 func readSettings(db *sql.DB) (map[string]string, error) {
-	rows, err := db.Query(`SELECT key, value FROM settings`)
+	return readSettingsFrom(context.Background(), db)
+}
+
+func readSettingsFrom(ctx context.Context, db sqlQueryer) (map[string]string, error) {
+	rows, err := db.QueryContext(ctx, `SELECT key, value FROM settings`)
 	if err != nil {
 		return nil, err
 	}
@@ -1357,7 +1478,11 @@ func readSettings(db *sql.DB) (map[string]string, error) {
 }
 
 func readListenAddrs(db *sql.DB, cfg *Config) error {
-	rows, err := db.Query(`SELECT addr FROM listen_addrs WHERE enabled = 1 ORDER BY id`)
+	return readListenAddrsFrom(context.Background(), db, cfg)
+}
+
+func readListenAddrsFrom(ctx context.Context, db sqlQueryer, cfg *Config) error {
+	rows, err := db.QueryContext(ctx, `SELECT addr FROM listen_addrs WHERE enabled = 1 ORDER BY id`)
 	if err != nil {
 		return err
 	}
@@ -1374,14 +1499,19 @@ func readListenAddrs(db *sql.DB, cfg *Config) error {
 	return rows.Err()
 }
 func readUpstreams(db *sql.DB, cfg *Config) error {
-	rows, err := db.Query(`SELECT addr, proto FROM upstreams WHERE enabled = 1 ORDER BY priority, id`)
+	return readUpstreamsFrom(context.Background(), db, cfg)
+}
+
+func readUpstreamsFrom(ctx context.Context, db sqlQueryer, cfg *Config) error {
+	rows, err := db.QueryContext(ctx, `SELECT addr, proto, priority FROM upstreams WHERE enabled = 1 ORDER BY priority, id`)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var addr, proto string
-		if err := rows.Scan(&addr, &proto); err != nil {
+		var priority int
+		if err := rows.Scan(&addr, &proto, &priority); err != nil {
 			return err
 		}
 		addr = strings.TrimSpace(addr)
@@ -1394,11 +1524,16 @@ func readUpstreams(db *sql.DB, cfg *Config) error {
 		}
 		cfg.Upstreams = append(cfg.Upstreams, addr)
 		cfg.UpstreamProto[addr] = proto
+		cfg.UpstreamPriority[addr] = priority
 	}
 	return rows.Err()
 }
 func readForwardZones(db *sql.DB, cfg *Config) error {
-	rows, err := db.Query(`SELECT id, domain FROM forward_zones WHERE enabled = 1 ORDER BY length(domain) DESC, domain`)
+	return readForwardZonesFrom(context.Background(), db, cfg)
+}
+
+func readForwardZonesFrom(ctx context.Context, db sqlQueryer, cfg *Config) error {
+	rows, err := db.QueryContext(ctx, `SELECT id, domain FROM forward_zones WHERE enabled = 1 ORDER BY length(domain) DESC, domain`)
 	if err != nil {
 		return err
 	}
@@ -1419,9 +1554,12 @@ func readForwardZones(db *sql.DB, cfg *Config) error {
 	if err := rows.Err(); err != nil {
 		return err
 	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
 
 	for i := range zones {
-		upRows, err := db.Query(`SELECT id, addr, proto, priority FROM forward_zone_upstreams WHERE zone_id = ? AND enabled = 1 ORDER BY priority, id`, zones[i].ID)
+		upRows, err := db.QueryContext(ctx, `SELECT id, addr, proto, priority FROM forward_zone_upstreams WHERE zone_id = ? AND enabled = 1 ORDER BY priority, id`, zones[i].ID)
 		if err != nil {
 			return err
 		}
@@ -1449,7 +1587,11 @@ func readForwardZones(db *sql.DB, cfg *Config) error {
 }
 
 func readSpecialDomains(db *sql.DB, cfg *Config) error {
-	rows, err := db.Query(`SELECT domain FROM special_domains WHERE enabled = 1 ORDER BY domain`)
+	return readSpecialDomainsFrom(context.Background(), db, cfg)
+}
+
+func readSpecialDomainsFrom(ctx context.Context, db sqlQueryer, cfg *Config) error {
+	rows, err := db.QueryContext(ctx, `SELECT domain FROM special_domains WHERE enabled = 1 ORDER BY domain`)
 	if err != nil {
 		return err
 	}
@@ -1472,7 +1614,11 @@ func readSpecialDomains(db *sql.DB, cfg *Config) error {
 	return rows.Err()
 }
 func readDNSRecords(db *sql.DB, cfg *Config) error {
-	rows, err := db.Query(`SELECT id, name, type, value, ttl, enabled FROM dns_records ORDER BY id`)
+	return readDNSRecordsFrom(context.Background(), db, cfg)
+}
+
+func readDNSRecordsFrom(ctx context.Context, db sqlQueryer, cfg *Config) error {
+	rows, err := db.QueryContext(ctx, `SELECT id, name, type, value, ttl, enabled FROM dns_records ORDER BY id`)
 	if err != nil {
 		return err
 	}
@@ -1623,7 +1769,7 @@ func defaultUpstreamTargets(cfg *Config) []upstreamTarget {
 	}
 	out := make([]upstreamTarget, 0, len(cfg.Upstreams))
 	for _, addr := range cfg.Upstreams {
-		out = append(out, upstreamTarget{Addr: addr, Proto: cfg.UpstreamProto[addr]})
+		out = append(out, upstreamTarget{Addr: addr, Proto: cfg.UpstreamProto[addr], Priority: cfg.UpstreamPriority[addr]})
 	}
 	return out
 }
@@ -1652,7 +1798,7 @@ func allConfiguredUpstreamTargets(cfg *Config) []upstreamTarget {
 	}
 	for _, zone := range cfg.ForwardZones {
 		for _, upstream := range zone.Upstreams {
-			add(upstreamTarget{Addr: upstream.Addr, Proto: upstream.Proto})
+			add(upstreamTarget{Addr: upstream.Addr, Proto: upstream.Proto, Priority: upstream.Priority})
 		}
 	}
 	return out
@@ -1672,7 +1818,7 @@ func forwardZoneUpstreamCount(cfg *Config) int {
 func buildForwardPolicy(key, domain string, targets []upstreamTarget) forwardPolicy {
 	fingerprint := make([]string, 0, len(targets))
 	for _, target := range targets {
-		fingerprint = append(fingerprint, upstreamCircuitKey(target.Addr, target.Proto))
+		fingerprint = append(fingerprint, fmt.Sprintf("%d:%s", target.Priority, upstreamCircuitKey(target.Addr, target.Proto)))
 	}
 	sort.Strings(fingerprint)
 	return forwardPolicy{
@@ -1698,7 +1844,7 @@ func forwardPolicyForName(name string, cfg *Config) forwardPolicy {
 	if best != nil {
 		targets := make([]upstreamTarget, 0, len(best.Upstreams))
 		for _, upstream := range best.Upstreams {
-			targets = append(targets, upstreamTarget{Addr: upstream.Addr, Proto: upstream.Proto})
+			targets = append(targets, upstreamTarget{Addr: upstream.Addr, Proto: upstream.Proto, Priority: upstream.Priority})
 		}
 		return buildForwardPolicy(best.Domain, best.Domain, targets)
 	}
@@ -1782,15 +1928,20 @@ func (a *App) startCacheCleanup() {
 	go func() {
 		ticker := time.NewTicker(cacheCleanupInterval)
 		defer ticker.Stop()
-		for range ticker.C {
-			now := time.Now()
-			a.cacheMu.Lock()
-			for k, e := range a.cache {
-				if now.After(e.expiration) {
-					delete(a.cache, k)
+		for {
+			select {
+			case <-a.context().Done():
+				return
+			case <-ticker.C:
+				now := time.Now()
+				a.cacheMu.Lock()
+				for k, e := range a.cache {
+					if now.After(e.expiration) {
+						delete(a.cache, k)
+					}
 				}
+				a.cacheMu.Unlock()
 			}
-			a.cacheMu.Unlock()
 		}
 	}()
 }
@@ -1809,20 +1960,36 @@ func currentSpecialDomainSourceSnapshots(cfg *Config) []SpecialDomainSourceSnaps
 	return append([]SpecialDomainSourceSnapshot(nil), cfg.SpecialDomainSourceSnapshots...)
 }
 
-func (a *App) activateReloadedConfig(oldCfg, cfg *Config) error {
-	a.setConfig(cfg)
+func (a *App) activateReloadedConfig(ctx context.Context, oldCfg, cfg *Config) error {
+	if ctx == nil {
+		ctx = a.context()
+	}
+	if a.routeMgr == nil {
+		return fmt.Errorf("route manager is not initialized")
+	}
+
+	// Publish route-sensitive config and the matching backend set as one
+	// generation. Listener reconciliation is deliberately performed after
+	// releasing this lock: shutting down a DNS listener waits for in-flight
+	// handlers, and those handlers may need a route-generation read lock.
+	routeCtx, routeCancel := context.WithTimeout(ctx, routeOperationTimeout)
+	defer routeCancel()
+	a.routeConfigMu.Lock()
 	if sameRouteBackendConfig(oldCfg, cfg) {
-		if err := a.routeMgr.ReloadBackends(context.Background()); err != nil {
-			a.setConfig(oldCfg)
+		if err := a.routeMgr.ReloadBackends(routeCtx); err != nil {
+			a.routeConfigMu.Unlock()
 			return fmt.Errorf("reload route backends after config change: %w", err)
 		}
-	} else if err := a.routeMgr.ReconfigureBackends(context.Background(), cfg); err != nil {
-		a.setConfig(oldCfg)
+	} else if err := a.routeMgr.ReconfigureBackends(routeCtx, cfg); err != nil {
+		a.routeConfigMu.Unlock()
 		return fmt.Errorf("reconfigure route backends: %w", err)
 	}
+	a.setConfig(cfg)
+	a.routeMgr.ResetCaches()
+	a.routeConfigMu.Unlock()
+
 	a.syncUpstreamCircuits(cfg)
 	a.reconcileListeners(cfg)
-	a.routeMgr.ResetCaches()
 	logConfig("CONFIG reloaded", cfg)
 	return nil
 }
@@ -1836,7 +2003,64 @@ func (a *App) reloadConfig() error {
 	if err != nil {
 		return err
 	}
-	return a.activateReloadedConfig(oldCfg, cfg)
+	return a.activateReloadedConfig(a.context(), oldCfg, cfg)
+}
+
+func (a *App) applyConfigMutation(ctx context.Context, mutate func(*sql.Conn) error) (err error) {
+	if mutate == nil {
+		return fmt.Errorf("config mutation is nil")
+	}
+	if ctx == nil {
+		ctx = a.context()
+	}
+	a.reloadMu.Lock()
+	defer a.reloadMu.Unlock()
+
+	conn, err := a.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire sqlite connection: %w", err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return fmt.Errorf("begin sqlite config transaction: %w", err)
+	}
+	active := true
+	defer func() {
+		if !active {
+			return
+		}
+		rollbackCtx, cancel := context.WithTimeout(context.Background(), sqliteRollbackLimit)
+		defer cancel()
+		if _, rollbackErr := conn.ExecContext(rollbackCtx, "ROLLBACK"); rollbackErr != nil && !sqliteNoActiveTransaction(rollbackErr) {
+			err = errors.Join(err, fmt.Errorf("rollback sqlite config transaction: %w", rollbackErr))
+		}
+	}()
+
+	oldCfg := a.getConfig()
+	if err := mutate(conn); err != nil {
+		return err
+	}
+	cfg, err := loadConfigFromQueryer(
+		ctx,
+		conn,
+		currentDNSRecordSourceSnapshots(oldCfg),
+		currentSpecialDomainSourceSnapshots(oldCfg),
+	)
+	if err != nil {
+		return fmt.Errorf("load candidate config: %w", err)
+	}
+	if err := a.activateReloadedConfig(ctx, oldCfg, cfg); err != nil {
+		return err
+	}
+
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+		restoreCtx, cancel := context.WithTimeout(context.Background(), routeOperationTimeout)
+		restoreErr := a.activateReloadedConfig(restoreCtx, cfg, oldCfg)
+		cancel()
+		return errors.Join(fmt.Errorf("commit sqlite config transaction: %w", err), restoreErr)
+	}
+	active = false
+	return nil
 }
 
 func (a *App) refreshExternalSources(ctx context.Context) error {
@@ -1857,7 +2081,7 @@ func (a *App) refreshExternalSources(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if err := a.activateReloadedConfig(oldCfg, cfg); err != nil {
+	if err := a.activateReloadedConfig(ctx, oldCfg, cfg); err != nil {
 		return err
 	}
 	log.Printf("external sources reloaded: dns_record_sources=%d special_domain_sources=%d", len(dnsSnapshots), len(specialSnapshots))
@@ -1868,14 +2092,19 @@ func (a *App) startListenerRetry() {
 	go func() {
 		ticker := time.NewTicker(listenerRetryInterval)
 		defer ticker.Stop()
-		for range ticker.C {
-			a.reconcileListeners(a.getConfig())
+		for {
+			select {
+			case <-a.context().Done():
+				return
+			case <-ticker.C:
+				a.reconcileListeners(a.getConfig())
+			}
 		}
 	}()
 }
 
 func (a *App) reconcileListeners(cfg *Config) {
-	if cfg == nil {
+	if cfg == nil || a.context().Err() != nil {
 		return
 	}
 	a.listenerReconcileMu.Lock()
@@ -2024,13 +2253,13 @@ func (a *App) newServer(spec listenerSpec, freeBind bool) (*dns.Server, error) {
 	lc := listenerListenConfig(freeBind)
 	switch spec.Net {
 	case "udp":
-		pc, err := lc.ListenPacket(context.Background(), "udp", spec.Addr)
+		pc, err := lc.ListenPacket(a.context(), "udp", spec.Addr)
 		if err != nil {
 			return nil, err
 		}
 		return &dns.Server{Net: "udp", PacketConn: pc, Handler: handler}, nil
 	case "tcp":
-		ln, err := lc.Listen(context.Background(), "tcp", spec.Addr)
+		ln, err := lc.Listen(a.context(), "tcp", spec.Addr)
 		if err != nil {
 			return nil, err
 		}
@@ -2042,6 +2271,9 @@ func (a *App) newServer(spec listenerSpec, freeBind bool) (*dns.Server, error) {
 
 func (a *App) serveLoop(active *managedListener) {
 	err := active.Server.ActivateAndServe()
+	if a.context().Err() != nil {
+		return
+	}
 	if err == nil {
 		err = fmt.Errorf("listener stopped unexpectedly")
 	}
@@ -2110,7 +2342,7 @@ func (a *App) listenerViews() []listenerView {
 	return out
 }
 
-func (a *App) startHTTP() {
+func (a *App) startHTTP() error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", a.handleAdmin)
 	mux.HandleFunc("/settings", a.handleSettingsPage)
@@ -2145,12 +2377,72 @@ func (a *App) startHTTP() {
 	mux.HandleFunc("/record/source/update", a.handleRecordSourceUpdate)
 	mux.HandleFunc("/record/source/delete", a.handleRecordSourceDelete)
 	mux.HandleFunc("/record/sources/refresh", a.handleRecordSourcesRefresh)
+	listener, err := net.Listen("tcp", a.adminAddr)
+	if err != nil {
+		return err
+	}
+	server := &http.Server{
+		Addr:              a.adminAddr,
+		Handler:           mux,
+		ReadHeaderTimeout: httpReadHeaderTimeout,
+		ReadTimeout:       httpReadTimeout,
+		WriteTimeout:      httpWriteTimeout,
+		IdleTimeout:       httpIdleTimeout,
+	}
+	a.httpServer = server
 	go func() {
 		log.Printf("admin http listening on %s", a.adminAddr)
-		if err := http.ListenAndServe(a.adminAddr, mux); err != nil {
-			log.Fatalf("admin http failed: %v", err)
+		if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("admin http failed: %v", err)
+			if a.cancel != nil {
+				a.cancel()
+			}
 		}
 	}()
+	return nil
+}
+
+func (a *App) Close(ctx context.Context) error {
+	if a == nil {
+		return nil
+	}
+	if a.cancel != nil {
+		a.cancel()
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	var errs []error
+	if a.httpServer != nil {
+		if err := a.httpServer.Shutdown(ctx); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errs = append(errs, fmt.Errorf("shutdown admin HTTP server: %w", err))
+		}
+	}
+
+	a.srvMu.Lock()
+	listeners := make([]*managedListener, 0, len(a.servers))
+	for _, active := range a.servers {
+		listeners = append(listeners, active)
+	}
+	a.servers = make(map[string]*managedListener)
+	a.pendingListeners = make(map[string]*pendingListener)
+	a.srvMu.Unlock()
+	for _, active := range listeners {
+		if err := active.Server.Shutdown(); err != nil && !errors.Is(err, net.ErrClosed) {
+			errs = append(errs, fmt.Errorf("shutdown DNS listener %s: %w", active.Spec.Key(), err))
+		}
+	}
+
+	if a.routeMgr != nil {
+		if err := a.routeMgr.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if a.dohClient != nil {
+		a.dohClient.CloseIdleConnections()
+	}
+	return errors.Join(errs...)
 }
 
 func (a *App) adminPageData(title, path string) (pageData, error) {
@@ -2193,7 +2485,7 @@ func (a *App) renderAdminPage(w http.ResponseWriter, r *http.Request, path, titl
 		renderError(w, http.StatusInternalServerError, err)
 		return
 	}
-	if err := templates.ExecuteTemplate(w, templateName, data); err != nil {
+	if err := renderTemplateResponse(w, http.StatusOK, templateName, data); err != nil {
 		renderError(w, http.StatusInternalServerError, err)
 	}
 }
@@ -2244,7 +2536,7 @@ func (a *App) handleSpecialDomainsPage(w http.ResponseWriter, r *http.Request) {
 	data.SpecialPrevURL = view.PrevURL
 	data.SpecialNextURL = view.NextURL
 	data.SpecialReturnURL = view.ReturnURL
-	if err := templates.ExecuteTemplate(w, "special_domains.html.tmpl", data); err != nil {
+	if err := renderTemplateResponse(w, http.StatusOK, "special_domains.html.tmpl", data); err != nil {
 		renderError(w, http.StatusInternalServerError, err)
 	}
 }
@@ -2282,7 +2574,7 @@ func (a *App) handleDNSRecordsPage(w http.ResponseWriter, r *http.Request) {
 	data.RecordPrevURL = view.PrevURL
 	data.RecordNextURL = view.NextURL
 	data.RecordReturnURL = view.ReturnURL
-	if err := templates.ExecuteTemplate(w, "dns_records.html.tmpl", data); err != nil {
+	if err := renderTemplateResponse(w, http.StatusOK, "dns_records.html.tmpl", data); err != nil {
 		renderError(w, http.StatusInternalServerError, err)
 	}
 }
@@ -2300,7 +2592,7 @@ func (a *App) handleStatistics(w http.ResponseWriter, r *http.Request) {
 	data.Title = "Statistics"
 	data.Path = "/statistics"
 	data.Message = a.adminAddr
-	if err := templates.ExecuteTemplate(w, "stats.html.tmpl", data); err != nil {
+	if err := renderTemplateResponse(w, http.StatusOK, "stats.html.tmpl", data); err != nil {
 		renderError(w, http.StatusInternalServerError, err)
 	}
 }
@@ -2339,22 +2631,30 @@ func redirectAdmin(w http.ResponseWriter, r *http.Request, fallback string) {
 
 func (a *App) handleReload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		renderError(w, 405, fmt.Errorf("method not allowed"))
+		renderError(w, http.StatusMethodNotAllowed, fmt.Errorf("method not allowed"))
 		return
 	}
 	if err := a.reloadConfig(); err != nil {
-		renderError(w, 500, err)
+		renderError(w, http.StatusInternalServerError, err)
 		return
 	}
 	redirectAdmin(w, r, "/")
 }
 func (a *App) handleRoutesReload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		renderError(w, 405, fmt.Errorf("method not allowed"))
+		renderError(w, http.StatusMethodNotAllowed, fmt.Errorf("method not allowed"))
 		return
 	}
-	if err := a.routeMgr.ReloadBackends(context.Background()); err != nil {
-		renderError(w, 500, err)
+	routeCtx, cancel := context.WithTimeout(r.Context(), routeOperationTimeout)
+	defer cancel()
+	a.routeConfigMu.Lock()
+	err := a.routeMgr.ReloadBackends(routeCtx)
+	if err == nil {
+		a.routeMgr.ResetCaches()
+	}
+	a.routeConfigMu.Unlock()
+	if err != nil {
+		renderError(w, http.StatusInternalServerError, err)
 		return
 	}
 	redirectAdmin(w, r, "/")
@@ -2385,7 +2685,7 @@ func (a *App) handleRouteErrors(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) handleSettingsSave(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		renderError(w, 405, fmt.Errorf("method not allowed"))
+		renderError(w, http.StatusMethodNotAllowed, fmt.Errorf("method not allowed"))
 		return
 	}
 	if err := r.ParseForm(); err != nil {
@@ -2443,7 +2743,7 @@ func (a *App) handleSettingsSave(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if err := withSQLiteWriteTx(r.Context(), a.db, func(conn *sql.Conn) error {
+	if err := a.applyConfigMutation(r.Context(), func(conn *sql.Conn) error {
 		for k, v := range settings {
 			if _, err := conn.ExecContext(r.Context(), `INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`, k, v); err != nil {
 				return err
@@ -2454,16 +2754,12 @@ func (a *App) handleSettingsSave(w http.ResponseWriter, r *http.Request) {
 		renderError(w, http.StatusInternalServerError, err)
 		return
 	}
-	if err := a.reloadConfig(); err != nil {
-		renderError(w, http.StatusInternalServerError, err)
-		return
-	}
 	redirectAdmin(w, r, "/settings")
 }
 
 func (a *App) handleListenAdd(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		renderError(w, 405, fmt.Errorf("method not allowed"))
+		renderError(w, http.StatusMethodNotAllowed, fmt.Errorf("method not allowed"))
 		return
 	}
 	addr := strings.TrimSpace(r.FormValue("addr"))
@@ -2471,13 +2767,11 @@ func (a *App) handleListenAdd(w http.ResponseWriter, r *http.Request) {
 		redirectAdmin(w, r, "/settings")
 		return
 	}
-	if _, err := a.db.Exec(`INSERT OR IGNORE INTO listen_addrs(addr, enabled) VALUES(?, 1)`, addr); err != nil {
-		renderError(w, 500, err)
-		return
-	}
-	if err := a.reloadConfig(); err != nil {
-		_, _ = a.db.Exec(`DELETE FROM listen_addrs WHERE addr = ?`, addr)
-		renderError(w, 500, err)
+	if err := a.applyConfigMutation(r.Context(), func(conn *sql.Conn) error {
+		_, err := conn.ExecContext(r.Context(), `INSERT INTO listen_addrs(addr, enabled) VALUES(?, 1) ON CONFLICT(addr) DO UPDATE SET enabled = 1`, addr)
+		return err
+	}); err != nil {
+		renderError(w, http.StatusInternalServerError, err)
 		return
 	}
 	redirectAdmin(w, r, "/settings")
@@ -2487,7 +2781,7 @@ func (a *App) handleListenDelete(w http.ResponseWriter, r *http.Request) {
 }
 func (a *App) handleUpstreamAdd(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		renderError(w, 405, fmt.Errorf("method not allowed"))
+		renderError(w, http.StatusMethodNotAllowed, fmt.Errorf("method not allowed"))
 		return
 	}
 	addr := strings.TrimSpace(r.FormValue("addr"))
@@ -2500,20 +2794,18 @@ func (a *App) handleUpstreamAdd(w http.ResponseWriter, r *http.Request) {
 		proto = "auto"
 	}
 	if !validUpstreamProto(proto) {
-		renderError(w, 400, fmt.Errorf("unsupported upstream protocol %q", proto))
+		renderError(w, http.StatusBadRequest, fmt.Errorf("unsupported upstream protocol %q", proto))
 		return
 	}
 	if _, _, err := resolveUpstream(addr, proto); err != nil {
-		renderError(w, 400, err)
+		renderError(w, http.StatusBadRequest, err)
 		return
 	}
-	if _, err := a.db.Exec(`INSERT INTO upstreams(addr, proto, enabled, priority) VALUES(?, ?, 1, 100) ON CONFLICT(addr) DO UPDATE SET proto = excluded.proto, enabled = 1`, addr, proto); err != nil {
-		renderError(w, 500, err)
-		return
-	}
-	if err := a.reloadConfig(); err != nil {
-		_, _ = a.db.Exec(`DELETE FROM upstreams WHERE addr = ?`, addr)
-		renderError(w, 500, err)
+	if err := a.applyConfigMutation(r.Context(), func(conn *sql.Conn) error {
+		_, err := conn.ExecContext(r.Context(), `INSERT INTO upstreams(addr, proto, enabled, priority) VALUES(?, ?, 1, 100) ON CONFLICT(addr) DO UPDATE SET proto = excluded.proto, enabled = 1`, addr, proto)
+		return err
+	}); err != nil {
+		renderError(w, http.StatusInternalServerError, err)
 		return
 	}
 	redirectAdmin(w, r, "/upstreams")
@@ -2546,7 +2838,7 @@ func (a *App) handleForwardZoneAdd(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := withSQLiteWriteTx(r.Context(), a.db, func(conn *sql.Conn) error {
+	if err := a.applyConfigMutation(r.Context(), func(conn *sql.Conn) error {
 		if _, err := conn.ExecContext(r.Context(), `INSERT INTO forward_zones(domain, enabled) VALUES(?, 1) ON CONFLICT(domain) DO UPDATE SET enabled = 1`, domain); err != nil {
 			return err
 		}
@@ -2559,10 +2851,6 @@ func (a *App) handleForwardZoneAdd(w http.ResponseWriter, r *http.Request) {
 		}
 		return nil
 	}); err != nil {
-		renderError(w, http.StatusInternalServerError, err)
-		return
-	}
-	if err := a.reloadConfig(); err != nil {
 		renderError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -2579,11 +2867,10 @@ func (a *App) handleForwardZoneUpstreamDelete(w http.ResponseWriter, r *http.Req
 		renderError(w, http.StatusBadRequest, fmt.Errorf("invalid forward-zone upstream id"))
 		return
 	}
-	if _, err := a.db.Exec(`DELETE FROM forward_zone_upstreams WHERE id = ?`, id); err != nil {
-		renderError(w, http.StatusInternalServerError, err)
-		return
-	}
-	if err := a.reloadConfig(); err != nil {
+	if err := a.applyConfigMutation(r.Context(), func(conn *sql.Conn) error {
+		_, err := conn.ExecContext(r.Context(), `DELETE FROM forward_zone_upstreams WHERE id = ?`, id)
+		return err
+	}); err != nil {
 		renderError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -2600,7 +2887,7 @@ func (a *App) handleForwardZoneDelete(w http.ResponseWriter, r *http.Request) {
 		renderError(w, http.StatusBadRequest, fmt.Errorf("invalid forward-zone id"))
 		return
 	}
-	if err := withSQLiteWriteTx(r.Context(), a.db, func(conn *sql.Conn) error {
+	if err := a.applyConfigMutation(r.Context(), func(conn *sql.Conn) error {
 		if _, err := conn.ExecContext(r.Context(), `DELETE FROM forward_zone_upstreams WHERE zone_id = ?`, id); err != nil {
 			return err
 		}
@@ -2609,10 +2896,6 @@ func (a *App) handleForwardZoneDelete(w http.ResponseWriter, r *http.Request) {
 		}
 		return nil
 	}); err != nil {
-		renderError(w, http.StatusInternalServerError, err)
-		return
-	}
-	if err := a.reloadConfig(); err != nil {
 		renderError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -2646,7 +2929,7 @@ func (a *App) handleSpecialDelete(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) handleRecordAdd(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		renderError(w, 405, fmt.Errorf("method not allowed"))
+		renderError(w, http.StatusMethodNotAllowed, fmt.Errorf("method not allowed"))
 		return
 	}
 	name := normalizeName(r.FormValue("name"))
@@ -2660,15 +2943,15 @@ func (a *App) handleRecordAdd(w http.ResponseWriter, r *http.Request) {
 	if value != "" {
 		ip := net.ParseIP(value)
 		if ip == nil {
-			renderError(w, 400, fmt.Errorf("invalid ip"))
+			renderError(w, http.StatusBadRequest, fmt.Errorf("invalid ip"))
 			return
 		}
 		if rtype == "A" && ip.To4() == nil {
-			renderError(w, 400, fmt.Errorf("A requires IPv4"))
+			renderError(w, http.StatusBadRequest, fmt.Errorf("A requires IPv4"))
 			return
 		}
 		if rtype == "AAAA" && ip.To4() != nil {
-			renderError(w, 400, fmt.Errorf("AAAA requires IPv6"))
+			renderError(w, http.StatusBadRequest, fmt.Errorf("AAAA requires IPv6"))
 			return
 		}
 	}
@@ -2676,75 +2959,71 @@ func (a *App) handleRecordAdd(w http.ResponseWriter, r *http.Request) {
 	if ttlStr != "" {
 		n, err := strconv.Atoi(ttlStr)
 		if err != nil || n < 0 {
-			renderError(w, 400, fmt.Errorf("invalid ttl"))
+			renderError(w, http.StatusBadRequest, fmt.Errorf("invalid ttl"))
 			return
 		}
 		ttl = n
 	}
-	if _, err := a.db.Exec(`INSERT INTO dns_records(name, type, value, ttl, enabled) VALUES(?, ?, ?, ?, 1)`, name, rtype, value, ttl); err != nil {
-		renderError(w, 500, err)
-		return
-	}
-	if err := a.reloadConfig(); err != nil {
-		renderError(w, 500, err)
+	if err := a.applyConfigMutation(r.Context(), func(conn *sql.Conn) error {
+		_, err := conn.ExecContext(r.Context(), `INSERT INTO dns_records(name, type, value, ttl, enabled) VALUES(?, ?, ?, ?, 1)`, name, rtype, value, ttl)
+		return err
+	}); err != nil {
+		renderError(w, http.StatusInternalServerError, err)
 		return
 	}
 	redirectAdmin(w, r, "/dns-records")
 }
 func (a *App) handleRecordDelete(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		renderError(w, 405, fmt.Errorf("method not allowed"))
+		renderError(w, http.StatusMethodNotAllowed, fmt.Errorf("method not allowed"))
 		return
 	}
 	id, err := strconv.ParseInt(strings.TrimSpace(r.FormValue("id")), 10, 64)
 	if err != nil {
-		renderError(w, 400, fmt.Errorf("invalid id"))
+		renderError(w, http.StatusBadRequest, fmt.Errorf("invalid id"))
 		return
 	}
-	if _, err := a.db.Exec(`DELETE FROM dns_records WHERE id = ?`, id); err != nil {
-		renderError(w, 500, err)
-		return
-	}
-	if err := a.reloadConfig(); err != nil {
-		renderError(w, 500, err)
+	if err := a.applyConfigMutation(r.Context(), func(conn *sql.Conn) error {
+		_, err := conn.ExecContext(r.Context(), `DELETE FROM dns_records WHERE id = ?`, id)
+		return err
+	}); err != nil {
+		renderError(w, http.StatusInternalServerError, err)
 		return
 	}
 	redirectAdmin(w, r, "/dns-records")
 }
 func (a *App) handleSimpleInsert(w http.ResponseWriter, r *http.Request, fallback, query, value string) {
 	if r.Method != http.MethodPost {
-		renderError(w, 405, fmt.Errorf("method not allowed"))
+		renderError(w, http.StatusMethodNotAllowed, fmt.Errorf("method not allowed"))
 		return
 	}
 	if value == "" {
 		redirectAdmin(w, r, fallback)
 		return
 	}
-	if _, err := a.db.Exec(query, value); err != nil {
-		renderError(w, 500, err)
-		return
-	}
-	if err := a.reloadConfig(); err != nil {
-		renderError(w, 500, err)
+	if err := a.applyConfigMutation(r.Context(), func(conn *sql.Conn) error {
+		_, err := conn.ExecContext(r.Context(), query, value)
+		return err
+	}); err != nil {
+		renderError(w, http.StatusInternalServerError, err)
 		return
 	}
 	redirectAdmin(w, r, fallback)
 }
 func (a *App) handleSimpleDelete(w http.ResponseWriter, r *http.Request, fallback, query, value string) {
 	if r.Method != http.MethodPost {
-		renderError(w, 405, fmt.Errorf("method not allowed"))
+		renderError(w, http.StatusMethodNotAllowed, fmt.Errorf("method not allowed"))
 		return
 	}
 	if value == "" {
 		redirectAdmin(w, r, fallback)
 		return
 	}
-	if _, err := a.db.Exec(query, value); err != nil {
-		renderError(w, 500, err)
-		return
-	}
-	if err := a.reloadConfig(); err != nil {
-		renderError(w, 500, err)
+	if err := a.applyConfigMutation(r.Context(), func(conn *sql.Conn) error {
+		_, err := conn.ExecContext(r.Context(), query, value)
+		return err
+	}); err != nil {
+		renderError(w, http.StatusInternalServerError, err)
 		return
 	}
 	redirectAdmin(w, r, fallback)
@@ -2768,9 +3047,8 @@ func (a *App) listSimple(query string) ([]string, error) {
 }
 func (a *App) handleDNS(w dns.ResponseWriter, req *dns.Msg) {
 	atomic.AddUint64(&a.totalQueries, 1)
-	if len(req.Question) == 0 {
-		atomic.AddUint64(&a.servfailCount, 1)
-		respondSERVFAIL(w, req)
+	if req == nil || len(req.Question) != 1 {
+		respondFORMERR(w, req)
 		return
 	}
 
@@ -2782,7 +3060,7 @@ func (a *App) handleDNS(w dns.ResponseWriter, req *dns.Msg) {
 		ips := a.routeIPsFromAnswers(name, q.Qtype, resp.Answer, cfg)
 		if cfg.ReplyBeforeRoute {
 			atomic.AddUint64(&a.localAnswers, 1)
-			_ = writeDNSResponse(w, req, resp)
+			a.writeDNSResponse(w, req, resp)
 			if len(ips) > 0 {
 				a.routeMgr.EnsureIPs(ips)
 			}
@@ -2797,41 +3075,54 @@ func (a *App) handleDNS(w dns.ResponseWriter, req *dns.Msg) {
 			}
 		}
 		atomic.AddUint64(&a.localAnswers, 1)
-		_ = writeDNSResponse(w, req, resp)
+		a.writeDNSResponse(w, req, resp)
 		return
 	}
 
 	cfgForPolicy := a.getConfig()
 	policy := forwardPolicyForName(name, cfgForPolicy)
-	key := policy.CacheKey + "|" + name + ":" + dns.TypeToString[q.Qtype]
-
-	a.cacheMu.RLock()
-	if entry, ok := a.cache[key]; ok && time.Now().Before(entry.expiration) {
-		a.cacheMu.RUnlock()
-		atomic.AddUint64(&a.cacheHits, 1)
-		cached := entry.msg.Copy()
-		cached.Id = req.Id
-		cfg := a.getConfig()
-		ips := a.routeIPsFromAnswers(name, q.Qtype, cached.Answer, cfg)
-		if cfg.ReplyBeforeRoute {
-			_ = writeDNSResponse(w, req, cached)
-			if len(ips) > 0 {
-				a.routeMgr.EnsureIPs(ips)
-			}
-			return
-		}
-		if len(ips) > 0 {
-			if err := a.routeMgr.EnsureIPsAndWait(ips); err != nil {
-				atomic.AddUint64(&a.servfailCount, 1)
-				log.Printf("ROUTE_BEFORE_REPLY_ERROR name=%s qtype=%s cached=true error=%v", name, dns.TypeToString[q.Qtype], err)
-				respondSERVFAIL(w, req)
-				return
-			}
-		}
-		_ = writeDNSResponse(w, req, cached)
+	key, err := dnsCacheKey(policy, req)
+	if err != nil {
+		atomic.AddUint64(&a.servfailCount, 1)
+		log.Printf("DNS_CACHE_KEY_ERROR name=%s qtype=%d qclass=%d error=%v", name, q.Qtype, q.Qclass, err)
+		respondSERVFAIL(w, req)
 		return
 	}
+
+	now := time.Now()
+	a.cacheMu.RLock()
+	entry, cacheHit := a.cache[key]
+	cacheHit = cacheHit && now.Before(entry.expiration)
 	a.cacheMu.RUnlock()
+	if cacheHit {
+		cached := cachedDNSResponse(entry, req.Id, now)
+		if cached == nil {
+			a.cacheMu.Lock()
+			delete(a.cache, key)
+			a.cacheMu.Unlock()
+		} else {
+			atomic.AddUint64(&a.cacheHits, 1)
+			cfg := a.getConfig()
+			ips := a.routeIPsFromAnswers(name, q.Qtype, cached.Answer, cfg)
+			if cfg.ReplyBeforeRoute {
+				a.writeDNSResponse(w, req, cached)
+				if len(ips) > 0 {
+					a.routeMgr.EnsureIPs(ips)
+				}
+				return
+			}
+			if len(ips) > 0 {
+				if err := a.routeMgr.EnsureIPsAndWait(ips); err != nil {
+					atomic.AddUint64(&a.servfailCount, 1)
+					log.Printf("ROUTE_BEFORE_REPLY_ERROR name=%s qtype=%s cached=true error=%v", name, dns.TypeToString[q.Qtype], err)
+					respondSERVFAIL(w, req)
+					return
+				}
+			}
+			a.writeDNSResponse(w, req, cached)
+			return
+		}
+	}
 	atomic.AddUint64(&a.cacheMisses, 1)
 
 	resp, err := a.forwardDNSWithPolicy(req, policy)
@@ -2844,15 +3135,10 @@ func (a *App) handleDNS(w dns.ResponseWriter, req *dns.Msg) {
 	}
 	resp.Id = req.Id
 
-	if len(resp.Answer) > 0 {
-		minTTL := resp.Answer[0].Header().Ttl
-		for _, rr := range resp.Answer[1:] {
-			if rr.Header().Ttl < minTTL {
-				minTTL = rr.Header().Ttl
-			}
-		}
+	if minTTL, ok := minimumCacheTTL(resp); ok && minTTL > 0 {
+		storedAt := time.Now()
 		a.cacheMu.Lock()
-		a.cache[key] = cacheEntry{msg: resp.Copy(), expiration: time.Now().Add(time.Duration(minTTL) * time.Second)}
+		a.cache[key] = cacheEntry{msg: resp.Copy(), storedAt: storedAt, expiration: storedAt.Add(time.Duration(minTTL) * time.Second)}
 		a.cacheMu.Unlock()
 	}
 
@@ -2860,7 +3146,7 @@ func (a *App) handleDNS(w dns.ResponseWriter, req *dns.Msg) {
 	ips := a.routeIPsFromAnswers(name, q.Qtype, resp.Answer, cfg)
 
 	if cfg.ReplyBeforeRoute {
-		_ = writeDNSResponse(w, req, resp)
+		a.writeDNSResponse(w, req, resp)
 		atomic.AddUint64(&a.forwardedOK, 1)
 		if len(ips) > 0 {
 			a.routeMgr.EnsureIPs(ips)
@@ -2876,8 +3162,89 @@ func (a *App) handleDNS(w dns.ResponseWriter, req *dns.Msg) {
 			return
 		}
 	}
-	_ = writeDNSResponse(w, req, resp)
+	a.writeDNSResponse(w, req, resp)
 	atomic.AddUint64(&a.forwardedOK, 1)
+}
+
+func minimumCacheTTL(msg *dns.Msg) (uint32, bool) {
+	if msg == nil || len(msg.Answer) == 0 {
+		return 0, false
+	}
+	var minimum uint32
+	found := false
+	for _, section := range [][]dns.RR{msg.Answer, msg.Ns, msg.Extra} {
+		for _, record := range section {
+			if record == nil || record.Header() == nil {
+				continue
+			}
+			switch record.Header().Rrtype {
+			case dns.TypeOPT, dns.TypeTKEY, dns.TypeTSIG:
+				continue
+			}
+			ttl := record.Header().Ttl
+			if !found || ttl < minimum {
+				minimum = ttl
+				found = true
+			}
+		}
+	}
+	return minimum, found
+}
+
+func dnsCacheKey(policy forwardPolicy, req *dns.Msg) (string, error) {
+	if req == nil || len(req.Question) != 1 {
+		return "", fmt.Errorf("DNS cache requires exactly one question")
+	}
+	copyReq := req.Copy()
+	copyReq.Id = 0
+	copyReq.Compress = false
+	copyReq.Question[0].Name = dns.Fqdn(normalizeName(copyReq.Question[0].Name))
+	wire, err := copyReq.Pack()
+	if err != nil {
+		return "", fmt.Errorf("pack DNS cache key: %w", err)
+	}
+	digest := sha256.Sum256(wire)
+	return fmt.Sprintf("%s|%x", policy.CacheKey, digest), nil
+}
+
+func cachedDNSResponse(entry cacheEntry, requestID uint16, now time.Time) *dns.Msg {
+	if entry.msg == nil {
+		return nil
+	}
+	msg := entry.msg.Copy()
+	msg.Id = requestID
+	elapsed := uint32(0)
+	if !entry.storedAt.IsZero() && now.After(entry.storedAt) {
+		elapsedSeconds := uint64(now.Sub(entry.storedAt) / time.Second)
+		if elapsedSeconds > uint64(^uint32(0)) {
+			elapsed = ^uint32(0)
+		} else {
+			elapsed = uint32(elapsedSeconds)
+		}
+	}
+	ageRRSection(msg.Answer, elapsed)
+	ageRRSection(msg.Ns, elapsed)
+	ageRRSection(msg.Extra, elapsed)
+	return msg
+}
+
+func ageRRSection(records []dns.RR, elapsed uint32) {
+	for _, record := range records {
+		if record == nil || record.Header() == nil {
+			continue
+		}
+		switch record.Header().Rrtype {
+		case dns.TypeOPT, dns.TypeTKEY, dns.TypeTSIG:
+			// These pseudo-records use the TTL field for protocol metadata rather
+			// than cache lifetime and must be copied unchanged.
+			continue
+		}
+		if record.Header().Ttl <= elapsed {
+			record.Header().Ttl = 0
+		} else {
+			record.Header().Ttl -= elapsed
+		}
+	}
 }
 
 func (a *App) localResponse(req *dns.Msg, q dns.Question) *dns.Msg {
@@ -2946,7 +3313,7 @@ func newDoHClient() *http.Client {
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   5 * time.Second,
 		ResponseHeaderTimeout: 5 * time.Second,
-		TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
+		TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},
 	}
 	return &http.Client{Timeout: 5 * time.Second, Transport: transport}
 }
@@ -3066,12 +3433,12 @@ func upstreamAddrWithDefaultPort(addr, defaultPort string) (string, error) {
 	return "", fmt.Errorf("address must be host:port; IPv6 literals must use brackets")
 }
 
-func (a *App) exchangeDoH(req *dns.Msg, endpoint string) (*dns.Msg, error) {
+func (a *App) exchangeDoH(ctx context.Context, req *dns.Msg, endpoint string) (*dns.Msg, error) {
 	wire, err := req.Pack()
 	if err != nil {
 		return nil, fmt.Errorf("pack request: %w", err)
 	}
-	httpReq, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(wire))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(wire))
 	if err != nil {
 		return nil, fmt.Errorf("create DoH request: %w", err)
 	}
@@ -3101,7 +3468,7 @@ func (a *App) exchangeDoH(req *dns.Msg, endpoint string) (*dns.Msg, error) {
 	return resp, nil
 }
 
-func exchangeClassicDNS(req *dns.Msg, proto, endpoint string) (*dns.Msg, error) {
+func exchangeClassicDNS(ctx context.Context, req *dns.Msg, proto, endpoint string) (*dns.Msg, error) {
 	network := proto
 	client := &dns.Client{Timeout: 5 * time.Second}
 	switch proto {
@@ -3111,12 +3478,16 @@ func exchangeClassicDNS(req *dns.Msg, proto, endpoint string) (*dns.Msg, error) 
 		client.Net = "tcp"
 	case "tls":
 		client.Net = "tcp-tls"
-		client.TLSConfig = &tls.Config{InsecureSkipVerify: true}
+		tlsConfig, err := dotTLSConfig(endpoint)
+		if err != nil {
+			return nil, err
+		}
+		client.TLSConfig = tlsConfig
 	default:
 		return nil, fmt.Errorf("unsupported DNS transport %q", proto)
 	}
 
-	resp, _, err := client.Exchange(req, endpoint)
+	resp, _, err := client.ExchangeContext(ctx, req, endpoint)
 	if err != nil {
 		return nil, err
 	}
@@ -3125,7 +3496,7 @@ func exchangeClassicDNS(req *dns.Msg, proto, endpoint string) (*dns.Msg, error) 
 	}
 	if proto == "udp" && resp.Truncated {
 		tcpClient := &dns.Client{Net: "tcp", Timeout: 5 * time.Second}
-		resp, _, err = tcpClient.Exchange(req, endpoint)
+		resp, _, err = tcpClient.ExchangeContext(ctx, req, endpoint)
 		if err != nil {
 			return nil, fmt.Errorf("UDP response truncated; TCP retry failed: %w", err)
 		}
@@ -3134,6 +3505,21 @@ func exchangeClassicDNS(req *dns.Msg, proto, endpoint string) (*dns.Msg, error) 
 		}
 	}
 	return resp, nil
+}
+
+func dotTLSConfig(endpoint string) (*tls.Config, error) {
+	host, _, err := net.SplitHostPort(endpoint)
+	if err != nil {
+		return nil, fmt.Errorf("split DoT endpoint: %w", err)
+	}
+	host = strings.Trim(host, "[]")
+	if host == "" {
+		return nil, fmt.Errorf("DoT endpoint has an empty host")
+	}
+	return &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		ServerName: host,
+	}, nil
 }
 
 func upstreamCircuitKey(rawAddr, configuredProto string) string {
@@ -3444,10 +3830,17 @@ func (a *App) forwardDNS(req *dns.Msg) (*dns.Msg, error) {
 	if req != nil && len(req.Question) > 0 {
 		name = normalizeName(req.Question[0].Name)
 	}
-	return a.forwardDNSWithPolicy(req, forwardPolicyForName(name, cfg))
+	return a.forwardDNSWithPolicyContext(a.context(), req, forwardPolicyForName(name, cfg))
 }
 
 func (a *App) forwardDNSWithPolicy(req *dns.Msg, policy forwardPolicy) (*dns.Msg, error) {
+	return a.forwardDNSWithPolicyContext(a.context(), req, policy)
+}
+
+func (a *App) forwardDNSWithPolicyContext(ctx context.Context, req *dns.Msg, policy forwardPolicy) (*dns.Msg, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	a.recordForwardPolicy(policy.Key, "selected")
 	if len(policy.Upstreams) == 0 {
 		a.recordForwardPolicy(policy.Key, "error")
@@ -3460,7 +3853,7 @@ func (a *App) forwardDNSWithPolicy(req *dns.Msg, policy forwardPolicy) (*dns.Msg
 	var attemptErrors []string
 	var lastRetryableResponse *dns.Msg
 	attempted := 0
-	for _, target := range shuffledUpstreamTargets(policy.Upstreams) {
+	for _, target := range orderedUpstreamTargets(policy.Upstreams) {
 		configuredProto := canonicalUpstreamProto(target.Proto)
 		proto, endpoint, err := resolveUpstream(target.Addr, configuredProto)
 		if err != nil {
@@ -3480,11 +3873,13 @@ func (a *App) forwardDNSWithPolicy(req *dns.Msg, policy forwardPolicy) (*dns.Msg
 		attempted++
 
 		var resp *dns.Msg
+		exchangeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		if proto == "https" {
-			resp, err = a.exchangeDoH(req, endpoint)
+			resp, err = a.exchangeDoH(exchangeCtx, req, endpoint)
 		} else {
-			resp, err = exchangeClassicDNS(req, proto, endpoint)
+			resp, err = exchangeClassicDNS(exchangeCtx, req, proto, endpoint)
 		}
+		cancel()
 		if err != nil {
 			a.completeUpstreamFailure(attempt, err)
 			attemptErrors = append(attemptErrors, fmt.Sprintf("%s[%s]: %v", endpoint, proto, err))
@@ -3542,9 +3937,19 @@ func (a *App) logForwardError(name string, qtype uint16, err error) {
 	)
 }
 
-func shuffledUpstreamTargets(upstreams []upstreamTarget) []upstreamTarget {
+func orderedUpstreamTargets(upstreams []upstreamTarget) []upstreamTarget {
 	res := append([]upstreamTarget(nil), upstreams...)
-	rand.Shuffle(len(res), func(i, j int) { res[i], res[j] = res[j], res[i] })
+	sort.SliceStable(res, func(i, j int) bool { return res[i].Priority < res[j].Priority })
+	for start := 0; start < len(res); {
+		end := start + 1
+		for end < len(res) && res[end].Priority == res[start].Priority {
+			end++
+		}
+		rand.Shuffle(end-start, func(i, j int) {
+			res[start+i], res[start+j] = res[start+j], res[start+i]
+		})
+		start = end
+	}
 	return res
 }
 
@@ -3620,7 +4025,7 @@ func (a *App) lookupCymruTXT(ctx context.Context, queryName string) ([]string, e
 	req.RecursionDesired = true
 
 	cfg := a.getConfig()
-	resp, err := a.forwardDNSWithPolicy(req, buildForwardPolicy("default", "", defaultUpstreamTargets(cfg)))
+	resp, err := a.forwardDNSWithPolicyContext(ctx, req, buildForwardPolicy("default", "", defaultUpstreamTargets(cfg)))
 	if err != nil {
 		return nil, err
 	}
@@ -3693,6 +4098,18 @@ func writeDNSResponse(w dns.ResponseWriter, req, resp *dns.Msg) error {
 	return w.WriteMsg(out)
 }
 
+func (a *App) writeDNSResponse(w dns.ResponseWriter, req, resp *dns.Msg) {
+	if err := writeDNSResponse(w, req, resp); err != nil {
+		name := ""
+		qtype := uint16(0)
+		if req != nil && len(req.Question) > 0 {
+			name = normalizeName(req.Question[0].Name)
+			qtype = req.Question[0].Qtype
+		}
+		log.Printf("DNS_WRITE_ERROR name=%s qtype=%d error=%v", name, qtype, err)
+	}
+}
+
 func isUDPResponseWriter(w dns.ResponseWriter) bool {
 	if w == nil {
 		return false
@@ -3708,8 +4125,28 @@ func isUDPResponseWriter(w dns.ResponseWriter) bool {
 
 func respondSERVFAIL(w dns.ResponseWriter, req *dns.Msg) {
 	m := new(dns.Msg)
-	m.SetRcode(req, dns.RcodeServerFailure)
-	_ = writeDNSResponse(w, req, m)
+	if req != nil {
+		m.SetRcode(req, dns.RcodeServerFailure)
+	} else {
+		m.Response = true
+		m.Rcode = dns.RcodeServerFailure
+	}
+	if err := writeDNSResponse(w, req, m); err != nil {
+		log.Printf("DNS_WRITE_ERROR rcode=SERVFAIL error=%v", err)
+	}
+}
+
+func respondFORMERR(w dns.ResponseWriter, req *dns.Msg) {
+	m := new(dns.Msg)
+	if req != nil {
+		m.SetRcode(req, dns.RcodeFormatError)
+	} else {
+		m.Response = true
+		m.Rcode = dns.RcodeFormatError
+	}
+	if err := writeDNSResponse(w, req, m); err != nil {
+		log.Printf("DNS_WRITE_ERROR rcode=FORMERR error=%v", err)
+	}
 }
 
 func (a *App) resetConntrackForIP(ipString string) {
@@ -4009,7 +4446,12 @@ func (a *App) upstreamViews(cfg *Config) []upstreamView {
 }
 
 func (a *App) statsSnapshot() statsData {
+	a.routeConfigMu.RLock()
 	cfg := a.getConfig()
+	bgp := a.bgpStatus(cfg)
+	routeSnapshot := a.routeMgr.BackendSnapshotSize()
+	a.routeConfigMu.RUnlock()
+
 	a.cacheMu.RLock()
 	cacheEntries := len(a.cache)
 	a.cacheMu.RUnlock()
@@ -4018,8 +4460,6 @@ func (a *App) statsSnapshot() statsData {
 	pendingListeners := len(a.pendingListeners)
 	a.srvMu.Unlock()
 	listenerStates := a.listenerViews()
-	bgp := a.bgpStatus(cfg)
-	routeSnapshot := a.routeMgr.BackendSnapshotSize()
 	a.routeMgr.ipMu.RLock()
 	ipEntries := len(a.routeMgr.ipCache)
 	a.routeMgr.ipMu.RUnlock()
@@ -4034,7 +4474,7 @@ func (a *App) statsSnapshot() statsData {
 		PendingListeners: pendingListeners,
 		ListenAddrs:      len(cfg.ListenAddrs), Upstreams: len(cfg.Upstreams), ForwardZones: len(cfg.ForwardZones), ForwardUpstreams: forwardZoneUpstreamCount(cfg), SpecialDomains: len(cfg.SpecialDomains),
 		LocalADomains: len(cfg.LocalA), LocalAAAADomains: len(cfg.LocalAAAA), LookupCIDR: cfg.LookupCIDR,
-		ReplyBeforeRoute: cfg.ReplyBeforeRoute, ListenerFreeBind: cfg.ListenerFreeBind, RouteMode: string(cfg.RouteMode), RouteIPv4: cfg.RouteIPv4, RouteIPv6: cfg.RouteIPv6, RouteTable: cfg.RouteTable, BGP: bgp, WGInterface: cfg.WGInterface, WGGatewayV4: cfg.WGGatewayV4, WGGatewayV6: cfg.WGGatewayV6,
+		ReplyBeforeRoute: cfg.ReplyBeforeRoute, ListenerFreeBind: cfg.ListenerFreeBind, RouteMode: string(cfg.RouteMode), RouteIPv4: cfg.RouteIPv4, RouteIPv6: cfg.RouteIPv6, RouteTable: effectiveRouteTable(cfg.RouteTable), BGP: bgp, WGInterface: cfg.WGInterface, WGGatewayV4: cfg.WGGatewayV4, WGGatewayV6: cfg.WGGatewayV6,
 		RouteSnapshot: routeSnapshot, IPCacheEntries: ipEntries, CIDRCacheEntries: cidrEntries,
 		TotalQueries: atomic.LoadUint64(&a.totalQueries), CacheHits: atomic.LoadUint64(&a.cacheHits), CacheMisses: atomic.LoadUint64(&a.cacheMisses),
 		LocalAnswers: atomic.LoadUint64(&a.localAnswers), ForwardedOK: atomic.LoadUint64(&a.forwardedOK), ServfailCount: atomic.LoadUint64(&a.servfailCount),
@@ -4081,7 +4521,7 @@ func (a *App) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	gauge("dns_route_reply_before_route_enabled", boolToInt(s.ReplyBeforeRoute), "reply before route enabled")
 	gauge("dns_route_route_ipv4_enabled", boolToInt(s.RouteIPv4), "IPv4 route programming enabled")
 	gauge("dns_route_route_ipv6_enabled", boolToInt(s.RouteIPv6), "IPv6 route programming enabled")
-	gauge("dns_route_route_table", s.RouteTable, "configured route table")
+	gauge("dns_route_route_table", s.RouteTable, "effective route table")
 	fmt.Fprintln(w, "# HELP dns_route_route_mode_info Configured route mode as a one-hot gauge")
 	fmt.Fprintln(w, "# TYPE dns_route_route_mode_info gauge")
 	for _, mode := range []string{string(RouteModeKernel), string(RouteModeBGP), string(RouteModeKernelBGP)} {

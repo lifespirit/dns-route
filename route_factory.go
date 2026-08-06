@@ -34,7 +34,7 @@ func buildRouteBackends(ctx context.Context, app *App, cfg *Config) ([]RouteBack
 	}
 
 	if mode.UsesKernel() {
-		backends = append(backends, NewKernelRouteBackend(app))
+		backends = append(backends, NewKernelRouteBackendForConfig(app, cfg))
 	}
 	if mode.UsesBGP() {
 		speakerCfg, err := cfg.BGP.SpeakerConfig(cfg.RouteIPv4, cfg.RouteIPv6)
@@ -81,7 +81,11 @@ func sameRouteBackendConfig(a, b *Config) bool {
 		return a == b
 	}
 	return a.RouteMode == b.RouteMode &&
+		a.RouteTable == b.RouteTable &&
 		a.RouteIPv4 == b.RouteIPv4 &&
 		a.RouteIPv6 == b.RouteIPv6 &&
+		a.WGInterface == b.WGInterface &&
+		a.WGGatewayV4 == b.WGGatewayV4 &&
+		a.WGGatewayV6 == b.WGGatewayV6 &&
 		a.BGP == b.BGP
 }

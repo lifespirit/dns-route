@@ -8,17 +8,21 @@ import (
 )
 
 type fakeBGPSpeaker struct {
-	established bool
-	announceErr error
-	withdrawErr error
-	changed     bool
-	announced   []RouteIntent
-	withdrawn   []netip.Prefix
-	closed      bool
+	established         bool
+	announceErr         error
+	announceErrByPrefix map[netip.Prefix]error
+	withdrawErr         error
+	changed             bool
+	announced           []RouteIntent
+	withdrawn           []netip.Prefix
+	closed              bool
 }
 
 func (s *fakeBGPSpeaker) Announce(_ context.Context, route RouteIntent) (bool, error) {
 	s.announced = append(s.announced, route)
+	if err := s.announceErrByPrefix[route.Prefix.Masked()]; err != nil {
+		return s.changed, err
+	}
 	return s.changed, s.announceErr
 }
 func (s *fakeBGPSpeaker) Withdraw(_ context.Context, prefix netip.Prefix) (bool, error) {
@@ -167,6 +171,31 @@ func TestBGPBackendReplaceDesiredFiltersDisabledFamily(t *testing.T) {
 	}
 	if backend.DesiredSize() != 1 || len(speaker.announced) != 1 || speaker.announced[0].Prefix != v4.Prefix {
 		t.Fatalf("desired=%d announced=%+v", backend.DesiredSize(), speaker.announced)
+	}
+}
+
+func TestBGPBackendReloadDoesNotWithdrawStaleRoutesAfterAnnounceFailure(t *testing.T) {
+	speaker := &fakeBGPSpeaker{established: true}
+	backend, err := NewBGPRouteBackend(speaker, false, true, false)
+	if err != nil {
+		t.Fatalf("new backend: %v", err)
+	}
+	stale := bgpTestRoute("192.0.2.0/24", "192.0.2.1")
+	if _, err := backend.Ensure(context.Background(), stale); err != nil {
+		t.Fatalf("seed stale: %v", err)
+	}
+
+	desired := bgpTestRoute("198.51.100.0/24", "198.51.100.1")
+	speaker.announced = nil
+	speaker.announceErrByPrefix = map[netip.Prefix]error{desired.Prefix: errors.New("announce failed")}
+	if err := backend.ReplaceDesired(context.Background(), []RouteIntent{desired}); err == nil {
+		t.Fatal("replace desired unexpectedly succeeded")
+	}
+	if len(speaker.withdrawn) != 0 {
+		t.Fatalf("withdrawn=%v, want none", speaker.withdrawn)
+	}
+	if !backend.CoversAddress(stale.IP) {
+		t.Fatal("previously announced route must remain active")
 	}
 }
 
