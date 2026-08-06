@@ -57,7 +57,7 @@ button { padding: 7px 11px; cursor: pointer; }
 .checkbox-field { padding-bottom: 8px; white-space: nowrap; }
 .site-footer { border-top: 1px solid #8886; padding: 14px 24px; }
 .footer-inner { width: min(1500px, 100%); margin: 0 auto; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; }
-.footer-links { display: flex; flex-wrap: wrap; gap: 12px; }
+.footer-links, .footer-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }
 .search-row { display: grid; grid-template-columns: minmax(240px, 1fr) auto auto; gap: 8px; align-items: end; margin-top: 16px; }
 .pagination { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; margin-top: 14px; }
 .pagination-links { display: flex; gap: 8px; align-items: center; }
@@ -103,6 +103,12 @@ button { padding: 7px 11px; cursor: pointer; }
     <div class="footer-links">
       <a href="/metrics" target="_blank" rel="noopener">Prometheus metrics</a>
       <a href="/routes/errors" target="_blank" rel="noopener">Route error log</a>
+    </div>
+    <div class="footer-actions" aria-label="Source actions">
+      <form class="inline" method="post" action="/record/sources/refresh">
+        <input type="hidden" name="return" value="{{.Path}}">
+        <button type="submit">Refresh sources</button>
+      </form>
     </div>
   </div>
 </footer>

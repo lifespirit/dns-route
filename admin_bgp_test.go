@@ -194,9 +194,9 @@ func TestStatsTemplateRendersBGPStatus(t *testing.T) {
 			t.Fatalf("%q unexpectedly appears in the footer", action)
 		}
 	}
-	for _, footerLink := range []string{`href="/metrics"`, `href="/routes/errors"`} {
-		if index := strings.Index(html, footerLink); index < footerIndex {
-			t.Fatalf("%q is not located in the footer", footerLink)
+	for _, footerItem := range []string{`href="/metrics"`, `href="/routes/errors"`, `action="/record/sources/refresh"`} {
+		if index := strings.Index(html, footerItem); index < footerIndex {
+			t.Fatalf("%q is not located in the footer", footerItem)
 		}
 	}
 	for _, unwanted := range []string{

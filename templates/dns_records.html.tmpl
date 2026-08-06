@@ -27,10 +27,10 @@
 
   <form method="get" action="/dns-records" class="search-row">
     <label>Search domains
-      <input type="text" name="q" value="{{.RecordQuery}}" placeholder="substring or /regexp/" maxlength="512">
+      <input id="record-domain-search" type="text" name="q" value="{{.RecordQuery}}" placeholder="substring or /regexp/" maxlength="512">
     </label>
     <button type="submit">Search</button>
-    <a href="/dns-records">Clear</a>
+    <button type="button" onclick="document.getElementById('record-domain-search').value=''; this.form.submit()">Clear</button>
   </form>
   <p><small>Plain text performs a case-insensitive substring search. Expressions wrapped in slashes use Go RE2 syntax, for example <code>/^ads\..*\.lan$/</code>.</small></p>
   {{if .RecordSearchError}}<div class="search-error">{{.RecordSearchError}}</div>{{end}}
@@ -92,10 +92,6 @@
 <div class="card section-gap">
   <div class="section-title-row">
     <h2>External CSV sources</h2>
-    <form method="post" action="/record/sources/refresh">
-      <input type="hidden" name="return" value="{{$return}}">
-      <button type="submit">Refresh sources</button>
-    </form>
   </div>
   <form method="post" action="/record/source/add" class="source-form-grid">
     <input type="hidden" name="return" value="{{$return}}">

@@ -82,8 +82,11 @@ func TestDNSRecordsPageUsesFilePickerAndUnifiedSourceBlock(t *testing.T) {
 		`document.getElementById('record-import-file').click()`,
 		`onchange="if (this.files.length) this.form.submit()"`,
 		`action="/record/export"`,
+		`id="record-domain-search"`,
 		`name="q" value="db"`,
 		`substring or /regexp/`,
+		`document.getElementById('record-domain-search').value=''`,
+		`>Clear</button>`,
 		`41 domains · page 2 of 3`,
 		`/dns-records?q=db&amp;page=3`,
 		`<h2>External CSV sources</h2>`,
@@ -101,5 +104,13 @@ func TestDNSRecordsPageUsesFilePickerAndUnifiedSourceBlock(t *testing.T) {
 	}
 	if strings.Contains(html, "<h2>Configured sources</h2>") {
 		t.Fatal("configured sources remained a separate card")
+	}
+	if strings.Contains(html, `href="/dns-records">Clear</a>`) {
+		t.Fatal("search clear control is still rendered as a link")
+	}
+	footerIndex := strings.Index(html, `<footer class="site-footer">`)
+	refreshIndex := strings.Index(html, `action="/record/sources/refresh"`)
+	if footerIndex < 0 || refreshIndex < footerIndex {
+		t.Fatal("Refresh sources action is not located in the shared footer")
 	}
 }
