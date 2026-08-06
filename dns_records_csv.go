@@ -47,7 +47,8 @@ type DNSRecordSourceState struct {
 
 // DNSRecordState is one persistent or externally supplied DNS record as shown
 // in the admin panel. Status reflects the currently loaded configuration:
-// later external sources override earlier layers per name and record type.
+// later external sources override earlier external layers per name and type;
+// persistent SQLite records are applied last and have final priority.
 type DNSRecordState struct {
 	ID          int64
 	Name        string
@@ -461,7 +462,6 @@ func loadDNSRecordSources(ctx context.Context, db *sql.DB, cfg *Config, client *
 	if err := rows.Err(); err != nil {
 		return err
 	}
-	sortDNSRecordStates(cfg.DNSRecordEntries)
 	return nil
 }
 

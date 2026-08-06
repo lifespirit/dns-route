@@ -68,7 +68,7 @@
     <label class="checkbox-field"><input type="checkbox" name="no_data_only" value="1"> NO_DATA only</label>
     <button type="submit">Add / update source</button>
   </form>
-  <p><small>Sources are downloaded or reread on every Reload config. Their records stay in memory and override earlier layers per name and type. NO_DATA only ignores address columns and prevents DNS-address injection.</small></p>
+  <p><small>Sources are downloaded or reread on every Reload config. Their records stay in memory. Later sources override earlier sources, while enabled local database records have final priority per name and type. NO_DATA only ignores address columns and prevents DNS-address injection.</small></p>
 
   <table>
     <tr><th>ID</th><th>Location</th><th>Kind</th><th>Loaded</th><th>Mode</th><th>Actions</th></tr>

@@ -53,8 +53,8 @@ func TestDNSRecordsPageUsesFilePickerAndUnifiedSourceBlock(t *testing.T) {
 		Config:  &Config{},
 		Message: "127.0.0.1:8080",
 		Records: []DNSRecordState{
-			{Name: "db.lan", Type: "A", Value: "192.0.2.1", TTL: 60, DefaultTTL: true, Source: "Database", SourceKind: "database", Status: "overridden", Persistent: true, ID: 1},
-			{Name: "source.lan", Type: "AAAA", Value: "::1", TTL: 60, DefaultTTL: true, Source: "/tmp/source.csv", SourceKind: "file", SourceID: 2, Status: "active"},
+			{Name: "db.lan", Type: "A", Value: "192.0.2.1", TTL: 60, DefaultTTL: true, Source: "Database", SourceKind: "database", Status: "active", Persistent: true, ID: 1},
+			{Name: "db.lan", Type: "A", Value: "192.0.2.2", TTL: 60, DefaultTTL: true, Source: "/tmp/source.csv", SourceKind: "file", SourceID: 2, Status: "overridden"},
 		},
 		DNSRecordSources: []DNSRecordSourceState{{ID: 2, Location: "/tmp/source.csv", Kind: "file", Domains: 1, Records: 1}},
 	}

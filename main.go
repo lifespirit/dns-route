@@ -1202,12 +1202,15 @@ func loadConfigFromDB(db *sql.DB) (*Config, error) {
 	if err := readSpecialDomains(db, cfg); err != nil {
 		return nil, err
 	}
-	if err := readDNSRecords(db, cfg); err != nil {
-		return nil, err
-	}
+	// External sources form the lower-priority layer. Persistent records are
+	// loaded afterwards and replace matching name/type families in memory.
 	if err := loadDNSRecordSources(context.Background(), db, cfg, newDNSRecordSourceClient()); err != nil {
 		return nil, err
 	}
+	if err := readDNSRecords(db, cfg); err != nil {
+		return nil, err
+	}
+	sortDNSRecordStates(cfg.DNSRecordEntries)
 	cfg.ListenAddrs = uniqueStrings(cfg.ListenAddrs)
 	cfg.Upstreams = uniqueStrings(cfg.Upstreams)
 	return cfg, nil
@@ -1398,6 +1401,11 @@ func readDNSRecords(db *sql.DB, cfg *Config) error {
 		return err
 	}
 	defer rows.Close()
+
+	// The first valid enabled SQLite record for a name/type family replaces the
+	// complete external-source family. Further SQLite rows of that family are
+	// appended, preserving multi-value local answers.
+	persistentFamilies := make(map[string]struct{})
 	for rows.Next() {
 		var id int64
 		var name, typ, value string
@@ -1444,37 +1452,52 @@ func readDNSRecords(db *sql.DB, cfg *Config) error {
 		}
 
 		recordTTL := state.TTL
+		var record LocalRecord
 		switch typ {
 		case "A":
 			if value == "" {
-				cfg.LocalA[name] = append(cfg.LocalA[name], LocalRecord{TTL: recordTTL, NoData: true})
-				cfg.DNSRecordEntries = append(cfg.DNSRecordEntries, state)
-				continue
+				record = LocalRecord{TTL: recordTTL, NoData: true}
+			} else {
+				ip := net.ParseIP(value)
+				if ip == nil || ip.To4() == nil {
+					state.Status = "invalid"
+					cfg.DNSRecordEntries = append(cfg.DNSRecordEntries, state)
+					continue
+				}
+				v4 := ip.To4()
+				state.Value = v4.String()
+				record = LocalRecord{IP: v4, TTL: recordTTL}
 			}
-			ip := net.ParseIP(value)
-			if ip == nil || ip.To4() == nil {
-				state.Status = "invalid"
-				cfg.DNSRecordEntries = append(cfg.DNSRecordEntries, state)
-				continue
-			}
-			v4 := ip.To4()
-			state.Value = v4.String()
-			cfg.LocalA[name] = append(cfg.LocalA[name], LocalRecord{IP: v4, TTL: recordTTL})
 		case "AAAA":
 			if value == "" {
-				cfg.LocalAAAA[name] = append(cfg.LocalAAAA[name], LocalRecord{TTL: recordTTL, NoData: true})
-				cfg.DNSRecordEntries = append(cfg.DNSRecordEntries, state)
-				continue
+				record = LocalRecord{TTL: recordTTL, NoData: true}
+			} else {
+				ip := net.ParseIP(value)
+				if ip == nil || ip.To4() != nil {
+					state.Status = "invalid"
+					cfg.DNSRecordEntries = append(cfg.DNSRecordEntries, state)
+					continue
+				}
+				ip = ip.To16()
+				state.Value = ip.String()
+				record = LocalRecord{IP: ip, TTL: recordTTL}
 			}
-			ip := net.ParseIP(value)
-			if ip == nil || ip.To4() != nil {
-				state.Status = "invalid"
-				cfg.DNSRecordEntries = append(cfg.DNSRecordEntries, state)
-				continue
+		}
+
+		familyKey := name + "\x00" + typ
+		if _, exists := persistentFamilies[familyKey]; !exists {
+			markDNSRecordFamilyOverridden(cfg.DNSRecordEntries, name, typ)
+			if typ == "A" {
+				delete(cfg.LocalA, name)
+			} else {
+				delete(cfg.LocalAAAA, name)
 			}
-			ip = ip.To16()
-			state.Value = ip.String()
-			cfg.LocalAAAA[name] = append(cfg.LocalAAAA[name], LocalRecord{IP: ip, TTL: recordTTL})
+			persistentFamilies[familyKey] = struct{}{}
+		}
+		if typ == "A" {
+			cfg.LocalA[name] = append(cfg.LocalA[name], record)
+		} else {
+			cfg.LocalAAAA[name] = append(cfg.LocalAAAA[name], record)
 		}
 		cfg.DNSRecordEntries = append(cfg.DNSRecordEntries, state)
 	}

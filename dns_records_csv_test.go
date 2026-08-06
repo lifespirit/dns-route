@@ -169,7 +169,7 @@ func TestExportDNSRecordsCSVExportsEffectivePersistentRules(t *testing.T) {
 	}
 }
 
-func TestLoadDNSRecordSourcesOverlayDBAndRefresh(t *testing.T) {
+func TestLoadDNSRecordSourcesRefreshBelowDatabasePriority(t *testing.T) {
 	db := openDNSRecordTestDB(t)
 	for _, args := range [][]any{
 		{"base.lan", "A", "192.0.2.1"},
@@ -207,11 +207,11 @@ func TestLoadDNSRecordSourcesOverlayDBAndRefresh(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := cfg.LocalA["base.lan"][0].IP.String(); got != "192.0.2.2" {
+	if got := cfg.LocalA["base.lan"][0].IP.String(); got != "192.0.2.1" {
 		t.Fatalf("base A = %q", got)
 	}
-	if rec := cfg.LocalAAAA["base.lan"][0]; !rec.NoData || rec.IP != nil {
-		t.Fatalf("base AAAA from NO_DATA-only source = %#v", rec)
+	if got := cfg.LocalAAAA["base.lan"][0].IP.String(); got != "2001:db8::1" {
+		t.Fatalf("base AAAA = %q", got)
 	}
 	if rec := cfg.LocalA["http.lan"][0]; !rec.NoData || rec.IP != nil {
 		t.Fatalf("http A from NO_DATA-only source = %#v", rec)
@@ -246,11 +246,11 @@ func TestLoadDNSRecordSourcesOverlayDBAndRefresh(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := cfg.LocalA["base.lan"][0].IP.String(); got != "192.0.2.3" {
+	if got := cfg.LocalA["base.lan"][0].IP.String(); got != "192.0.2.1" {
 		t.Fatalf("refreshed base A = %q", got)
 	}
-	if rec := cfg.LocalAAAA["base.lan"][0]; !rec.NoData {
-		t.Fatalf("refreshed base AAAA = %#v", rec)
+	if got := cfg.LocalAAAA["base.lan"][0].IP.String(); got != "2001:db8::1" {
+		t.Fatalf("refreshed base AAAA = %q", got)
 	}
 	mu.Lock()
 	secondRequestCount := httpRequests
@@ -376,7 +376,7 @@ func TestLoadDNSRecordSourcesTracksActiveAndOverriddenRecords(t *testing.T) {
 			statuses[key{entry.Value, entry.Source}] = entry.Status
 		}
 	}
-	if got := statuses[key{"192.0.2.10", "Database"}]; got != "overridden" {
+	if got := statuses[key{"192.0.2.10", "Database"}]; got != "active" {
 		t.Fatalf("database A status = %q", got)
 	}
 	if got := statuses[key{"2001:db8::10", "Database"}]; got != "active" {
@@ -385,10 +385,10 @@ func TestLoadDNSRecordSourcesTracksActiveAndOverriddenRecords(t *testing.T) {
 	if got := statuses[key{"192.0.2.20", first}]; got != "overridden" {
 		t.Fatalf("first source A status = %q", got)
 	}
-	if got := statuses[key{"192.0.2.30", second}]; got != "active" {
+	if got := statuses[key{"192.0.2.30", second}]; got != "overridden" {
 		t.Fatalf("second source A status = %q", got)
 	}
-	if got := cfg.LocalA["same.lan"][0].IP.String(); got != "192.0.2.30" {
+	if got := cfg.LocalA["same.lan"][0].IP.String(); got != "192.0.2.10" {
 		t.Fatalf("effective A = %q", got)
 	}
 }
@@ -416,5 +416,57 @@ func TestDisabledDatabaseRecordIsShownButNotOverridden(t *testing.T) {
 		if entry.Persistent && entry.Status != "disabled" {
 			t.Fatalf("disabled database status = %q", entry.Status)
 		}
+	}
+}
+
+func TestPersistentRecordsOverrideSourcesPerFamily(t *testing.T) {
+	db := openDNSRecordTestDB(t)
+	if _, err := db.Exec(`INSERT INTO dns_records(name, type, value, ttl, enabled) VALUES
+		('mixed.lan', 'A', '192.0.2.10', 0, 1),
+		('mixed.lan', 'A', '192.0.2.11', 0, 1)`); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(t.TempDir(), "source.csv")
+	if err := os.WriteFile(file, []byte("mixed.lan,A,192.0.2.20\nmixed.lan,AAAA,2001:db8::20\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO dns_record_sources(location, no_data_only, enabled) VALUES(?, 0, 1)`, file); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := loadConfigFromDB(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(cfg.LocalA["mixed.lan"]); got != 2 {
+		t.Fatalf("effective A count = %d", got)
+	}
+	if got := cfg.LocalA["mixed.lan"][0].IP.String(); got != "192.0.2.10" {
+		t.Fatalf("first effective A = %q", got)
+	}
+	if got := cfg.LocalA["mixed.lan"][1].IP.String(); got != "192.0.2.11" {
+		t.Fatalf("second effective A = %q", got)
+	}
+	if got := cfg.LocalAAAA["mixed.lan"][0].IP.String(); got != "2001:db8::20" {
+		t.Fatalf("effective AAAA = %q", got)
+	}
+
+	statuses := make(map[string]string)
+	for _, entry := range cfg.DNSRecordEntries {
+		if entry.Name == "mixed.lan" {
+			statuses[entry.Source+"|"+entry.Type+"|"+entry.Value] = entry.Status
+		}
+	}
+	if got := statuses[file+"|A|192.0.2.20"]; got != "overridden" {
+		t.Fatalf("source A status = %q", got)
+	}
+	if got := statuses[file+"|AAAA|2001:db8::20"]; got != "active" {
+		t.Fatalf("source AAAA status = %q", got)
+	}
+	if got := statuses["Database|A|192.0.2.10"]; got != "active" {
+		t.Fatalf("first database A status = %q", got)
+	}
+	if got := statuses["Database|A|192.0.2.11"]; got != "active" {
+		t.Fatalf("second database A status = %q", got)
 	}
 }
