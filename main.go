@@ -1040,6 +1040,8 @@ func initDB(db *sql.DB) error {
 		`CREATE TABLE IF NOT EXISTS special_domains (id INTEGER PRIMARY KEY AUTOINCREMENT, domain TEXT NOT NULL UNIQUE, enabled INTEGER NOT NULL DEFAULT 1);`,
 		`CREATE TABLE IF NOT EXISTS dns_records (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, type TEXT NOT NULL, value TEXT NOT NULL, ttl INTEGER NOT NULL DEFAULT 0, enabled INTEGER NOT NULL DEFAULT 1);`,
 		`CREATE INDEX IF NOT EXISTS idx_dns_records_name_type ON dns_records(name, type, enabled);`,
+		`CREATE TABLE IF NOT EXISTS managed_prefixes (prefix TEXT PRIMARY KEY, family INTEGER NOT NULL, resolved_by TEXT NOT NULL, first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL, enabled INTEGER NOT NULL DEFAULT 1);`,
+		`CREATE INDEX IF NOT EXISTS idx_managed_prefixes_enabled_family ON managed_prefixes(enabled, family, prefix);`,
 	}
 	for _, stmt := range stmts {
 		if _, err := db.Exec(stmt); err != nil {
