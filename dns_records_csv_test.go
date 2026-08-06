@@ -337,3 +337,84 @@ func TestLoadDNSRecordSourcesLaterSourceWinsPerFamily(t *testing.T) {
 		t.Fatalf("AAAA = %q", got)
 	}
 }
+
+func TestLoadDNSRecordSourcesTracksActiveAndOverriddenRecords(t *testing.T) {
+	db := openDNSRecordTestDB(t)
+	for _, args := range [][]any{
+		{"same.lan", "A", "192.0.2.10"},
+		{"same.lan", "AAAA", "2001:db8::10"},
+	} {
+		if _, err := db.Exec(`INSERT INTO dns_records(name, type, value, ttl, enabled) VALUES(?, ?, ?, 0, 1)`, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	first := filepath.Join(t.TempDir(), "first.csv")
+	second := filepath.Join(t.TempDir(), "second.csv")
+	if err := os.WriteFile(first, []byte("same.lan,A,192.0.2.20\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(second, []byte("same.lan,A,192.0.2.30\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO dns_record_sources(location, no_data_only, enabled) VALUES(?, 0, 1), (?, 0, 1)`, first, second); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := loadConfigFromDB(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	type key struct {
+		value  string
+		source string
+	}
+	statuses := make(map[key]string)
+	for _, entry := range cfg.DNSRecordEntries {
+		if entry.Name == "same.lan" {
+			statuses[key{entry.Value, entry.Source}] = entry.Status
+		}
+	}
+	if got := statuses[key{"192.0.2.10", "Database"}]; got != "overridden" {
+		t.Fatalf("database A status = %q", got)
+	}
+	if got := statuses[key{"2001:db8::10", "Database"}]; got != "active" {
+		t.Fatalf("database AAAA status = %q", got)
+	}
+	if got := statuses[key{"192.0.2.20", first}]; got != "overridden" {
+		t.Fatalf("first source A status = %q", got)
+	}
+	if got := statuses[key{"192.0.2.30", second}]; got != "active" {
+		t.Fatalf("second source A status = %q", got)
+	}
+	if got := cfg.LocalA["same.lan"][0].IP.String(); got != "192.0.2.30" {
+		t.Fatalf("effective A = %q", got)
+	}
+}
+
+func TestDisabledDatabaseRecordIsShownButNotOverridden(t *testing.T) {
+	db := openDNSRecordTestDB(t)
+	if _, err := db.Exec(`INSERT INTO dns_records(name, type, value, ttl, enabled) VALUES('same.lan', 'A', '192.0.2.10', 0, 0)`); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(t.TempDir(), "source.csv")
+	if err := os.WriteFile(file, []byte("same.lan,A,192.0.2.20\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO dns_record_sources(location, no_data_only, enabled) VALUES(?, 0, 1)`, file); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadConfigFromDB(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.DNSRecordEntries) != 2 {
+		t.Fatalf("record entries = %d", len(cfg.DNSRecordEntries))
+	}
+	for _, entry := range cfg.DNSRecordEntries {
+		if entry.Persistent && entry.Status != "disabled" {
+			t.Fatalf("disabled database status = %q", entry.Status)
+		}
+	}
+}

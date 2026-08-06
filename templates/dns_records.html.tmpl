@@ -2,51 +2,78 @@
 {{template "admin_header" .}}
 <div class="card">
   <h2>DNS records</h2>
-  <form method="post" action="/record/add">
+  <form id="record-add-form" method="post" action="/record/add">
     <input type="hidden" name="return" value="/dns-records">
     <table>
-      <tr><td><input type="text" name="name" placeholder="example.com or *.example.com" required></td><td><select name="type"><option value="A">A</option><option value="AAAA">AAAA</option></select></td><td><input type="text" name="value" placeholder="10.0.0.1, 2001:db8::1, or empty=NODATA"></td><td><input type="number" min="0" name="ttl" placeholder="0"></td><td><button type="submit">Add record</button></td></tr>
+      <tr>
+        <td><input type="text" name="name" placeholder="example.com or *.example.com" required></td>
+        <td><select name="type"><option value="A">A</option><option value="AAAA">AAAA</option></select></td>
+        <td><input type="text" name="value" placeholder="10.0.0.1, 2001:db8::1, or empty=NODATA"></td>
+        <td><input type="number" min="0" name="ttl" placeholder="0"></td>
+      </tr>
     </table>
   </form>
+  <div class="actions" aria-label="DNS record actions">
+    <button type="submit" form="record-add-form">Add record</button>
+    <form id="record-import-form" class="inline" method="post" action="/record/import" enctype="multipart/form-data">
+      <input type="hidden" name="return" value="/dns-records">
+      <input id="record-import-file" class="visually-hidden" type="file" name="file" accept=".csv,text/csv,text/plain" required onchange="if (this.files.length) this.form.submit()">
+    </form>
+    <button type="button" onclick="document.getElementById('record-import-file').click()">Import CSV</button>
+    <form class="inline" method="get" action="/record/export"><button type="submit">Export CSV</button></form>
+  </div>
+  <p><small>Import replaces every persistent A/AAAA record for each name present in the selected file. Export downloads the persistent database records only.</small></p>
+
   <table>
-    <tr><th>ID</th><th>Name</th><th>Type</th><th>Value</th><th>TTL</th><th>Action</th></tr>
-    {{range .Records}}<tr><td>{{.ID}}</td><td>{{.Name}}</td><td>{{.Type}}</td><td>{{if .Value}}{{.Value}}{{else}}<span class="badge disabled">NODATA</span>{{end}}</td><td>{{.TTL}}</td><td><form class="inline" method="post" action="/record/delete"><input type="hidden" name="return" value="/dns-records"><input type="hidden" name="id" value="{{.ID}}"><button type="submit">Delete</button></form></td></tr>{{else}}<tr><td colspan="6" class="muted">No local DNS records configured.</td></tr>{{end}}
+    <tr><th>Name</th><th>Type</th><th>Value</th><th>TTL</th><th>Source</th><th>Status</th><th>Action</th></tr>
+    {{range .Records}}
+    <tr>
+      <td>{{.Name}}</td>
+      <td>{{.Type}}</td>
+      <td>{{if .Value}}{{.Value}}{{else}}<span class="badge disabled">NODATA</span>{{end}}</td>
+      <td>{{if .DefaultTTL}}default ({{.TTL}}){{else}}{{.TTL}}{{end}}</td>
+      <td class="source-cell">
+        {{if .Persistent}}
+          <span class="badge disabled">database</span>
+        {{else}}
+          <a href="#record-source-{{.SourceID}}"><span class="badge source">{{.SourceKind}} #{{.SourceID}}</span></a>
+          <small class="source-location">{{.Source}}</small>
+        {{end}}
+      </td>
+      <td>
+        {{if eq .Status "active"}}<span class="badge active">active</span>
+        {{else if eq .Status "overridden"}}<span class="badge overridden">overridden</span>
+        {{else if eq .Status "disabled"}}<span class="badge disabled">disabled</span>
+        {{else}}<span class="badge invalid">invalid</span>{{end}}
+      </td>
+      <td>
+        {{if .Persistent}}
+        <form class="inline" method="post" action="/record/delete">
+          <input type="hidden" name="return" value="/dns-records">
+          <input type="hidden" name="id" value="{{.ID}}">
+          <button type="submit">Delete</button>
+        </form>
+        {{else}}<span class="muted">Managed by source</span>{{end}}
+      </td>
+    </tr>
+    {{else}}<tr><td colspan="7" class="muted">No DNS records configured or loaded.</td></tr>{{end}}
   </table>
 </div>
 
-<div class="grid section-gap">
-  <div class="card">
-    <h2>Import / export</h2>
-    <div class="actions">
-      <form method="get" action="/record/export"><button type="submit">Export CSV</button></form>
-    </div>
-    <form method="post" action="/record/import" enctype="multipart/form-data" class="section-gap">
-      <input type="hidden" name="return" value="/dns-records">
-      <label>CSV file<input type="file" name="file" accept=".csv,text/csv,text/plain" required></label>
-      <p><button type="submit">Import CSV</button></p>
-    </form>
-    <p><small>Import replaces every persistent A/AAAA record for each name present in the file. Other names remain unchanged. Imported records are stored in SQLite with the default TTL.</small></p>
-    <p><small><code>name</code> means NODATA for A and AAAA; <code>name,A</code> or <code>name,AAAA</code> means NODATA only for that type; a third column supplies the address.</small></p>
-  </div>
-
-  <div class="card">
-    <h2>External CSV sources</h2>
-    <form method="post" action="/record/source/add">
-      <input type="hidden" name="return" value="/dns-records">
-      <label>HTTP(S) URL or filesystem path<input type="text" name="location" placeholder="https://example/list.csv or /etc/dns-route/records.csv" required></label>
-      <p><label><input type="checkbox" name="no_data_only" value="1"> NO_DATA only</label></p>
-      <p><button type="submit">Add / update source</button></p>
-    </form>
-    <p><small>Sources are downloaded or reread on every Reload config. Their records exist only in memory and override persistent records per name and type. NO_DATA only ignores the address column and prevents a source from injecting DNS addresses.</small></p>
-  </div>
-</div>
-
 <div class="card section-gap">
-  <h2>Configured sources</h2>
+  <h2>External CSV sources</h2>
+  <form method="post" action="/record/source/add" class="source-form-grid">
+    <input type="hidden" name="return" value="/dns-records">
+    <label>HTTP(S) URL or filesystem path<input type="text" name="location" placeholder="https://example/list.csv or /etc/dns-route/records.csv" required></label>
+    <label class="checkbox-field"><input type="checkbox" name="no_data_only" value="1"> NO_DATA only</label>
+    <button type="submit">Add / update source</button>
+  </form>
+  <p><small>Sources are downloaded or reread on every Reload config. Their records stay in memory and override earlier layers per name and type. NO_DATA only ignores address columns and prevents DNS-address injection.</small></p>
+
   <table>
     <tr><th>ID</th><th>Location</th><th>Kind</th><th>Loaded</th><th>Mode</th><th>Actions</th></tr>
     {{range .DNSRecordSources}}
-    <tr>
+    <tr id="record-source-{{.ID}}">
       <td>{{.ID}}</td>
       <td class="error-text">{{.Location}}</td>
       <td>{{.Kind}}</td>

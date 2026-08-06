@@ -153,6 +153,7 @@ type Config struct {
 	ForwardZones     []ForwardZone
 	SpecialDomains   map[string]struct{}
 	DNSRecordSources []DNSRecordSourceState
+	DNSRecordEntries []DNSRecordState
 	LocalA           map[string][]LocalRecord
 	LocalAAAA        map[string][]LocalRecord
 	WGGatewayV4      string
@@ -416,18 +417,9 @@ type pageData struct {
 	ForwardZones     []forwardZoneView
 	SpecialDomains   []string
 	DNSRecordSources []DNSRecordSourceState
-	Records          []recordRow
+	Records          []DNSRecordState
 	BGP              bgpStatusView
 	Message          string
-}
-
-type recordRow struct {
-	ID      int64
-	Name    string
-	Type    string
-	Value   string
-	TTL     int
-	Enabled bool
 }
 
 type statsData struct {
@@ -1113,7 +1105,7 @@ func (a *App) validateTemplates() error {
 		ForwardZones:     a.forwardZoneViews(cfg),
 		SpecialDomains:   []string{},
 		DNSRecordSources: []DNSRecordSourceState{},
-		Records:          []recordRow{},
+		Records:          []DNSRecordState{},
 		BGP:              a.bgpStatus(cfg),
 		Message:          a.adminAddr,
 	}
@@ -1401,52 +1393,90 @@ func readSpecialDomains(db *sql.DB, cfg *Config) error {
 	return rows.Err()
 }
 func readDNSRecords(db *sql.DB, cfg *Config) error {
-	rows, err := db.Query(`SELECT name, type, value, ttl FROM dns_records WHERE enabled = 1 ORDER BY id`)
+	rows, err := db.Query(`SELECT id, name, type, value, ttl, enabled FROM dns_records ORDER BY id`)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
 	for rows.Next() {
+		var id int64
 		var name, typ, value string
-		var ttl int
-		if err := rows.Scan(&name, &typ, &value, &ttl); err != nil {
+		var ttl, enabled int
+		if err := rows.Scan(&id, &name, &typ, &value, &ttl, &enabled); err != nil {
 			return err
 		}
+
+		rawName := strings.TrimSpace(name)
 		name = normalizeName(name)
-		if name == "" {
+		typ = strings.ToUpper(strings.TrimSpace(typ))
+		value = strings.TrimSpace(value)
+		state := DNSRecordState{
+			ID:          id,
+			Name:        name,
+			Type:        typ,
+			Value:       value,
+			Source:      "Database",
+			SourceKind:  "database",
+			Status:      "active",
+			Persistent:  true,
+			sourceLayer: 0,
+			nameKey:     name,
+			typeKey:     typ,
+		}
+		if state.Name == "" {
+			state.Name = rawName
+		}
+		if ttl > 0 {
+			state.TTL = uint32(ttl)
+		} else {
+			state.TTL = cfg.DefaultTTL
+			state.DefaultTTL = true
+		}
+		if enabled == 0 {
+			state.Status = "disabled"
+			cfg.DNSRecordEntries = append(cfg.DNSRecordEntries, state)
 			continue
 		}
-		value = strings.TrimSpace(value)
-		recordTTL := cfg.DefaultTTL
-		if ttl > 0 {
-			recordTTL = uint32(ttl)
+		if name == "" || (typ != "A" && typ != "AAAA") {
+			state.Status = "invalid"
+			cfg.DNSRecordEntries = append(cfg.DNSRecordEntries, state)
+			continue
 		}
-		switch strings.ToUpper(strings.TrimSpace(typ)) {
+
+		recordTTL := state.TTL
+		switch typ {
 		case "A":
 			if value == "" {
 				cfg.LocalA[name] = append(cfg.LocalA[name], LocalRecord{TTL: recordTTL, NoData: true})
+				cfg.DNSRecordEntries = append(cfg.DNSRecordEntries, state)
 				continue
 			}
 			ip := net.ParseIP(value)
-			if ip == nil {
+			if ip == nil || ip.To4() == nil {
+				state.Status = "invalid"
+				cfg.DNSRecordEntries = append(cfg.DNSRecordEntries, state)
 				continue
 			}
-			if v4 := ip.To4(); v4 != nil {
-				cfg.LocalA[name] = append(cfg.LocalA[name], LocalRecord{IP: v4, TTL: recordTTL})
-			}
+			v4 := ip.To4()
+			state.Value = v4.String()
+			cfg.LocalA[name] = append(cfg.LocalA[name], LocalRecord{IP: v4, TTL: recordTTL})
 		case "AAAA":
 			if value == "" {
 				cfg.LocalAAAA[name] = append(cfg.LocalAAAA[name], LocalRecord{TTL: recordTTL, NoData: true})
+				cfg.DNSRecordEntries = append(cfg.DNSRecordEntries, state)
 				continue
 			}
 			ip := net.ParseIP(value)
-			if ip == nil {
+			if ip == nil || ip.To4() != nil {
+				state.Status = "invalid"
+				cfg.DNSRecordEntries = append(cfg.DNSRecordEntries, state)
 				continue
 			}
-			if ip.To4() == nil {
-				cfg.LocalAAAA[name] = append(cfg.LocalAAAA[name], LocalRecord{IP: ip, TTL: recordTTL})
-			}
+			ip = ip.To16()
+			state.Value = ip.String()
+			cfg.LocalAAAA[name] = append(cfg.LocalAAAA[name], LocalRecord{IP: ip, TTL: recordTTL})
 		}
+		cfg.DNSRecordEntries = append(cfg.DNSRecordEntries, state)
 	}
 	return rows.Err()
 }
@@ -1972,10 +2002,6 @@ func (a *App) adminPageData(title, path string) (pageData, error) {
 	if err != nil {
 		return pageData{}, err
 	}
-	records, err := a.listRecords()
-	if err != nil {
-		return pageData{}, err
-	}
 	cfg := a.getConfig()
 	return pageData{
 		Title:            title,
@@ -1988,7 +2014,7 @@ func (a *App) adminPageData(title, path string) (pageData, error) {
 		ForwardZones:     a.forwardZoneViews(cfg),
 		SpecialDomains:   specials,
 		DNSRecordSources: append([]DNSRecordSourceState(nil), cfg.DNSRecordSources...),
-		Records:          records,
+		Records:          append([]DNSRecordState(nil), cfg.DNSRecordEntries...),
 		BGP:              a.bgpStatus(cfg),
 		Message:          a.adminAddr,
 	}, nil
@@ -2505,25 +2531,6 @@ func (a *App) listSimple(query string) ([]string, error) {
 	}
 	return out, rows.Err()
 }
-func (a *App) listRecords() ([]recordRow, error) {
-	rows, err := a.db.Query(`SELECT id, name, type, value, ttl, enabled FROM dns_records ORDER BY id`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []recordRow
-	for rows.Next() {
-		var rr recordRow
-		var enabled int
-		if err := rows.Scan(&rr.ID, &rr.Name, &rr.Type, &rr.Value, &rr.TTL, &enabled); err != nil {
-			return nil, err
-		}
-		rr.Enabled = enabled != 0
-		out = append(out, rr)
-	}
-	return out, rows.Err()
-}
-
 func (a *App) handleDNS(w dns.ResponseWriter, req *dns.Msg) {
 	atomic.AddUint64(&a.totalQueries, 1)
 	if len(req.Question) == 0 {

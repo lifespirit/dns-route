@@ -45,3 +45,40 @@ func TestLegacyStatsRedirect(t *testing.T) {
 		t.Fatalf("Location=%q want /statistics", got)
 	}
 }
+
+func TestDNSRecordsPageUsesFilePickerAndUnifiedSourceBlock(t *testing.T) {
+	data := pageData{
+		Title:   "DNS records",
+		Path:    "/dns-records",
+		Config:  &Config{},
+		Message: "127.0.0.1:8080",
+		Records: []DNSRecordState{
+			{Name: "db.lan", Type: "A", Value: "192.0.2.1", TTL: 60, DefaultTTL: true, Source: "Database", SourceKind: "database", Status: "overridden", Persistent: true, ID: 1},
+			{Name: "source.lan", Type: "AAAA", Value: "::1", TTL: 60, DefaultTTL: true, Source: "/tmp/source.csv", SourceKind: "file", SourceID: 2, Status: "active"},
+		},
+		DNSRecordSources: []DNSRecordSourceState{{ID: 2, Location: "/tmp/source.csv", Kind: "file", Domains: 1, Records: 1}},
+	}
+	var out strings.Builder
+	if err := templates.ExecuteTemplate(&out, "dns_records.html.tmpl", data); err != nil {
+		t.Fatal(err)
+	}
+	html := out.String()
+	for _, expected := range []string{
+		`form="record-add-form">Add record`,
+		`id="record-import-file"`,
+		`document.getElementById('record-import-file').click()`,
+		`onchange="if (this.files.length) this.form.submit()"`,
+		`action="/record/export"`,
+		`<h2>External CSV sources</h2>`,
+		`overridden`,
+		`active`,
+		`/tmp/source.csv`,
+	} {
+		if !strings.Contains(html, expected) {
+			t.Fatalf("rendered page does not contain %q", expected)
+		}
+	}
+	if strings.Contains(html, "<h2>Configured sources</h2>") {
+		t.Fatal("configured sources remained a separate card")
+	}
+}

@@ -45,6 +45,26 @@ type DNSRecordSourceState struct {
 	Records    int
 }
 
+// DNSRecordState is one persistent or externally supplied DNS record as shown
+// in the admin panel. Status reflects the currently loaded configuration:
+// later external sources override earlier layers per name and record type.
+type DNSRecordState struct {
+	ID          int64
+	Name        string
+	Type        string
+	Value       string
+	TTL         uint32
+	DefaultTTL  bool
+	Source      string
+	SourceKind  string
+	SourceID    int64
+	Status      string
+	Persistent  bool
+	sourceLayer int
+	nameKey     string
+	typeKey     string
+}
+
 type dnsRecordCSV struct {
 	Domains map[string]DNSRecordRuleSet
 }
@@ -387,7 +407,9 @@ func loadDNSRecordSources(ctx context.Context, db *sql.DB, cfg *Config, client *
 	}
 	defer rows.Close()
 
+	sourceLayer := 0
 	for rows.Next() {
+		sourceLayer++
 		var id int64
 		var location string
 		var noDataOnly int
@@ -408,12 +430,22 @@ func loadDNSRecordSources(ctx context.Context, db *sql.DB, cfg *Config, client *
 		}
 
 		recordCount := 0
-		for name, set := range parsed.Domains {
+		names := make([]string, 0, len(parsed.Domains))
+		for name := range parsed.Domains {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			set := parsed.Domains[name]
 			if set.ASet {
+				markDNSRecordFamilyOverridden(cfg.DNSRecordEntries, name, "A")
 				cfg.LocalA[name] = cloneCSVRecords(set.A, cfg.DefaultTTL)
+				cfg.DNSRecordEntries = appendDNSRecordSourceEntries(cfg.DNSRecordEntries, id, sourceLayer, location, kind, name, "A", set.A, cfg.DefaultTTL)
 			}
 			if set.AAAASet {
+				markDNSRecordFamilyOverridden(cfg.DNSRecordEntries, name, "AAAA")
 				cfg.LocalAAAA[name] = cloneCSVRecords(set.AAAA, cfg.DefaultTTL)
+				cfg.DNSRecordEntries = appendDNSRecordSourceEntries(cfg.DNSRecordEntries, id, sourceLayer, location, kind, name, "AAAA", set.AAAA, cfg.DefaultTTL)
 			}
 			recordCount += dnsRecordRuleCount(set)
 		}
@@ -426,7 +458,62 @@ func loadDNSRecordSources(ctx context.Context, db *sql.DB, cfg *Config, client *
 			Records:    recordCount,
 		})
 	}
-	return rows.Err()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	sortDNSRecordStates(cfg.DNSRecordEntries)
+	return nil
+}
+
+func markDNSRecordFamilyOverridden(entries []DNSRecordState, name, typ string) {
+	for i := range entries {
+		if entries[i].Status == "active" && entries[i].nameKey == name && entries[i].typeKey == typ {
+			entries[i].Status = "overridden"
+		}
+	}
+}
+
+func appendDNSRecordSourceEntries(entries []DNSRecordState, sourceID int64, sourceLayer int, location, kind, name, typ string, records []LocalRecord, ttl uint32) []DNSRecordState {
+	for _, record := range records {
+		value := ""
+		if !record.NoData && record.IP != nil {
+			value = record.IP.String()
+		}
+		entries = append(entries, DNSRecordState{
+			Name:        name,
+			Type:        typ,
+			Value:       value,
+			TTL:         ttl,
+			DefaultTTL:  true,
+			Source:      location,
+			SourceKind:  kind,
+			SourceID:    sourceID,
+			Status:      "active",
+			Persistent:  false,
+			sourceLayer: sourceLayer,
+			nameKey:     name,
+			typeKey:     typ,
+		})
+	}
+	return entries
+}
+
+func sortDNSRecordStates(entries []DNSRecordState) {
+	sort.SliceStable(entries, func(i, j int) bool {
+		if entries[i].nameKey != entries[j].nameKey {
+			return entries[i].nameKey < entries[j].nameKey
+		}
+		if entries[i].typeKey != entries[j].typeKey {
+			return entries[i].typeKey < entries[j].typeKey
+		}
+		if entries[i].sourceLayer != entries[j].sourceLayer {
+			return entries[i].sourceLayer < entries[j].sourceLayer
+		}
+		if entries[i].ID != entries[j].ID {
+			return entries[i].ID < entries[j].ID
+		}
+		return entries[i].Value < entries[j].Value
+	})
 }
 
 func validateDNSRecordSourceLocation(location string) error {

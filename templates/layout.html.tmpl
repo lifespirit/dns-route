@@ -42,9 +42,17 @@ button { padding: 7px 11px; cursor: pointer; }
 .badge.closed, .badge.active, .badge.established { background: #2e7d3230; }
 .badge.open { background: #c6282830; }
 .badge.half_open, .badge.pending, .badge.down, .badge.unavailable { background: #ef6c0030; }
+.badge.overridden { background: #ef6c0030; }
+.badge.invalid { background: #c6282830; }
+.badge.source { background: #1565c030; }
 .badge.disabled { background: #8883; }
 .nowrap { white-space: nowrap; }
 .error-text { max-width: 520px; overflow-wrap: anywhere; }
+.visually-hidden { position: absolute !important; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+.source-cell { min-width: 190px; }
+.source-location { display: block; margin-top: 4px; max-width: 360px; overflow-wrap: anywhere; }
+.source-form-grid { display: grid; grid-template-columns: minmax(280px, 1fr) auto auto; gap: 12px; align-items: end; }
+.checkbox-field { padding-bottom: 8px; white-space: nowrap; }
 .site-footer { border-top: 1px solid #8886; padding: 14px 24px; }
 .footer-inner { width: min(1500px, 100%); margin: 0 auto; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; }
 .footer-links { display: flex; flex-wrap: wrap; gap: 12px; }
@@ -52,7 +60,8 @@ button { padding: 7px 11px; cursor: pointer; }
   .topbar, .container, .site-footer { padding-left: 12px; padding-right: 12px; }
   .header-controls { width: 100%; justify-content: flex-start; }
   .grid { grid-template-columns: 1fr; }
-  .form-grid, .forward-grid { grid-template-columns: 1fr; }
+  .form-grid, .forward-grid, .source-form-grid { grid-template-columns: 1fr; }
+  .checkbox-field { padding-bottom: 0; }
 }
 </style>
 </head>
