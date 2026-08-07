@@ -3,14 +3,18 @@
 <div class="card">
   <h2>Runtime</h2>
   <table>
-    <tr><td>Listen addrs</td><td>{{len .Config.ListenAddrs}}</td></tr>
-    <tr><td>Default upstreams</td><td>{{len .Config.Upstreams}}</td></tr>
-    <tr><td>Conditional forward zones</td><td>{{len .ForwardZones}}</td></tr>
-    <tr><td>Special domains</td><td>{{len .SpecialDomains}}</td></tr>
-    <tr><td>Local A domains</td><td>{{len .Config.LocalA}}</td></tr>
-    <tr><td>Local AAAA domains</td><td>{{len .Config.LocalAAAA}}</td></tr>
+    <tr><td>Listen addresses</td><td>{{.Runtime.ListenAddrs}}</td></tr>
+    <tr><td>Default upstreams</td><td>{{.Runtime.DefaultUpstreams}}</td></tr>
+    <tr><td>Conditional forward zones</td><td>{{.Runtime.ActiveForwardZones}} active / {{.Runtime.ForwardZones}} configured</td></tr>
+    <tr><td>Conditional forward upstreams</td><td>{{.Runtime.ForwardUpstreams}}</td></tr>
+    <tr><td>Special domains</td><td>{{.Runtime.SpecialDomains}}</td></tr>
+    <tr><td>Special-domain sources</td><td>{{.Runtime.LoadedSpecialDomainSources}} loaded / {{.Runtime.SpecialDomainSources}} configured</td></tr>
+    <tr><td>Local DNS domains</td><td>{{.Runtime.LocalDNSDomains}} unique</td></tr>
+    <tr><td>Local A domains</td><td>{{.Runtime.LocalADomains}}</td></tr>
+    <tr><td>Local AAAA domains</td><td>{{.Runtime.LocalAAAADomains}}</td></tr>
+    <tr><td>DNS-record sources</td><td>{{.Runtime.LoadedDNSRecordSources}} loaded / {{.Runtime.DNSRecordSources}} configured</td></tr>
     <tr><td>Route mode</td><td>{{.Config.RouteMode}}</td></tr>
-    <tr><td>Route table</td><td>{{.Config.RouteTable}}</td></tr>
+    <tr><td>Route table</td><td>{{.Runtime.RouteTableEffective}}{{if ne .Runtime.RouteTableConfigured .Runtime.RouteTableEffective}} <small>(configured: {{.Runtime.RouteTableConfigured}})</small>{{end}}</td></tr>
     <tr><td>Route IPv4</td><td>{{.Config.RouteIPv4}}</td></tr>
     <tr><td>Route IPv6</td><td>{{.Config.RouteIPv6}}</td></tr>
     <tr><td>Team Cymru prefix lookup</td><td>{{.Config.LookupCIDR}}</td></tr>
@@ -20,8 +24,10 @@
     <tr><td>WG gateway v4</td><td>{{.Config.WGGatewayV4}}</td></tr>
     <tr><td>WG gateway v6</td><td>{{.Config.WGGatewayV6}}</td></tr>
     <tr><td>BGP peer</td><td>{{if .BGP.Enabled}}<span class="badge {{.BGP.State}}">{{.BGP.State}}</span> {{.BGP.PeerAddress}} AS{{.BGP.PeerASN}}{{else}}<span class="badge disabled">disabled</span>{{end}}</td></tr>
+    {{if .BGP.Enabled}}
     <tr><td>BGP prefixes</td><td>desired: {{.BGP.DesiredPrefixes}}<br>Loc-RIB: {{.BGP.AnnouncedPrefixes}}</td></tr>
     <tr><td>BGP backend ready</td><td>{{.BGP.Ready}}{{if .BGP.RequireEstablished}} <small>(requires Established)</small>{{end}}</td></tr>
+    {{end}}
   </table>
 </div>
 {{template "admin_footer" .}}

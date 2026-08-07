@@ -433,10 +433,29 @@ type bgpStatusView struct {
 	PasswordConfigured bool
 }
 
+type configSummaryView struct {
+	ListenAddrs                int
+	DefaultUpstreams           int
+	ForwardZones               int
+	ActiveForwardZones         int
+	ForwardUpstreams           int
+	SpecialDomains             int
+	SpecialDomainSources       int
+	LoadedSpecialDomainSources int
+	LocalADomains              int
+	LocalAAAADomains           int
+	LocalDNSDomains            int
+	DNSRecordSources           int
+	LoadedDNSRecordSources     int
+	RouteTableConfigured       int
+	RouteTableEffective        int
+}
+
 type pageData struct {
 	Title                string
 	Path                 string
 	Config               *Config
+	Runtime              configSummaryView
 	Settings             map[string]string
 	ListenAddrs          []string
 	ListenerStates       []listenerView
@@ -469,35 +488,43 @@ type pageData struct {
 }
 
 type statsData struct {
-	Title            string
-	Path             string
-	Message          string
-	Uptime           string
-	StartedAt        string
-	CacheEntries     int
-	ActiveListeners  int
-	PendingListeners int
-	ListenAddrs      int
-	Upstreams        int
-	ForwardZones     int
-	ForwardUpstreams int
-	SpecialDomains   int
-	LocalADomains    int
-	LocalAAAADomains int
-	LookupCIDR       bool
-	ReplyBeforeRoute bool
-	ListenerFreeBind bool
-	RouteMode        string
-	RouteIPv4        bool
-	RouteIPv6        bool
-	RouteTable       int
-	BGP              bgpStatusView
-	WGInterface      string
-	WGGatewayV4      string
-	WGGatewayV6      string
-	RouteSnapshot    int
-	IPCacheEntries   int
-	CIDRCacheEntries int
+	Title                      string
+	Path                       string
+	Message                    string
+	Uptime                     string
+	StartedAt                  string
+	CacheEntries               int
+	ActiveListeners            int
+	PendingListeners           int
+	ListenAddrs                int
+	Upstreams                  int
+	ForwardZones               int
+	ActiveForwardZones         int
+	ForwardUpstreams           int
+	SpecialDomains             int
+	SpecialDomainSources       int
+	LoadedSpecialDomainSources int
+	LocalADomains              int
+	LocalAAAADomains           int
+	LocalDNSDomains            int
+	DNSRecordSources           int
+	LoadedDNSRecordSources     int
+	LookupCIDR                 bool
+	ReplyBeforeRoute           bool
+	ListenerFreeBind           bool
+	RouteMode                  string
+	RouteIPv4                  bool
+	RouteIPv6                  bool
+	RouteTable                 int
+	RouteTableConfigured       int
+	BGP                        bgpStatusView
+	WGInterface                string
+	WGGatewayV4                string
+	WGGatewayV6                string
+	RouteSnapshot              int
+	KernelRouteSnapshot        int
+	IPCacheEntries             int
+	CIDRCacheEntries           int
 
 	TotalQueries           uint64
 	CacheHits              uint64
@@ -1132,6 +1159,19 @@ func (rm *RouteManager) BackendSnapshotSize() int {
 	return total
 }
 
+func (rm *RouteManager) BackendSnapshotSizeByName(name string) int {
+	if rm == nil {
+		return 0
+	}
+	rm.backendMu.RLock()
+	defer rm.backendMu.RUnlock()
+	backend := rm.backendByName(name)
+	if backend == nil {
+		return 0
+	}
+	return backend.SnapshotSize()
+}
+
 func (rm *RouteManager) CloseBackends() error {
 	rm.backendMu.Lock()
 	backends := rm.backends
@@ -1232,6 +1272,7 @@ func (a *App) validateTemplates() error {
 		Title:                "Runtime",
 		Path:                 "/",
 		Config:               cfg,
+		Runtime:              summarizeConfig(cfg),
 		Settings:             map[string]string{},
 		ListenAddrs:          append([]string(nil), cfg.ListenAddrs...),
 		ListenerStates:       a.listenerViews(),
@@ -1813,6 +1854,52 @@ func forwardZoneUpstreamCount(cfg *Config) int {
 		total += len(zone.Upstreams)
 	}
 	return total
+}
+
+func summarizeConfig(cfg *Config) configSummaryView {
+	if cfg == nil {
+		return configSummaryView{}
+	}
+
+	summary := configSummaryView{
+		ListenAddrs:          len(cfg.ListenAddrs),
+		DefaultUpstreams:     len(cfg.Upstreams),
+		ForwardZones:         len(cfg.ForwardZones),
+		ForwardUpstreams:     forwardZoneUpstreamCount(cfg),
+		SpecialDomains:       len(cfg.SpecialDomains),
+		SpecialDomainSources: len(cfg.SpecialDomainSources),
+		LocalADomains:        len(cfg.LocalA),
+		LocalAAAADomains:     len(cfg.LocalAAAA),
+		DNSRecordSources:     len(cfg.DNSRecordSources),
+		RouteTableConfigured: cfg.RouteTable,
+		RouteTableEffective:  effectiveRouteTable(cfg.RouteTable),
+	}
+
+	for _, zone := range cfg.ForwardZones {
+		if len(zone.Upstreams) > 0 {
+			summary.ActiveForwardZones++
+		}
+	}
+	for _, source := range cfg.SpecialDomainSources {
+		if source.Loaded {
+			summary.LoadedSpecialDomainSources++
+		}
+	}
+	for _, source := range cfg.DNSRecordSources {
+		if source.Loaded {
+			summary.LoadedDNSRecordSources++
+		}
+	}
+
+	localDomains := make(map[string]struct{}, len(cfg.LocalA)+len(cfg.LocalAAAA))
+	for name := range cfg.LocalA {
+		localDomains[name] = struct{}{}
+	}
+	for name := range cfg.LocalAAAA {
+		localDomains[name] = struct{}{}
+	}
+	summary.LocalDNSDomains = len(localDomains)
+	return summary
 }
 
 func buildForwardPolicy(key, domain string, targets []upstreamTarget) forwardPolicy {
@@ -2459,6 +2546,7 @@ func (a *App) adminPageData(title, path string) (pageData, error) {
 		Title:                title,
 		Path:                 path,
 		Config:               cfg,
+		Runtime:              summarizeConfig(cfg),
 		Settings:             settings,
 		ListenAddrs:          listenAddrs,
 		ListenerStates:       a.listenerViews(),
@@ -4448,8 +4536,10 @@ func (a *App) upstreamViews(cfg *Config) []upstreamView {
 func (a *App) statsSnapshot() statsData {
 	a.routeConfigMu.RLock()
 	cfg := a.getConfig()
+	summary := summarizeConfig(cfg)
 	bgp := a.bgpStatus(cfg)
 	routeSnapshot := a.routeMgr.BackendSnapshotSize()
+	kernelRouteSnapshot := a.routeMgr.BackendSnapshotSizeByName(KernelRouteBackendName)
 	a.routeConfigMu.RUnlock()
 
 	a.cacheMu.RLock()
@@ -4467,24 +4557,62 @@ func (a *App) statsSnapshot() statsData {
 	cidrEntries := len(a.routeMgr.cidrCache)
 	a.routeMgr.cidrMu.RUnlock()
 	return statsData{
-		Uptime:           time.Since(a.startedAt).Truncate(time.Second).String(),
-		StartedAt:        a.startedAt.Format(time.RFC3339),
-		CacheEntries:     cacheEntries,
-		ActiveListeners:  activeListeners,
-		PendingListeners: pendingListeners,
-		ListenAddrs:      len(cfg.ListenAddrs), Upstreams: len(cfg.Upstreams), ForwardZones: len(cfg.ForwardZones), ForwardUpstreams: forwardZoneUpstreamCount(cfg), SpecialDomains: len(cfg.SpecialDomains),
-		LocalADomains: len(cfg.LocalA), LocalAAAADomains: len(cfg.LocalAAAA), LookupCIDR: cfg.LookupCIDR,
-		ReplyBeforeRoute: cfg.ReplyBeforeRoute, ListenerFreeBind: cfg.ListenerFreeBind, RouteMode: string(cfg.RouteMode), RouteIPv4: cfg.RouteIPv4, RouteIPv6: cfg.RouteIPv6, RouteTable: effectiveRouteTable(cfg.RouteTable), BGP: bgp, WGInterface: cfg.WGInterface, WGGatewayV4: cfg.WGGatewayV4, WGGatewayV6: cfg.WGGatewayV6,
-		RouteSnapshot: routeSnapshot, IPCacheEntries: ipEntries, CIDRCacheEntries: cidrEntries,
-		TotalQueries: atomic.LoadUint64(&a.totalQueries), CacheHits: atomic.LoadUint64(&a.cacheHits), CacheMisses: atomic.LoadUint64(&a.cacheMisses),
-		LocalAnswers: atomic.LoadUint64(&a.localAnswers), ForwardedOK: atomic.LoadUint64(&a.forwardedOK), ServfailCount: atomic.LoadUint64(&a.servfailCount),
-		RouteAdds: atomic.LoadUint64(&a.routeAdds), RouteAddErrors: atomic.LoadUint64(&a.routeAddErrors), ForwardErrors: atomic.LoadUint64(&a.forwardErrors),
-		LookupCIDRAttempts: atomic.LoadUint64(&a.lookupCIDRAttempts), LookupCIDRFailed: atomic.LoadUint64(&a.lookupCIDRFailed), RouteQueueDrops: atomic.LoadUint64(&a.routeQueueDrops),
-		ConntrackResetAttempts: atomic.LoadUint64(&a.conntrackResetAttempts), ConntrackResetDeleted: atomic.LoadUint64(&a.conntrackResetDeleted), ConntrackResetErrors: atomic.LoadUint64(&a.conntrackResetErrors),
-		ListenerBindAttempts: atomic.LoadUint64(&a.listenerBindAttempts), ListenerBindErrors: atomic.LoadUint64(&a.listenerBindErrors), ListenerStarts: atomic.LoadUint64(&a.listenerStarts), ListenerRecoveries: atomic.LoadUint64(&a.listenerRecoveries),
-		UpstreamCircuits: a.upstreamViews(cfg),
-		ForwardPolicies:  a.forwardPolicyViews(cfg),
-		ListenerStates:   listenerStates,
+		Uptime:                     time.Since(a.startedAt).Truncate(time.Second).String(),
+		StartedAt:                  a.startedAt.Format(time.RFC3339),
+		CacheEntries:               cacheEntries,
+		ActiveListeners:            activeListeners,
+		PendingListeners:           pendingListeners,
+		ListenAddrs:                summary.ListenAddrs,
+		Upstreams:                  summary.DefaultUpstreams,
+		ForwardZones:               summary.ForwardZones,
+		ActiveForwardZones:         summary.ActiveForwardZones,
+		ForwardUpstreams:           summary.ForwardUpstreams,
+		SpecialDomains:             summary.SpecialDomains,
+		SpecialDomainSources:       summary.SpecialDomainSources,
+		LoadedSpecialDomainSources: summary.LoadedSpecialDomainSources,
+		LocalADomains:              summary.LocalADomains,
+		LocalAAAADomains:           summary.LocalAAAADomains,
+		LocalDNSDomains:            summary.LocalDNSDomains,
+		DNSRecordSources:           summary.DNSRecordSources,
+		LoadedDNSRecordSources:     summary.LoadedDNSRecordSources,
+		LookupCIDR:                 cfg.LookupCIDR,
+		ReplyBeforeRoute:           cfg.ReplyBeforeRoute,
+		ListenerFreeBind:           cfg.ListenerFreeBind,
+		RouteMode:                  string(cfg.RouteMode),
+		RouteIPv4:                  cfg.RouteIPv4,
+		RouteIPv6:                  cfg.RouteIPv6,
+		RouteTable:                 summary.RouteTableEffective,
+		RouteTableConfigured:       summary.RouteTableConfigured,
+		BGP:                        bgp,
+		WGInterface:                cfg.WGInterface,
+		WGGatewayV4:                cfg.WGGatewayV4,
+		WGGatewayV6:                cfg.WGGatewayV6,
+		RouteSnapshot:              routeSnapshot,
+		KernelRouteSnapshot:        kernelRouteSnapshot,
+		IPCacheEntries:             ipEntries,
+		CIDRCacheEntries:           cidrEntries,
+		TotalQueries:               atomic.LoadUint64(&a.totalQueries),
+		CacheHits:                  atomic.LoadUint64(&a.cacheHits),
+		CacheMisses:                atomic.LoadUint64(&a.cacheMisses),
+		LocalAnswers:               atomic.LoadUint64(&a.localAnswers),
+		ForwardedOK:                atomic.LoadUint64(&a.forwardedOK),
+		ServfailCount:              atomic.LoadUint64(&a.servfailCount),
+		RouteAdds:                  atomic.LoadUint64(&a.routeAdds),
+		RouteAddErrors:             atomic.LoadUint64(&a.routeAddErrors),
+		ForwardErrors:              atomic.LoadUint64(&a.forwardErrors),
+		LookupCIDRAttempts:         atomic.LoadUint64(&a.lookupCIDRAttempts),
+		LookupCIDRFailed:           atomic.LoadUint64(&a.lookupCIDRFailed),
+		RouteQueueDrops:            atomic.LoadUint64(&a.routeQueueDrops),
+		ConntrackResetAttempts:     atomic.LoadUint64(&a.conntrackResetAttempts),
+		ConntrackResetDeleted:      atomic.LoadUint64(&a.conntrackResetDeleted),
+		ConntrackResetErrors:       atomic.LoadUint64(&a.conntrackResetErrors),
+		ListenerBindAttempts:       atomic.LoadUint64(&a.listenerBindAttempts),
+		ListenerBindErrors:         atomic.LoadUint64(&a.listenerBindErrors),
+		ListenerStarts:             atomic.LoadUint64(&a.listenerStarts),
+		ListenerRecoveries:         atomic.LoadUint64(&a.listenerRecoveries),
+		UpstreamCircuits:           a.upstreamViews(cfg),
+		ForwardPolicies:            a.forwardPolicyViews(cfg),
+		ListenerStates:             listenerStates,
 	}
 }
 
@@ -4512,16 +4640,23 @@ func (a *App) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	gauge("dns_route_listener_retry_interval_seconds", int64(listenerRetryInterval.Seconds()), "listener bind retry interval in seconds")
 	gauge("dns_route_listen_addrs", s.ListenAddrs, "number of configured listen addresses")
 	gauge("dns_route_upstreams", s.Upstreams, "number of configured default upstreams")
-	gauge("dns_route_forward_zones", s.ForwardZones, "number of configured conditional forwarding zones")
-	gauge("dns_route_forward_zone_upstreams", s.ForwardUpstreams, "number of upstream entries assigned to conditional forwarding zones")
-	gauge("dns_route_special_domains", s.SpecialDomains, "number of special domains")
-	gauge("dns_route_local_a_domains", s.LocalADomains, "number of local A domains")
-	gauge("dns_route_local_aaaa_domains", s.LocalAAAADomains, "number of local AAAA domains")
+	gauge("dns_route_forward_zones", s.ForwardZones, "number of enabled configured conditional forwarding zones")
+	gauge("dns_route_active_forward_zones", s.ActiveForwardZones, "number of conditional forwarding zones with at least one enabled upstream")
+	gauge("dns_route_forward_zone_upstreams", s.ForwardUpstreams, "number of enabled upstream entries assigned to conditional forwarding zones")
+	gauge("dns_route_special_domains", s.SpecialDomains, "number of unique effective special-domain patterns from SQLite and loaded external sources")
+	gauge("dns_route_special_domain_sources", s.SpecialDomainSources, "number of enabled configured special-domain sources")
+	gauge("dns_route_loaded_special_domain_sources", s.LoadedSpecialDomainSources, "number of special-domain sources present in the active in-memory snapshot")
+	gauge("dns_route_local_dns_domains", s.LocalDNSDomains, "number of unique effective local DNS names with A and/or AAAA rules")
+	gauge("dns_route_local_a_domains", s.LocalADomains, "number of effective local DNS names with A rules, including NODATA rules")
+	gauge("dns_route_local_aaaa_domains", s.LocalAAAADomains, "number of effective local DNS names with AAAA rules, including NODATA rules")
+	gauge("dns_route_dns_record_sources", s.DNSRecordSources, "number of enabled configured DNS-record sources")
+	gauge("dns_route_loaded_dns_record_sources", s.LoadedDNSRecordSources, "number of DNS-record sources present in the active in-memory snapshot")
 	gauge("dns_route_lookup_cidr_enabled", boolToInt(s.LookupCIDR), "Team Cymru BGP prefix lookup enabled; legacy metric name")
 	gauge("dns_route_reply_before_route_enabled", boolToInt(s.ReplyBeforeRoute), "reply before route enabled")
 	gauge("dns_route_route_ipv4_enabled", boolToInt(s.RouteIPv4), "IPv4 route programming enabled")
 	gauge("dns_route_route_ipv6_enabled", boolToInt(s.RouteIPv6), "IPv6 route programming enabled")
-	gauge("dns_route_route_table", s.RouteTable, "effective route table")
+	gauge("dns_route_route_table", s.RouteTable, "effective Linux route table; configured value 0 resolves to the main table")
+	gauge("dns_route_route_table_configured", s.RouteTableConfigured, "route table value stored in configuration before resolving 0 to the main table")
 	fmt.Fprintln(w, "# HELP dns_route_route_mode_info Configured route mode as a one-hot gauge")
 	fmt.Fprintln(w, "# TYPE dns_route_route_mode_info gauge")
 	for _, mode := range []string{string(RouteModeKernel), string(RouteModeBGP), string(RouteModeKernelBGP)} {
@@ -4536,17 +4671,18 @@ func (a *App) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	gauge("dns_route_bgp_backend_ready", boolToInt(s.BGP.Ready), "BGP backend readiness under the configured established-session policy")
 	gauge("dns_route_bgp_desired_prefixes", s.BGP.DesiredPrefixes, "prefixes in the ephemeral desired BGP set")
 	gauge("dns_route_bgp_loc_rib_prefixes", s.BGP.AnnouncedPrefixes, "prefixes accepted by the embedded GoBGP Loc-RIB")
-	gauge("dns_route_route_snapshot_entries", s.RouteSnapshot, "route snapshot entries")
+	gauge("dns_route_route_snapshot_entries", s.RouteSnapshot, "sum of snapshot entries across active route backends; one prefix can be counted once per backend")
+	gauge("dns_route_kernel_route_snapshot_entries", s.KernelRouteSnapshot, "prefixes in the active kernel route backend snapshot")
 	gauge("dns_route_route_ip_cache_entries", s.IPCacheEntries, "route manager IP cache entries")
 	gauge("dns_route_route_cidr_cache_entries", s.CIDRCacheEntries, "route manager prefix cache entries; legacy metric name")
 	counter("dns_route_queries_total", s.TotalQueries, "total DNS queries")
 	counter("dns_route_cache_hits_total", s.CacheHits, "cache hits")
 	counter("dns_route_cache_misses_total", s.CacheMisses, "cache misses")
 	counter("dns_route_local_answers_total", s.LocalAnswers, "local answers")
-	counter("dns_route_forwarded_ok_total", s.ForwardedOK, "successful forwarded answers")
+	counter("dns_route_forwarded_ok_total", s.ForwardedOK, "upstream DNS responses successfully returned after a cache miss, including DNS error rcodes")
 	counter("dns_route_servfail_total", s.ServfailCount, "servfail responses")
-	counter("dns_route_route_add_total", s.RouteAdds, "successful route additions")
-	counter("dns_route_route_add_errors_total", s.RouteAddErrors, "route add errors")
+	counter("dns_route_route_add_total", s.RouteAdds, "successful kernel route replacement operations; legacy metric name")
+	counter("dns_route_route_add_errors_total", s.RouteAddErrors, "failed kernel route replacement operations; legacy metric name")
 	counter("dns_route_route_queue_drops_total", s.RouteQueueDrops, "route requests dropped because the route worker queue was full")
 	counter("dns_route_conntrack_reset_attempts_total", s.ConntrackResetAttempts, "conntrack reset attempts after an early DNS reply and route installation")
 	counter("dns_route_conntrack_reset_deleted_total", s.ConntrackResetDeleted, "conntrack flows deleted after destination route installation")

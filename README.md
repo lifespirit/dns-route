@@ -23,6 +23,8 @@ client DNS query
               +-- Linux route / embedded BGP announcement
 ```
 
+![dns-route admin panel](docs/admin_panel.png)
+
 ## Features
 
 - DNS listeners on multiple IPv4 and IPv6 addresses, over both UDP and TCP.

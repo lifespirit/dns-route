@@ -8,7 +8,8 @@
     <tr><td>Cache entries</td><td>{{.CacheEntries}}</td></tr>
     <tr><td>Active listeners</td><td>{{.ActiveListeners}}</td></tr>
     <tr><td>Pending listeners</td><td>{{.PendingListeners}}</td></tr>
-    <tr><td>Route snapshot entries</td><td>{{.RouteSnapshot}}</td></tr>
+    <tr><td>Backend snapshot entries</td><td>{{.RouteSnapshot}} <small>(sum across active backends)</small></td></tr>
+    <tr><td>Kernel route snapshot entries</td><td>{{.KernelRouteSnapshot}}</td></tr>
     <tr><td>IP cache entries</td><td>{{.IPCacheEntries}}</td></tr>
     <tr><td>Route prefix cache entries</td><td>{{.CIDRCacheEntries}}</td></tr>
   </table>
@@ -19,18 +20,21 @@
   <table>
     <tr><td>Listen addrs</td><td>{{.ListenAddrs}}</td></tr>
     <tr><td>Default upstreams</td><td>{{.Upstreams}}</td></tr>
-    <tr><td>Conditional forward zones</td><td>{{.ForwardZones}}</td></tr>
+    <tr><td>Conditional forward zones</td><td>{{.ActiveForwardZones}} active / {{.ForwardZones}} configured</td></tr>
     <tr><td>Conditional forward upstreams</td><td>{{.ForwardUpstreams}}</td></tr>
     <tr><td>Special domains</td><td>{{.SpecialDomains}}</td></tr>
+    <tr><td>Special-domain sources</td><td>{{.LoadedSpecialDomainSources}} loaded / {{.SpecialDomainSources}} configured</td></tr>
+    <tr><td>Local DNS domains</td><td>{{.LocalDNSDomains}} unique</td></tr>
     <tr><td>Local A domains</td><td>{{.LocalADomains}}</td></tr>
     <tr><td>Local AAAA domains</td><td>{{.LocalAAAADomains}}</td></tr>
+    <tr><td>DNS-record sources</td><td>{{.LoadedDNSRecordSources}} loaded / {{.DNSRecordSources}} configured</td></tr>
     <tr><td>Team Cymru prefix lookup</td><td>{{.LookupCIDR}}</td></tr>
     <tr><td>Reply before route</td><td>{{.ReplyBeforeRoute}}</td></tr>
     <tr><td>Listener freebind</td><td>{{.ListenerFreeBind}}</td></tr>
     <tr><td>Route mode</td><td>{{.RouteMode}}</td></tr>
     <tr><td>Route IPv4</td><td>{{.RouteIPv4}}</td></tr>
     <tr><td>Route IPv6</td><td>{{.RouteIPv6}}</td></tr>
-    <tr><td>Route table</td><td>{{.RouteTable}}</td></tr>
+    <tr><td>Route table</td><td>{{.RouteTable}}{{if ne .RouteTableConfigured .RouteTable}} <small>(configured: {{.RouteTableConfigured}})</small>{{end}}</td></tr>
     <tr><td>WG interface</td><td>{{.WGInterface}}</td></tr>
     <tr><td>WG gateway v4</td><td>{{.WGGatewayV4}}</td></tr>
     <tr><td>WG gateway v6</td><td>{{.WGGatewayV6}}</td></tr>
@@ -41,6 +45,7 @@
   <h2>BGP</h2>
   <table>
     <tr><td>Status</td><td>{{if .BGP.Enabled}}<span class="badge {{.BGP.State}}">{{.BGP.State}}</span>{{else}}<span class="badge disabled">disabled</span>{{end}}</td></tr>
+    {{if .BGP.Enabled}}
     <tr><td>Backend ready</td><td>{{.BGP.Ready}}{{if .BGP.RequireEstablished}} <small>(requires Established)</small>{{end}}</td></tr>
     <tr><td>Local</td><td>AS{{.BGP.LocalASN}} / router-id {{.BGP.RouterID}}{{if .BGP.LocalAddress}} / source {{.BGP.LocalAddress}}{{end}}</td></tr>
     <tr><td>Peer</td><td>{{.BGP.PeerAddress}} AS{{.BGP.PeerASN}}</td></tr>
@@ -50,6 +55,7 @@
     <tr><td>TCP MD5 password</td><td>{{if .BGP.PasswordConfigured}}configured{{else}}not configured{{end}}</td></tr>
     <tr><td>Desired prefixes</td><td>{{.BGP.DesiredPrefixes}}</td></tr>
     <tr><td>Loc-RIB prefixes</td><td>{{.BGP.AnnouncedPrefixes}}</td></tr>
+    {{end}}
   </table>
 </div>
 
@@ -63,8 +69,8 @@
     <tr><td>Forwarded OK</td><td>{{.ForwardedOK}}</td></tr>
     <tr><td>SERVFAIL</td><td>{{.ServfailCount}}</td></tr>
     <tr><td>Forward errors</td><td>{{.ForwardErrors}}</td></tr>
-    <tr><td>Route adds</td><td>{{.RouteAdds}}</td></tr>
-    <tr><td>Route add errors</td><td>{{.RouteAddErrors}}</td></tr>
+    <tr><td>Kernel route replacements</td><td>{{.RouteAdds}}</td></tr>
+    <tr><td>Kernel route replacement errors</td><td>{{.RouteAddErrors}}</td></tr>
     <tr><td>Route queue drops</td><td>{{.RouteQueueDrops}}</td></tr>
     <tr><td>Conntrack reset attempts</td><td>{{.ConntrackResetAttempts}}</td></tr>
     <tr><td>Conntrack flows deleted</td><td>{{.ConntrackResetDeleted}}</td></tr>
